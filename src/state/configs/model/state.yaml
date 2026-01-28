@@ -58,3 +58,24 @@ kwargs:
       adapt_mlp: false
       task_type: FEATURE_EXTRACTION
       merge_on_eval: false
+
+  llm_name: null
+  llm_text_key: llm_description
+  llm_pooling: mean
+  llm_fusion: add
+  llm_max_length: 128
+  llm_scale: 1.0
+  llm_freeze: true
+  llm_require_text: true
+  llm_model_kwargs: {}
+  llm_tokenizer_kwargs: {}
+  llm_lora:
+      enable: false
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      bias: none
+      target: auto
+      adapt_mlp: true
+      task_type: FEATURE_EXTRACTION
+      merge_on_eval: false

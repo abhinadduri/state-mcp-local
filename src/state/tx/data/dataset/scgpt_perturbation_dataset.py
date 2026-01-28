@@ -14,7 +14,7 @@ import numpy as np
 import torch
 from cell_load.dataset import PerturbationDataset
 from cell_load.mapping_strategies import BaseMappingStrategy
-from cell_load.utils.data_utils import GlobalH5MetadataCache
+from cell_load.utils.data_utils import GlobalH5MetadataCache, safe_decode_array
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,10 @@ class scGPTPerturbationDataset(PerturbationDataset):
             sample["pert_cell_counts"] = self.fetch_obsm_expression(underlying_idx, "X_hvg")
         elif self.store_raw_expression and self.output_space == "all":
             sample["pert_cell_counts"] = self.fetch_gene_expression(underlying_idx)
+
+        if self.additional_obs:
+            for obs_key in self.additional_obs:
+                sample[obs_key] = self._fetch_obs_value(underlying_idx, obs_key)
         return sample
 
     def fetch_obsm_expression(self, idx: int, key: str) -> torch.Tensor:
@@ -309,6 +313,51 @@ class scGPTPerturbationDataset(PerturbationDataset):
             # Original behavior: just log transform without normalization
             batch_dict["pert_cell_emb"] = torch.log1p(batch_dict["pert_cell_emb"])
             batch_dict["ctrl_cell_emb"] = torch.log1p(batch_dict["ctrl_cell_emb"])
+
+        base_keys = {
+            "pert_cell_emb",
+            "ctrl_cell_emb",
+            "pert_emb",
+            "pert_name",
+            "cell_type",
+            "cell_type_onehot",
+            "batch",
+            "batch_name",
+            "gene_ids",
+            "pert_flags",
+            "pert_cell_counts",
+            "ctrl_cell_counts",
+        }
+        extra_keys = [key for key in batch[0].keys() if key not in base_keys]
+        if extra_keys:
+            def _collate_extra(values):
+                first = values[0]
+                if torch.is_tensor(first):
+                    return torch.stack(values)
+                if isinstance(first, np.ndarray):
+                    if first.shape == ():
+                        return torch.tensor([v.item() if isinstance(v, np.ndarray) else v for v in values])
+                    if first.dtype.kind in {"S", "U", "O"}:
+                        return [
+                            safe_decode_array(v).tolist() if isinstance(v, np.ndarray) else v
+                            for v in values
+                        ]
+                    return torch.as_tensor(np.stack(values))
+                if isinstance(first, (np.generic, int, float, bool)):
+                    return torch.tensor(
+                        [v.item() if isinstance(v, np.generic) else v for v in values]
+                    )
+                if isinstance(first, (bytes, bytearray, np.bytes_)):
+                    return [
+                        v.decode("utf-8", errors="ignore")
+                        if isinstance(v, (bytes, bytearray, np.bytes_))
+                        else v
+                        for v in values
+                    ]
+                return values
+
+            for key in extra_keys:
+                batch_dict[key] = _collate_extra([item[key] for item in batch])
 
         return batch_dict
 

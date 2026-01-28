@@ -14,6 +14,7 @@ from .base import PerturbationModel
 from .decoders import FinetuneVCICountsDecoder
 from .decoders_nb import NBDecoder, nb_nll
 from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
+from transformers import AutoModel, AutoTokenizer
 
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,25 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.regularization = kwargs.get("regularization", 0.0)
         self.detach_decoder = kwargs.get("detach_decoder", False)
 
+        self.llm_name = kwargs.get("llm_name")
+        self.llm_text_key = kwargs.get("llm_text_key")
+        if self.llm_name and not self.llm_text_key:
+            self.llm_text_key = "llm_description"
+        self.llm_max_length = int(kwargs.get("llm_max_length", 128))
+        self.llm_pooling = kwargs.get("llm_pooling", "mean")
+        self.llm_fusion = kwargs.get("llm_fusion", "add")
+        self.llm_scale = float(kwargs.get("llm_scale", 1.0))
+        self.llm_freeze = bool(kwargs.get("llm_freeze", True))
+        self.llm_require_text = bool(kwargs.get("llm_require_text", True))
+        self.llm_model_kwargs = dict(kwargs.get("llm_model_kwargs", {}) or {})
+        self.llm_tokenizer_kwargs = dict(kwargs.get("llm_tokenizer_kwargs", {}) or {})
+        self.llm_lora_cfg = kwargs.get("llm_lora")
+        self.llm_tokenizer = None
+        self.llm_encoder = None
+        self.llm_proj = None
+        self.llm_fusion_mlp = None
+        self.llm_gate = None
+
         self.transformer_backbone_key = transformer_backbone_key
         self.transformer_backbone_kwargs = transformer_backbone_kwargs
         self.transformer_backbone_kwargs["n_positions"] = self.cell_sentence_len + kwargs.get("extra_tokens", 0)
@@ -185,6 +205,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
+
+        if self.llm_name:
+            self._build_llm_encoder()
 
         # Add an optional encoder that introduces a batch variable
         self.batch_encoder = None
@@ -394,6 +417,145 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nn.Linear(self.output_dim // 8, self.output_dim),
             )
 
+    def _build_llm_encoder(self) -> None:
+        tokenizer_kwargs = dict(self.llm_tokenizer_kwargs)
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(self.llm_name, **tokenizer_kwargs)
+        if self.llm_tokenizer.pad_token is None:
+            fallback = self.llm_tokenizer.eos_token or self.llm_tokenizer.unk_token
+            if fallback is None:
+                raise ValueError("Tokenizer has no pad/eos/unk token; set pad_token_id explicitly.")
+            self.llm_tokenizer.pad_token = fallback
+
+        self.llm_encoder = AutoModel.from_pretrained(self.llm_name, **self.llm_model_kwargs)
+        self.llm_encoder.config.use_cache = False
+
+        if self.llm_lora_cfg and self.llm_lora_cfg.get("enable", False):
+            self.llm_encoder = apply_lora(self.llm_encoder, "llama", self.llm_lora_cfg)
+
+        if self.llm_freeze:
+            for name, param in self.llm_encoder.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+
+        llm_hidden = getattr(self.llm_encoder.config, "hidden_size", None)
+        if llm_hidden is None:
+            llm_hidden = getattr(self.llm_encoder.config, "n_embd", None)
+        if llm_hidden is None:
+            raise ValueError("Could not infer LLM hidden size from config.")
+
+        self.llm_proj = nn.Linear(llm_hidden, self.hidden_dim)
+
+        if self.llm_fusion == "concat":
+            self.llm_fusion_mlp = build_mlp(
+                in_dim=self.hidden_dim * 2,
+                out_dim=self.hidden_dim,
+                hidden_dim=self.hidden_dim,
+                n_layers=2,
+                dropout=self.dropout,
+                activation=self.activation_class,
+            )
+        elif self.llm_fusion == "gated":
+            self.llm_gate = nn.Linear(self.hidden_dim, self.hidden_dim)
+        elif self.llm_fusion != "add":
+            raise ValueError(f"Unsupported llm_fusion strategy: {self.llm_fusion}")
+
+    def _normalize_llm_text(self, text, expected: int) -> list[str]:
+        if isinstance(text, (list, tuple)):
+            flat = list(text)
+        elif isinstance(text, np.ndarray):
+            flat = text.reshape(-1).tolist()
+        else:
+            raise TypeError("LLM text must be a list/tuple or numpy array of strings.")
+        if len(flat) != expected:
+            raise ValueError(f"LLM text length {len(flat)} does not match expected {expected}.")
+        return ["" if t is None else str(t) for t in flat]
+
+    def _pool_llm_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        input_ids: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            attention_mask = torch.ones(hidden_states.shape[:2], device=hidden_states.device, dtype=torch.long)
+        mask = attention_mask.unsqueeze(-1).type_as(hidden_states)
+        if self.llm_pooling == "mean":
+            summed = (hidden_states * mask).sum(dim=1)
+            denom = mask.sum(dim=1).clamp(min=1.0)
+            return summed / denom
+        if self.llm_pooling == "last":
+            lengths = attention_mask.sum(dim=1).clamp(min=1) - 1
+            idx = lengths.to(hidden_states.device)
+            return hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), idx]
+        if self.llm_pooling == "cls":
+            return hidden_states[:, 0, :]
+        if self.llm_pooling == "eos":
+            if input_ids is None or self.llm_tokenizer is None or self.llm_tokenizer.eos_token_id is None:
+                lengths = attention_mask.sum(dim=1).clamp(min=1) - 1
+                idx = lengths.to(hidden_states.device)
+                return hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), idx]
+            eos_id = self.llm_tokenizer.eos_token_id
+            seq_len = input_ids.size(1)
+            positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand_as(input_ids)
+            eos_mask = (input_ids == eos_id) & attention_mask.bool()
+            last_eos = torch.where(eos_mask, positions, torch.full_like(positions, -1)).max(dim=1).values
+            fallback = attention_mask.sum(dim=1).clamp(min=1) - 1
+            idx = torch.where(last_eos >= 0, last_eos, fallback).to(hidden_states.device)
+            return hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), idx]
+        raise ValueError(f"Unsupported llm_pooling value: {self.llm_pooling}")
+
+    def _encode_llm_text(self, texts: list[str], device: torch.device) -> torch.Tensor:
+        if self.llm_tokenizer is None or self.llm_encoder is None:
+            raise RuntimeError("LLM tokenizer/encoder not initialized.")
+        inputs = self.llm_tokenizer(
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=self.llm_max_length,
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        outputs = self.llm_encoder(**inputs)
+        hidden_states = outputs.last_hidden_state
+        return self._pool_llm_hidden(hidden_states, inputs.get("attention_mask"), inputs.get("input_ids"))
+
+    def _apply_llm_fusion(self, seq_input: torch.Tensor, batch: dict, padded: bool) -> torch.Tensor:
+        if self.llm_encoder is None or self.llm_text_key is None:
+            return seq_input
+        if self.llm_text_key not in batch:
+            if self.llm_require_text:
+                raise KeyError(f"Missing LLM text key '{self.llm_text_key}' in batch.")
+            logger.warning("LLM text key '%s' not found in batch; skipping fusion.", self.llm_text_key)
+            return seq_input
+
+        batch_size, seq_len, _ = seq_input.shape
+        expected = batch_size * seq_len
+        texts = self._normalize_llm_text(batch[self.llm_text_key], expected)
+        pooled = self._encode_llm_text(texts, seq_input.device)
+        text_emb = pooled.view(batch_size, seq_len, -1)
+        if self.llm_proj is not None:
+            text_proj = self.llm_proj(text_emb.to(self.llm_proj.weight.dtype))
+        else:
+            text_proj = text_emb
+        if text_proj.dtype != seq_input.dtype:
+            text_proj = text_proj.to(seq_input.dtype)
+
+        if self.llm_fusion == "add":
+            return seq_input + self.llm_scale * text_proj
+        if self.llm_fusion == "concat":
+            if self.llm_fusion_mlp is None:
+                raise RuntimeError("llm_fusion_mlp not initialized for concat fusion.")
+            return self.llm_fusion_mlp(torch.cat([seq_input, text_proj], dim=-1))
+        if self.llm_fusion == "gated":
+            if self.llm_gate is None:
+                raise RuntimeError("llm_gate not initialized for gated fusion.")
+            gate = torch.sigmoid(self.llm_gate(text_proj))
+            return seq_input + self.llm_scale * gate * text_proj
+
+        raise ValueError(f"Unsupported llm_fusion strategy: {self.llm_fusion}")
+
     def encode_perturbation(self, pert: torch.Tensor) -> torch.Tensor:
         """If needed, define how we embed the raw perturbation input."""
         return self.pert_encoder(pert)
@@ -448,6 +610,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             # Get batch embeddings and add to sequence input
             batch_embeddings = self.batch_encoder(batch_indices.long())  # Shape: [B, S, hidden_dim]
             seq_input = seq_input + batch_embeddings
+
+        seq_input = self._apply_llm_fusion(seq_input, batch, padded)
 
         if self.use_batch_token and self.batch_token is not None:
             batch_size, _, _ = seq_input.shape

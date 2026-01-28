@@ -186,6 +186,7 @@ def run_tx_infer(args: argparse.Namespace):
         batch_indices: Optional[torch.Tensor],
         pert_names: List[str],
         device: torch.device,
+        extra_obs: Optional[Dict[str, object]] = None,
     ) -> Dict[str, torch.Tensor | List[str]]:
         """
         Construct a model batch with variable-length sentence (B=1, S=T, ...).
@@ -199,6 +200,8 @@ def run_tx_infer(args: argparse.Namespace):
         }
         if batch_indices is not None:
             batch["batch"] = batch_indices.to(device)  # [T]
+        if extra_obs:
+            batch.update(extra_obs)
         return batch
 
     def pad_adata_with_tsv(
@@ -336,6 +339,27 @@ def run_tx_infer(args: argparse.Namespace):
     cfg = load_config(config_path)
     if not args.quiet:
         print(f"Loaded config: {config_path}")
+
+    additional_obs = []
+    try:
+        additional_obs = cfg.get("data", {}).get("kwargs", {}).get("additional_obs", []) or []
+    except Exception:
+        additional_obs = []
+    if isinstance(additional_obs, (str, bytes, bytearray)):
+        additional_obs = [str(additional_obs)]
+    if not additional_obs:
+        data_module_path = os.path.join(args.model_dir, "data_module.torch")
+        if os.path.exists(data_module_path):
+            try:
+                data_module_state = torch.load(data_module_path, map_location="cpu")
+                dm_additional = data_module_state.get("additional_obs") or []
+                if isinstance(dm_additional, (str, bytes, bytearray)):
+                    dm_additional = [str(dm_additional)]
+                additional_obs = dm_additional
+            except Exception as exc:
+                if not args.quiet:
+                    print(f"Warning: failed to read additional_obs from data_module.torch: {exc}")
+    additional_obs = [str(key) for key in additional_obs if key]
 
     # control_pert
     control_pert = args.control_pert
@@ -594,6 +618,31 @@ def run_tx_infer(args: argparse.Namespace):
                     f"Subsampled perturbations exceeding --max-cells; dropped {total_dropped} cells. Total cells: {adata.n_obs}."
                 )
 
+    additional_obs_arrays: Dict[str, np.ndarray] = {}
+    if additional_obs:
+        for key in additional_obs:
+            if key in adata.obs:
+                additional_obs_arrays[key] = adata.obs[key].to_numpy()
+            else:
+                if not args.quiet:
+                    print(f"Warning: additional_obs key '{key}' not found in adata.obs; skipping.")
+        if additional_obs_arrays and not args.quiet:
+            print(f"Using additional_obs keys: {sorted(additional_obs_arrays.keys())}")
+
+    def _slice_additional_obs(values: np.ndarray, idxs: np.ndarray):
+        window_vals = values[idxs]
+        if isinstance(window_vals, np.ndarray):
+            if window_vals.ndim == 0:
+                return window_vals.item()
+            if window_vals.dtype.kind in {"S", "U"}:
+                return [str(v) for v in window_vals.tolist()]
+            if window_vals.dtype == object:
+                return window_vals.tolist()
+            return torch.tensor(window_vals)
+        if isinstance(window_vals, (bytes, bytearray, np.bytes_)):
+            return window_vals.decode("utf-8", errors="ignore")
+        return window_vals
+
     # select features: embeddings or genes
     if args.embed_key is None:
         X_in = to_dense(adata.X)  # [N, E_in]
@@ -785,12 +834,19 @@ def run_tx_infer(args: argparse.Namespace):
                         bi = None
 
                     # 4) Forward pass (homogeneous pert in this window)
+                    extra_obs_batch = None
+                    if additional_obs_arrays:
+                        extra_obs_batch = {
+                            key: _slice_additional_obs(values, idx_window)
+                            for key, values in additional_obs_arrays.items()
+                        }
                     batch = prepare_batch(
                         ctrl_basal_np=ctrl_basal,
                         pert_onehots=pert_oh,
                         batch_indices=bi,
                         pert_names=[p] * win_size,
                         device=model_device,
+                        extra_obs=extra_obs_batch,
                     )
                     batch_out = model.predict_step(batch, batch_idx=0, padded=False)
 
