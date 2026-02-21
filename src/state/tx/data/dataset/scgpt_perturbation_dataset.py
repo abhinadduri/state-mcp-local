@@ -229,7 +229,7 @@ class scGPTPerturbationDataset(PerturbationDataset):
     # Static methods
     ##############################
     @staticmethod
-    def collate_fn(batch, transform=None, pert_col="drug", int_counts=False):
+    def collate_fn(batch, transform=None, pert_col="drug", exp_counts=False):
         """
         Custom collate that reshapes data into sequences.
         Safely handles normalization when vectors sum to zero.
@@ -266,7 +266,7 @@ class scGPTPerturbationDataset(PerturbationDataset):
                     batch_dict["pert_cell_counts"] = torch.log1p(X_hvg_norm)
                 elif transform == "log1p" or transform is True:
                     batch_dict["pert_cell_counts"] = torch.log1p(X_hvg)
-                elif int_counts:
+                elif exp_counts:
                     # this is for log transformed data. let's make it count data
                     batch_dict["pert_cell_counts"] = torch.expm1(X_hvg).round().to(torch.int32)
 
@@ -286,7 +286,7 @@ class scGPTPerturbationDataset(PerturbationDataset):
                     batch_dict["ctrl_cell_counts"] = torch.log1p(basal_hvg_norm)
                 elif transform == "log1p" or transform is True:
                     batch_dict["ctrl_cell_counts"] = torch.log1p(basal_hvg)
-            elif int_counts:
+            elif exp_counts:
                 # this is for log transformed data. let's make it count data
                 batch_dict["ctrl_cell_counts"] = torch.expm1(basal_hvg).round().to(torch.int32)
             else:

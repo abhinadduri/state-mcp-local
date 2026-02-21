@@ -112,6 +112,20 @@ def run_tx_train(cfg: DictConfig):
     assert output_space in {"embedding", "gene", "all"}, (
         f"data.kwargs.output_space must be one of 'embedding', 'gene', or 'all'; got {output_space!r}"
     )
+    nb_loss_enabled = bool(cfg["model"]["kwargs"].get("nb_loss", False))
+    if nb_loss_enabled and output_space not in {"gene", "all"}:
+        raise ValueError(
+            f"model.kwargs.nb_loss=True requires data.kwargs.output_space in {{'gene', 'all'}}; got {output_space!r}."
+        )
+    embed_key = cfg["data"]["kwargs"].get("embed_key", None)
+    if nb_loss_enabled and embed_key not in {None, "X_hvg"}:
+        if not bool(cfg["data"]["kwargs"].get("store_raw_basal", False)):
+            logger.warning(
+                "nb_loss=True with embed_key=%r requires control counts for library-size estimation; "
+                "setting data.kwargs.store_raw_basal=True.",
+                embed_key,
+            )
+            cfg["data"]["kwargs"]["store_raw_basal"] = True
 
     data_module: PerturbationDataModule = get_datamodule(
         cfg["data"]["name"],
@@ -120,11 +134,36 @@ def run_tx_train(cfg: DictConfig):
         cell_sentence_len=sentence_len,
     )
 
+    data_module.setup(stage="fit")
+
+    if nb_loss_enabled:
+        resolved_is_log1p = bool(getattr(data_module, "is_log1p", cfg["data"]["kwargs"].get("is_log1p", False)))
+        expected_exp_counts = resolved_is_log1p
+        current_exp_counts = bool(getattr(data_module, "exp_counts", False))
+
+        if current_exp_counts != expected_exp_counts:
+            logger.warning(
+                "nb_loss=True requires exp_counts to follow is_log1p. "
+                "Resolved is_log1p=%s, overriding exp_counts %s -> %s.",
+                resolved_is_log1p,
+                current_exp_counts,
+                expected_exp_counts,
+            )
+            data_module.exp_counts = expected_exp_counts
+        else:
+            logger.info(
+                "nb_loss=True with resolved is_log1p=%s and exp_counts=%s.",
+                resolved_is_log1p,
+                current_exp_counts,
+            )
+
+        cfg["data"]["kwargs"]["is_log1p"] = resolved_is_log1p
+        cfg["data"]["kwargs"]["exp_counts"] = expected_exp_counts
+
     with open(join(run_output_dir, "data_module.torch"), "wb") as f:
         # TODO-Abhi: only save necessary data
         data_module.save_state(f)
 
-    data_module.setup(stage="fit")
     dl = data_module.train_dataloader()
     print("num_workers:", dl.num_workers)
     print("batch size:", dl.batch_size)

@@ -20,7 +20,7 @@ kwargs:
   map_controls: true # for a control cell, should we use it as the target (learn identity) or sample a control?
   perturbation_features_file: null
   store_raw_basal: false
-  int_counts: false
+  exp_counts: false
   barcode: true
   use_consecutive_loading: false
   val_subsample_fraction: 1.0

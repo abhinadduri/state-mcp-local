@@ -163,6 +163,21 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.gene_dim = gene_dim
         self.mmd_num_chunks = max(int(kwargs.get("mmd_num_chunks", 1)), 1)
         self.randomize_mmd_chunks = bool(kwargs.get("randomize_mmd_chunks", False))
+        self.nb_loss = bool(kwargs.get("nb_loss", False))
+        self.nb_eps = float(kwargs.get("nb_eps", 1e-8))
+        default_nb_embed_loss_weight = 1.0 if self.embed_key is not None else 0.0
+        self.nb_embed_loss_weight = float(kwargs.get("nb_embed_loss_weight", default_nb_embed_loss_weight))
+        if self.nb_loss:
+            if self.gene_decoder is not None:
+                logger.info("nb_loss=True: disabling gene_decoder and decoder loss branches.")
+            self.gene_decoder = None
+            self.gene_decoder_bool = False
+            self.decoder_cfg = None
+            try:
+                self.hparams["gene_decoder_bool"] = False  # type: ignore[index]
+                self.hparams["decoder_cfg"] = None  # type: ignore[index]
+            except Exception:
+                pass
 
         # Build the distributional loss from geomloss
         blur = kwargs.get("blur", 0.05)
@@ -184,6 +199,37 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
+
+        self.nb_parameter_head: Optional[nn.Module] = None
+        self.nb_target_dim = int(self.output_dim)
+        if self.nb_loss:
+            if self.output_space not in {"gene", "all"}:
+                raise ValueError(
+                    f"nb_loss=True requires output_space in {{'gene', 'all'}}; got {self.output_space!r}."
+                )
+
+            if self.output_space == "all":
+                self.nb_target_dim = int(self.gene_dim if self.gene_dim is not None else self.output_dim)
+            elif self.embed_key is not None and self.embed_key != "X_hvg":
+                self.nb_target_dim = int(self.hvg_dim if self.hvg_dim is not None else self.output_dim)
+
+            self.nb_parameter_head = build_mlp(
+                in_dim=self.output_dim,
+                out_dim=self.nb_target_dim * 2,
+                hidden_dim=self.hidden_dim,
+                n_layers=self.n_decoder_layers,
+                dropout=self.dropout,
+                activation=self.activation_class,
+            )
+            logger.info(
+                "NB loss enabled for state transition model (nb_target_dim=%d, nb_embed_loss_weight=%.3f).",
+                self.nb_target_dim,
+                self.nb_embed_loss_weight,
+            )
+        self._nb_mean_cache: Optional[torch.Tensor] = None
+        self._nb_dispersion_cache: Optional[torch.Tensor] = None
+        self._warned_nb_target_fallback = False
+        self._warned_nb_library_fallback = False
 
         # Add an optional encoder that introduces a batch variable
         self.batch_encoder = None
@@ -237,7 +283,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # if the model is outputting to counts space, apply relu
         # otherwise its in embedding space and we don't want to
         is_gene_space = kwargs["embed_key"] == "X_hvg" or kwargs["embed_key"] is None
-        if is_gene_space or self.gene_decoder is None:
+        if is_gene_space:
             self.relu = torch.nn.ReLU()
 
         self.use_batch_token = kwargs.get("use_batch_token", False)
@@ -393,6 +439,107 @@ class StateTransitionPerturbationModel(PerturbationModel):
         """Define how we embed basal state input, if needed."""
         return self.basal_encoder(expr)
 
+    @staticmethod
+    def _suspected_discrete_torch(x: torch.Tensor, n_cells: int = 100) -> bool:
+        if x.numel() == 0:
+            return False
+        flat = x.reshape(-1, x.shape[-1])
+        top_n = min(flat.shape[0], n_cells)
+        rowsum = flat[:top_n].sum(dim=1)
+        frac_part = rowsum - rowsum.floor()
+        return bool(torch.all(torch.abs(frac_part) < 1e-7))
+
+    @staticmethod
+    def _suspected_log_torch(x: torch.Tensor) -> bool:
+        if x.numel() == 0:
+            return False
+        return bool(x.max().item() < 15.0)
+
+    def _to_count_space(self, x: torch.Tensor) -> torch.Tensor:
+        x_float = x.float()
+        is_discrete = self._suspected_discrete_torch(x_float)
+        is_log = self._suspected_log_torch(x_float)
+
+        if (not is_discrete) and is_log:
+            counts = torch.expm1(x_float)
+        else:
+            counts = x_float
+
+        counts = torch.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
+        return counts.clamp_min(0.0).round()
+
+    def _compute_set_library_sizes_from_control(self, ctrl_cells: torch.Tensor) -> torch.Tensor:
+        """Compute one library size per sentence using median across cells in the set."""
+        ctrl_counts = self._to_count_space(ctrl_cells)
+        per_cell_library_sizes = ctrl_counts.sum(dim=-1)
+        per_cell_library_sizes = torch.nan_to_num(per_cell_library_sizes, nan=0.0, posinf=0.0, neginf=0.0)
+        per_set_library_sizes = per_cell_library_sizes.median(dim=1, keepdim=True).values.clamp_min(1.0)
+        return per_set_library_sizes.unsqueeze(-1)
+
+    def _reshape_sequence_tensor(self, x: torch.Tensor, padded: bool) -> torch.Tensor:
+        if padded:
+            return x.reshape(-1, self.cell_sentence_len, x.shape[-1])
+        return x.reshape(1, -1, x.shape[-1])
+
+    def _get_nb_target_tensor(self, batch: Dict[str, torch.Tensor], fallback_target: torch.Tensor, padded: bool) -> torch.Tensor:
+        pert_counts = batch.get("pert_cell_counts", None)
+        if pert_counts is not None:
+            return self._reshape_sequence_tensor(pert_counts.to(fallback_target.device), padded)
+
+        if self.embed_key is not None and self.embed_key != "X_hvg" and (not self._warned_nb_target_fallback):
+            logger.warning(
+                "nb_loss=True but 'pert_cell_counts' is missing; falling back to 'pert_cell_emb' for NB targets."
+            )
+            self._warned_nb_target_fallback = True
+        return fallback_target
+
+    def _get_nb_control_tensor_for_library(
+        self,
+        batch: Dict[str, torch.Tensor],
+        fallback_ctrl: torch.Tensor,
+        padded: bool,
+    ) -> torch.Tensor:
+        ctrl_counts = batch.get("ctrl_cell_counts", None)
+        if ctrl_counts is not None:
+            return self._reshape_sequence_tensor(ctrl_counts.to(fallback_ctrl.device), padded)
+
+        if self.embed_key is not None and self.embed_key != "X_hvg" and (not self._warned_nb_library_fallback):
+            logger.warning(
+                "nb_loss=True but 'ctrl_cell_counts' is missing; using 'ctrl_cell_emb' for library-size estimation."
+            )
+            self._warned_nb_library_fallback = True
+        return fallback_ctrl
+
+    def _compute_nb_nll_loss(
+        self,
+        nb_mean: torch.Tensor,
+        nb_dispersion: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        target_counts = self._to_count_space(target).to(nb_mean.dtype)
+        if nb_mean.shape != nb_dispersion.shape:
+            raise RuntimeError(
+                f"NB parameter shape mismatch: mean={tuple(nb_mean.shape)} dispersion={tuple(nb_dispersion.shape)}"
+            )
+        if target_counts.shape[-1] != nb_mean.shape[-1]:
+            raise RuntimeError(
+                "NB target dimension mismatch: "
+                f"target={target_counts.shape[-1]} vs nb_params={nb_mean.shape[-1]}. "
+                "Ensure pert_cell_counts has the expected gene dimension for NB training."
+            )
+        mu = nb_mean.clamp_min(self.nb_eps)
+        theta = nb_dispersion.clamp_min(self.nb_eps)
+        log_theta_mu_eps = torch.log(theta + mu + self.nb_eps)
+        log_nb = (
+            theta * (torch.log(theta + self.nb_eps) - log_theta_mu_eps)
+            + target_counts * (torch.log(mu + self.nb_eps) - log_theta_mu_eps)
+            + torch.lgamma(target_counts + theta)
+            - torch.lgamma(theta)
+            - torch.lgamma(target_counts + 1)
+        )
+        recon_loss_all = -log_nb
+        return torch.nanmean(recon_loss_all.reshape(recon_loss_all.shape[0], -1), dim=1)
+
     def forward(self, batch: dict, padded=True) -> torch.Tensor:
         """
         The main forward call. Batch is a flattened sequence of cell sentences,
@@ -497,23 +644,33 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # Cache token features for auxiliary batch prediction loss (B, S, H)
         self._token_features = res_pred
+        self._nb_mean_cache = None
+        self._nb_dispersion_cache = None
 
-        # add to basal if predicting residual
+        # Keep the primary transform output in model output space (e.g., embedding when embed_key is set).
         if self.predict_residual and self.output_space == "all":
-            # Project control_cells to hidden_dim space to match res_pred
-            # control_cells_hidden = self.project_to_hidden(control_cells)
-            # treat the actual prediction as a residual sum to basal
             out_pred = self.project_out(res_pred) + basal
             out_pred = self.final_down_then_up(out_pred)
         elif self.predict_residual:
-            out_pred = self.project_out(res_pred) + basal
+            out_pred = self.project_out(res_pred + control_cells)
         else:
             out_pred = self.project_out(res_pred)
 
         # apply relu if specified and we output to HVG space
         is_gene_space = self.hparams["embed_key"] == "X_hvg" or self.hparams["embed_key"] is None
-        if is_gene_space or self.gene_decoder is None:
+        if is_gene_space:
             out_pred = self.relu(out_pred)
+
+        if self.nb_loss:
+            if self.nb_parameter_head is None:
+                raise RuntimeError("nb_loss=True but nb_parameter_head was not initialized.")
+            nb_params = self.nb_parameter_head(out_pred)
+            px_scale_logits, nb_dispersion_logits = torch.chunk(nb_params, chunks=2, dim=-1)
+            px_scale = F.softmax(px_scale_logits, dim=-1)
+            ctrl_for_library = self._get_nb_control_tensor_for_library(batch, basal, padded)
+            set_library_sizes = self._compute_set_library_sizes_from_control(ctrl_for_library)
+            self._nb_mean_cache = px_scale * set_library_sizes
+            self._nb_dispersion_cache = F.softplus(nb_dispersion_logits) + self.nb_eps
 
         output = out_pred.reshape(-1, self.output_dim)
 
@@ -524,6 +681,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
     def _compute_distribution_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Apply the primary distributional loss, optionally chunking feature dimensions for SamplesLoss."""
+        pred = pred.float()
+        target = target.float()
 
         if isinstance(self.loss_fn, SamplesLoss) and self.mmd_num_chunks > 1:
             feature_dim = pred.shape[-1]
@@ -558,12 +717,30 @@ class StateTransitionPerturbationModel(PerturbationModel):
             pred = pred.reshape(1, -1, self.output_dim)
             target = target.reshape(1, -1, self.output_dim)
 
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
+        embedding_aux_loss = None
+        if self.nb_loss:
+            if self._nb_mean_cache is None or self._nb_dispersion_cache is None:
+                raise RuntimeError("nb_loss=True but cached NB parameters were not found from forward().")
+            if padded:
+                nb_mean = self._nb_mean_cache.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+                nb_dispersion = self._nb_dispersion_cache.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            else:
+                nb_mean = self._nb_mean_cache.reshape(1, -1, self.nb_target_dim)
+                nb_dispersion = self._nb_dispersion_cache.reshape(1, -1, self.nb_target_dim)
+            nb_target = self._get_nb_target_tensor(batch, target, padded)
+            per_set_main_losses = self._compute_nb_nll_loss(nb_mean, nb_dispersion, nb_target)
+
+            if self.nb_embed_loss_weight > 0.0:
+                embedding_aux_losses = self._compute_distribution_loss(pred, target)
+                embedding_aux_loss = torch.nanmean(embedding_aux_losses)
+                self.log("train/embedding_loss", embedding_aux_loss)
+        else:
+            per_set_main_losses = self._compute_distribution_loss(pred, target)
         main_loss = torch.nanmean(per_set_main_losses)
         self.log("train_loss", main_loss)
 
         # Log individual loss components if using combined loss
-        if hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
+        if (not self.nb_loss) and hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
             sinkhorn_component = self.loss_fn.sinkhorn_loss(pred, target).nanmean()
             energy_component = self.loss_fn.energy_loss(pred, target).nanmean()
             self.log("train/sinkhorn_loss", sinkhorn_component)
@@ -572,6 +749,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Process decoder if available
         decoder_loss = None
         total_loss = main_loss
+        if embedding_aux_loss is not None:
+            total_loss = total_loss + self.nb_embed_loss_weight * embedding_aux_loss
 
         if self.use_batch_token and self.batch_classifier is not None and self._batch_token_cache is not None:
             logits = self.batch_classifier(self._batch_token_cache)  # [B, 1, C]
@@ -624,7 +803,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             total_loss = total_loss + self.batch_token_weight * ce_loss
 
         # Auxiliary batch prediction loss (per token), if enabled
-        if self.gene_decoder is not None and "pert_cell_counts" in batch:
+        if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
             # Train decoder to map latent predictions to gene space
 
@@ -692,18 +871,33 @@ class StateTransitionPerturbationModel(PerturbationModel):
         target = batch["pert_cell_emb"]
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
+        embedding_aux_loss = None
+        if self.nb_loss:
+            if self._nb_mean_cache is None or self._nb_dispersion_cache is None:
+                raise RuntimeError("nb_loss=True but cached NB parameters were not found from forward().")
+            nb_mean = self._nb_mean_cache.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            nb_dispersion = self._nb_dispersion_cache.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            nb_target = self._get_nb_target_tensor(batch, target, padded=True)
+            per_set_main_losses = self._compute_nb_nll_loss(nb_mean, nb_dispersion, nb_target)
+            if self.nb_embed_loss_weight > 0.0:
+                embedding_aux_losses = self._compute_distribution_loss(pred, target)
+                embedding_aux_loss = torch.nanmean(embedding_aux_losses)
+                self.log("val/embedding_loss", embedding_aux_loss)
+        else:
+            per_set_main_losses = self._compute_distribution_loss(pred, target)
         loss = torch.nanmean(per_set_main_losses)
+        if embedding_aux_loss is not None:
+            loss = loss + self.nb_embed_loss_weight * embedding_aux_loss
         self.log("val_loss", loss)
 
         # Log individual loss components if using combined loss
-        if hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
+        if (not self.nb_loss) and hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
             sinkhorn_component = self.loss_fn.sinkhorn_loss(pred, target).mean()
             energy_component = self.loss_fn.energy_loss(pred, target).mean()
             self.log("val/sinkhorn_loss", sinkhorn_component)
             self.log("val/energy_loss", energy_component)
 
-        if self.gene_decoder is not None and "pert_cell_counts" in batch:
+        if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
 
             # Get model predictions from validation step
@@ -745,8 +939,23 @@ class StateTransitionPerturbationModel(PerturbationModel):
         target = batch["pert_cell_emb"]
         pred = pred.reshape(1, -1, self.output_dim)
         target = target.reshape(1, -1, self.output_dim)
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
+        embedding_aux_loss = None
+        if self.nb_loss:
+            if self._nb_mean_cache is None or self._nb_dispersion_cache is None:
+                raise RuntimeError("nb_loss=True but cached NB parameters were not found from forward().")
+            nb_mean = self._nb_mean_cache.reshape(1, -1, self.nb_target_dim)
+            nb_dispersion = self._nb_dispersion_cache.reshape(1, -1, self.nb_target_dim)
+            nb_target = self._get_nb_target_tensor(batch, target, padded=False)
+            per_set_main_losses = self._compute_nb_nll_loss(nb_mean, nb_dispersion, nb_target)
+            if self.nb_embed_loss_weight > 0.0:
+                embedding_aux_losses = self._compute_distribution_loss(pred, target)
+                embedding_aux_loss = torch.nanmean(embedding_aux_losses)
+                self.log("test/embedding_loss", embedding_aux_loss)
+        else:
+            per_set_main_losses = self._compute_distribution_loss(pred, target)
         loss = torch.nanmean(per_set_main_losses)
+        if embedding_aux_loss is not None:
+            loss = loss + self.nb_embed_loss_weight * embedding_aux_loss
         self.log("test_loss", loss)
 
         if confidence_pred is not None:
@@ -788,9 +997,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
         if confidence_pred is not None:
             output_dict["confidence_pred"] = confidence_pred
 
-        if self.gene_decoder is not None:
+        if self.nb_loss:
+            if self._nb_mean_cache is None or self._nb_dispersion_cache is None:
+                raise RuntimeError("nb_loss=True but cached NB parameters were not found from forward().")
+            output_dict["pert_cell_counts_preds"] = self._nb_mean_cache.reshape(-1, self.nb_target_dim)
+            output_dict["pert_cell_counts_dispersion"] = self._nb_dispersion_cache.reshape(-1, self.nb_target_dim)
+        elif self.gene_decoder is not None:
             pert_cell_counts_preds = self.gene_decoder(latent_output)
-
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
         return output_dict
