@@ -11,7 +11,6 @@ from geomloss import SamplesLoss
 from typing import Dict, Optional, Tuple
 
 from .base import PerturbationModel
-from .decoders import FinetuneVCICountsDecoder
 from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
 
 
@@ -306,24 +305,10 @@ class StateTransitionPerturbationModel(PerturbationModel):
             for param in self.project_out.parameters():
                 param.requires_grad = False
 
-        control_pert = kwargs.get("control_pert", "non-targeting")
-        if kwargs.get("finetune_vci_decoder", False):  # TODO: This will go very soon
-            # Prefer the gene names supplied by the data module (aligned to training output)
-            gene_names = self.gene_names
-            if gene_names is None:
-                raise ValueError(
-                    "finetune_vci_decoder=True but model.gene_names is None. "
-                    "Please provide gene_names via data module var_dims."
-                )
-
-            n_genes = len(gene_names)
-            logger.info(
-                f"Initializing FinetuneVCICountsDecoder with {n_genes} genes (output_space={output_space}; "
-                + ("HVG subset" if output_space == "gene" else "all genes")
-                + ")"
-            )
-            self.gene_decoder = FinetuneVCICountsDecoder(
-                genes=gene_names,
+        if kwargs.get("finetune_vci_decoder", False):
+            logger.warning(
+                "model.kwargs.finetune_vci_decoder is no longer supported. "
+                "Ignoring it and using the standard latent-to-gene decoder path."
             )
         print(self)
 

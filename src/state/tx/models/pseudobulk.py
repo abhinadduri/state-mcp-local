@@ -8,7 +8,6 @@ import torch.nn as nn
 from geomloss import SamplesLoss
 
 from .base import PerturbationModel
-from .decoders import FinetuneVCICountsDecoder
 from .utils import build_mlp, get_activation_class, get_transformer_backbone
 
 logger = logging.getLogger(__name__)
@@ -104,25 +103,10 @@ class PseudobulkPerturbationModel(PerturbationModel):
             # actually just set this to a relu for now
             self.relu = torch.nn.ReLU()
 
-        control_pert = kwargs.get("control_pert", "non-targeting")
         if kwargs.get("finetune_vci_decoder", False):
-            # Prefer the gene names supplied by the data module (aligned to training output)
-            gene_names = self.gene_names
-            if gene_names is None:
-                raise ValueError(
-                    "finetune_vci_decoder=True but model.gene_names is None. "
-                    "Please provide gene_names via data module var_dims."
-                )
-
-            n_genes = len(gene_names)
-            logger.info(
-                f"Initializing FinetuneVCICountsDecoder with {n_genes} genes (output_space={output_space}; "
-                + ("HVG subset" if output_space == "gene" else "all genes")
-                + ")"
-            )
-            self.gene_decoder = FinetuneVCICountsDecoder(
-                genes=gene_names,
-                checkpoint=kwargs.get("vci_checkpoint", None),
+            logger.warning(
+                "model.kwargs.finetune_vci_decoder is no longer supported. "
+                "Ignoring it and using the standard latent-to-gene decoder path."
             )
 
         print(self)
@@ -177,7 +161,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
 
         # Decide whether to concatenate based on the decoder's input expectation
         if expected_in is None:
-            # Fallback to previous behavior: concatenate for non-VCI decoders
+            # Fallback to previous behavior: concatenate batch covariates.
             return torch.cat([latent, batch_var], dim=-1)
 
         if expected_in == last_dim:
@@ -331,8 +315,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
             # with torch.no_grad():
             #     latent_preds = pred.detach()  # Detach to prevent gradient flow back to main model
 
-            if not isinstance(self.gene_decoder, FinetuneVCICountsDecoder):
-                latent_preds = self._maybe_concat_batch(latent_preds, batch["batch"], padded=True)
+            latent_preds = self._maybe_concat_batch(latent_preds, batch["batch"], padded=True)
 
             pert_cell_counts_preds = self.gene_decoder(latent_preds)
             if padded:
@@ -367,8 +350,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
             latent_preds = pred
 
             # Match decoder input dims
-            if not isinstance(self.gene_decoder, FinetuneVCICountsDecoder):
-                latent_preds = self._maybe_concat_batch(latent_preds, batch["batch"], padded=True)
+            latent_preds = self._maybe_concat_batch(latent_preds, batch["batch"], padded=True)
             pert_cell_counts_preds = self.gene_decoder(latent_preds)
 
             # Get decoder predictions
@@ -410,8 +392,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
 
         if self.gene_decoder is not None:
             # Only concat batch covariates if decoder expects them
-            if not isinstance(self.gene_decoder, FinetuneVCICountsDecoder):
-                latent_output = self._maybe_concat_batch(latent_output, batch["batch"], padded=padded)
+            latent_output = self._maybe_concat_batch(latent_output, batch["batch"], padded=padded)
             pert_cell_counts_preds = self.gene_decoder(latent_output)
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
