@@ -63,22 +63,10 @@ def run_tx_train(cfg: DictConfig):
     try:
         sentence_len = cfg["model"]["cell_set_len"]
     except KeyError:
-        if cfg["model"]["name"].lower() in ["cpa", "scvi"]:
-            if "cell_sentence_len" in cfg["model"]["kwargs"] and cfg["model"]["kwargs"]["cell_sentence_len"] > 1:
-                sentence_len = cfg["model"]["kwargs"]["cell_sentence_len"]
-                cfg["training"]["batch_size"] = 1
-            else:
-                sentence_len = 1
-        else:
-            try:
-                sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["n_positions"]
-            except:
-                sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
-
-    if cfg["model"]["name"].lower() == "cpa" and cfg["model"]["kwargs"]["recon_loss"] == "gauss":
-        cfg["data"]["kwargs"]["transform"] = "log-normalize"
-    elif cfg["model"]["name"].lower() == "scvi":
-        cfg["data"]["kwargs"]["transform"] = None
+        try:
+            sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["n_positions"]
+        except:
+            sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
 
     output_space = cfg["data"]["kwargs"].get("output_space", "gene")
     assert output_space in {"embedding", "gene", "all"}, (
@@ -135,11 +123,6 @@ def run_tx_train(cfg: DictConfig):
     torch.save(data_module.batch_onehot_map, batch_onehot_map_path)
     with open(var_dims_path, "wb") as f:
         pickle.dump(var_dims, f)
-
-    if cfg["model"]["name"].lower() in ["cpa", "scvi"]:
-        cfg["model"]["kwargs"]["n_cell_types"] = len(data_module.celltype_onehot_map)
-        cfg["model"]["kwargs"]["n_perts"] = len(data_module.pert_onehot_map)
-        cfg["model"]["kwargs"]["n_batches"] = len(data_module.batch_onehot_map)
 
     # Create model
     model = get_lightning_module(
@@ -236,7 +219,7 @@ def run_tx_train(cfg: DictConfig):
         logger=loggers,
         plugins=plugins,
         callbacks=callbacks,
-        gradient_clip_val=cfg["training"]["gradient_clip_val"] if cfg["model"]["name"].lower() != "cpa" else None,
+        gradient_clip_val=cfg["training"]["gradient_clip_val"],
         accumulate_grad_batches=cfg["training"].get("gradient_accumulation_steps", 1),
         use_distributed_sampler=False,
     )

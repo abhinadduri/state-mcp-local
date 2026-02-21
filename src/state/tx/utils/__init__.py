@@ -251,27 +251,5 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
             batch_dim=var_dims["batch_dim"],
             **module_config,
         )
-    elif model_type.lower() == "cpa":
-        from ...tx.models.cpa import CPAPerturbationModel
-
-        return CPAPerturbationModel(
-            input_dim=var_dims["input_dim"],
-            output_dim=var_dims["output_dim"],
-            pert_dim=var_dims["pert_dim"],
-            gene_dim=gene_dim,
-            **module_config,
-        )
-    elif model_type.lower() == "scvi":
-        from ...tx.models.scvi import SCVIPerturbationModel
-
-        return SCVIPerturbationModel(
-            input_dim=var_dims["input_dim"],
-            gene_dim=gene_dim,
-            hvg_dim=var_dims["hvg_dim"],
-            output_dim=var_dims["output_dim"],
-            pert_dim=var_dims["pert_dim"],
-            batch_dim=var_dims["batch_dim"],
-            **module_config,
-        )
     else:
         raise ValueError(f"Unknown model type: {model_type}")
