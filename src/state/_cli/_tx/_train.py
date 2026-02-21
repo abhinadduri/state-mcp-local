@@ -11,20 +11,17 @@ def add_arguments_train(parser: ap.ArgumentParser):
 
 
 def run_tx_train(cfg: DictConfig):
-    import json
     import logging
     import os
     import pickle
     import shutil
     from os.path import exists, join
-    from pathlib import Path
 
     import lightning.pytorch as pl
     import torch
     from cell_load.data_modules import PerturbationDataModule
     from cell_load.utils.modules import get_datamodule
     from lightning.pytorch.loggers import WandbLogger
-    from lightning.pytorch.plugins.precision import MixedPrecision
 
     from ...tx.callbacks import (
         BatchSpeedMonitorCallback,
@@ -66,7 +63,7 @@ def run_tx_train(cfg: DictConfig):
     try:
         sentence_len = cfg["model"]["cell_set_len"]
     except KeyError:
-        if cfg["model"]["name"].lower() in ["cpa", "scvi"] or cfg["model"]["name"].lower().startswith("scgpt"):
+        if cfg["model"]["name"].lower() in ["cpa", "scvi"]:
             if "cell_sentence_len" in cfg["model"]["kwargs"] and cfg["model"]["kwargs"]["cell_sentence_len"] > 1:
                 sentence_len = cfg["model"]["kwargs"]["cell_sentence_len"]
                 cfg["training"]["batch_size"] = 1
@@ -78,32 +75,7 @@ def run_tx_train(cfg: DictConfig):
             except:
                 sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
 
-    if cfg["model"]["name"].lower().startswith("scgpt"):  # scGPT uses log-normalized expression
-        cfg["data"]["kwargs"]["transform"] = "log-normalize"
-        cfg["data"]["kwargs"]["hvg_names_uns_key"] = (
-            "hvg_names" if cfg["data"]["kwargs"]["train_task"] != "replogle" else None
-        )  # TODO: better to not hardcode this
-
-        cfg["data"]["kwargs"]["dataset_cls"] = "scGPTPerturbationDataset"
-
-        model_dir = Path(cfg["model"]["kwargs"]["pretrained_path"])
-
-        vocab_file = model_dir / "vocab.json"
-
-        vocab = json.load(open(vocab_file, "r"))
-        cfg["model"]["kwargs"]["pad_token_id"] = vocab["<pad>"]
-        for s in cfg["model"]["kwargs"]["special_tokens"]:
-            if s not in vocab:
-                vocab[s] = len(vocab)
-
-        cfg["data"]["kwargs"]["vocab"] = vocab
-        cfg["data"]["kwargs"]["perturbation_type"] = cfg["model"]["kwargs"]["perturbation_type"]
-        cfg["model"]["kwargs"]["ntoken"] = len(vocab)
-        cfg["model"]["kwargs"]["d_model"] = cfg["model"]["kwargs"]["embsize"]
-
-        logger.info("Added vocab and hvg_names_uns_key to data kwargs for scGPT")
-
-    elif cfg["model"]["name"].lower() == "cpa" and cfg["model"]["kwargs"]["recon_loss"] == "gauss":
+    if cfg["model"]["name"].lower() == "cpa" and cfg["model"]["kwargs"]["recon_loss"] == "gauss":
         cfg["data"]["kwargs"]["transform"] = "log-normalize"
     elif cfg["model"]["name"].lower() == "scvi":
         cfg["data"]["kwargs"]["transform"] = None
@@ -164,7 +136,7 @@ def run_tx_train(cfg: DictConfig):
     with open(var_dims_path, "wb") as f:
         pickle.dump(var_dims, f)
 
-    if cfg["model"]["name"].lower() in ["cpa", "scvi"] or cfg["model"]["name"].lower().startswith("scgpt"):
+    if cfg["model"]["name"].lower() in ["cpa", "scvi"]:
         cfg["model"]["kwargs"]["n_cell_types"] = len(data_module.celltype_onehot_map)
         cfg["model"]["kwargs"]["n_perts"] = len(data_module.pert_onehot_map)
         cfg["model"]["kwargs"]["n_batches"] = len(data_module.batch_onehot_map)
@@ -239,15 +211,7 @@ def run_tx_train(cfg: DictConfig):
 
     logger.info("Loggers and callbacks set up.")
 
-    if cfg["model"]["name"].lower().startswith("scgpt"):
-        plugins = [
-            MixedPrecision(
-                precision="bf16-mixed",
-                device="cuda",
-            )
-        ]
-    else:
-        plugins = []
+    plugins = []
 
     if torch.cuda.is_available():
         accelerator = "gpu"
