@@ -14,22 +14,6 @@ from .utils import build_mlp, get_activation_class, get_transformer_backbone, ap
 logger = logging.getLogger(__name__)
 
 
-class CombinedLoss(nn.Module):
-    """Combined Sinkhorn + Energy loss."""
-
-    def __init__(self, sinkhorn_weight=0.001, energy_weight=1.0, blur=0.05):
-        super().__init__()
-        self.sinkhorn_weight = sinkhorn_weight
-        self.energy_weight = energy_weight
-        self.sinkhorn_loss = SamplesLoss(loss="sinkhorn", blur=blur)
-        self.energy_loss = SamplesLoss(loss="energy", blur=blur)
-
-    def forward(self, pred, target):
-        sinkhorn_val = self.sinkhorn_loss(pred, target)
-        energy_val = self.energy_loss(pred, target)
-        return self.sinkhorn_weight * sinkhorn_val + self.energy_weight * energy_val
-
-
 class StateTransitionPerturbationModel(PerturbationModel):
     """
     This model:
@@ -86,7 +70,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.activation_class = get_activation_class(kwargs.get("activation", "gelu"))
         self.cell_sentence_len = kwargs.get("cell_set_len", 256)
         self.decoder_loss_weight = kwargs.get("decoder_weight", 1.0)
-        self.regularization = kwargs.get("regularization", 0.0)
         self.detach_decoder = kwargs.get("detach_decoder", False)
 
         self.transformer_backbone_key = transformer_backbone_key
@@ -106,9 +89,10 @@ class StateTransitionPerturbationModel(PerturbationModel):
         elif loss_name == "mse":
             self.loss_fn = nn.MSELoss()
         elif loss_name == "se":
-            sinkhorn_weight = kwargs.get("sinkhorn_weight", 0.01)
-            energy_weight = kwargs.get("energy_weight", 1.0)
-            self.loss_fn = CombinedLoss(sinkhorn_weight=sinkhorn_weight, energy_weight=energy_weight, blur=blur)
+            raise ValueError(
+                "loss='se' (combined sinkhorn+energy) has been removed. "
+                "Use loss='energy', loss='sinkhorn', or loss='mse'."
+            )
         elif loss_name == "sinkhorn":
             self.loss_fn = SamplesLoss(loss="sinkhorn", blur=blur)
         else:
@@ -361,13 +345,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
         main_loss = torch.nanmean(per_set_main_losses)
         self.log("train_loss", main_loss)
 
-        # Log individual loss components if using combined loss
-        if hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
-            sinkhorn_component = self.loss_fn.sinkhorn_loss(pred, target).nanmean()
-            energy_component = self.loss_fn.energy_loss(pred, target).nanmean()
-            self.log("train/sinkhorn_loss", sinkhorn_component)
-            self.log("train/energy_loss", energy_component)
-
         # Process decoder if available
         decoder_loss = None
         total_loss = main_loss
@@ -400,19 +377,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
             total_loss = total_loss + self.decoder_loss_weight * decoder_loss
 
-        if self.regularization > 0.0:
-            ctrl_cell_emb = batch["ctrl_cell_emb"].reshape_as(pred)
-            delta = pred - ctrl_cell_emb
-
-            # compute l1 loss
-            l1_loss = torch.abs(delta).mean()
-
-            # Log the regularization loss
-            self.log("train/l1_regularization", l1_loss)
-
-            # Add regularization to total loss
-            total_loss = total_loss + self.regularization * l1_loss
-
         return total_loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
@@ -426,13 +390,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
         per_set_main_losses = self._compute_distribution_loss(pred, target)
         loss = torch.nanmean(per_set_main_losses)
         self.log("val_loss", loss)
-
-        # Log individual loss components if using combined loss
-        if hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
-            sinkhorn_component = self.loss_fn.sinkhorn_loss(pred, target).mean()
-            energy_component = self.loss_fn.energy_loss(pred, target).mean()
-            self.log("val/sinkhorn_loss", sinkhorn_component)
-            self.log("val/energy_loss", energy_component)
 
         if self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
