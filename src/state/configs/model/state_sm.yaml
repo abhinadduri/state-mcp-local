@@ -23,8 +23,6 @@ kwargs:
   distributional_loss: energy
   gene_decoder_bool: False
   init_from: null
-  mmd_num_chunks: 1
-  randomize_mmd_chunks: false
   transformer_backbone_key: llama
   transformer_backbone_kwargs:
       bidirectional_attention: true

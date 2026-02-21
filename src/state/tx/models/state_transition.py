@@ -78,8 +78,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         self.distributional_loss = distributional_loss
         self.gene_dim = gene_dim
-        self.mmd_num_chunks = max(int(kwargs.get("mmd_num_chunks", 1)), 1)
-        self.randomize_mmd_chunks = bool(kwargs.get("randomize_mmd_chunks", False))
 
         # Build the distributional loss from geomloss
         blur = kwargs.get("blur", 0.05)
@@ -291,7 +289,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # add to basal if predicting residual
         if self.predict_residual and self.output_space == "all":
             # Project control_cells to hidden_dim space to match res_pred
-            # control_cells_hidden = self.project_to_hidden(control_cells)
             # treat the actual prediction as a residual sum to basal
             out_pred = self.project_out(res_pred) + basal
             out_pred = self.final_down_then_up(out_pred)
@@ -310,21 +307,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         return output
 
     def _compute_distribution_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Apply the primary distributional loss, optionally chunking feature dimensions for SamplesLoss."""
-
-        if isinstance(self.loss_fn, SamplesLoss) and self.mmd_num_chunks > 1:
-            feature_dim = pred.shape[-1]
-            num_chunks = min(self.mmd_num_chunks, feature_dim)
-            if num_chunks > 1 and feature_dim > 0:
-                if self.randomize_mmd_chunks and self.training:
-                    perm = torch.randperm(feature_dim, device=pred.device)
-                    pred = pred.index_select(-1, perm)
-                    target = target.index_select(-1, perm)
-                pred_chunks = torch.chunk(pred, num_chunks, dim=-1)
-                target_chunks = torch.chunk(target, num_chunks, dim=-1)
-                chunk_losses = [self.loss_fn(p_chunk, t_chunk) for p_chunk, t_chunk in zip(pred_chunks, target_chunks)]
-                return torch.stack(chunk_losses, dim=0).nanmean(dim=0)
-
+        """Apply the primary distributional loss."""
         return self.loss_fn(pred, target)
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, padded=True) -> torch.Tensor:
@@ -442,7 +425,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         if self.gene_decoder is not None:
             pert_cell_counts_preds = self.gene_decoder(latent_output)
-
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
         return output_dict

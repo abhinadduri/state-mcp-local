@@ -21,8 +21,6 @@ kwargs:
   use_effect_gating_token: False
   distributional_loss: energy
   init_from: null
-  mmd_num_chunks: 1
-  randomize_mmd_chunks: false
   llm_name: null
 
   transformer_backbone_key: llama
