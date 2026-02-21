@@ -16,8 +16,8 @@ class DecoderOnlyPerturbationModel(PerturbationModel):
     this model simply feeds the latent representation through a decoder network. The loss is computed
     between the decoder output and the target HVG expression.
 
-    It keeps the overall architectural style (and uses the SamplesLoss loss function from geomloss)
-    as in the OldNeuralOT model.
+    It keeps the overall architectural style and uses the SamplesLoss loss
+    function from geomloss.
     """
 
     def __init__(
@@ -49,7 +49,7 @@ class DecoderOnlyPerturbationModel(PerturbationModel):
         self.activation_class = get_activation_class(kwargs.get("activation", "gelu"))
         self.gene_dim = gene_dim
 
-        # Use the same loss function as OldNeuralOT (e.g. using the MMD loss via geomloss)
+        # Use an MMD-style distributional loss via geomloss.
         self.loss_fn = SamplesLoss(loss=self.distributional_loss)
 
     def _build_networks(self):

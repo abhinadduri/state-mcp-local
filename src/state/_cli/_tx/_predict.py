@@ -250,10 +250,6 @@ def run_tx_predict(args: ap.ArgumentParser):
         from ...tx.models.embed_sum import EmbedSumPerturbationModel
 
         ModelClass = EmbedSumPerturbationModel
-    elif model_class_name.lower() == "old_neuralot":
-        from ...tx.models.old_neural_ot import OldNeuralOTPerturbationModel
-
-        ModelClass = OldNeuralOTPerturbationModel
     elif model_class_name.lower() in ["neuralot", "pertsets", "state"]:
         from ...tx.models.state_transition import StateTransitionPerturbationModel
 
