@@ -127,7 +127,13 @@ def get_loggers(
     return loggers
 
 
-def get_checkpoint_callbacks(output_dir: str, name: str, val_freq: int, _ckpt_every_n_steps: int):
+def get_checkpoint_callbacks(
+    output_dir: str,
+    name: str,
+    val_freq: int,
+    _ckpt_every_n_steps: int,
+    monitor_metric: str = "val/expression_loss",
+):
     """
     Create checkpoint callbacks based on validation frequency.
 
@@ -136,12 +142,12 @@ def get_checkpoint_callbacks(output_dir: str, name: str, val_freq: int, _ckpt_ev
     checkpoint_dir = join(output_dir, name, "checkpoints")
     callbacks = []
 
-    # Save only the best checkpoint (by val_loss) plus the latest checkpoint
+    # Save only the best checkpoint (by monitor_metric) plus the latest checkpoint
     best_ckpt = ModelCheckpoint(
         dirpath=checkpoint_dir,
         filename="best",
         save_last=True,
-        monitor="val_loss",
+        monitor=monitor_metric,
         mode="min",
         save_top_k=1,
         every_n_train_steps=val_freq,

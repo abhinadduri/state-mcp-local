@@ -302,7 +302,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
             target = target.reshape(1, -1, self.output_dim)
 
         main_loss = self.loss_fn(pred, target).nanmean()
-        self.log("train_loss", main_loss)
+        self.log(self._train_main_loss_key(), main_loss)
 
         # Process decoder if available
         decoder_loss = None
@@ -326,7 +326,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
             decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
 
             # Log decoder loss
-            self.log("decoder_loss", decoder_loss)
+            self.log(self._train_expression_loss_key(), decoder_loss)
 
             total_loss = total_loss + 0.1 * decoder_loss
 
@@ -341,7 +341,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
         loss = torch.nanmean(self.loss_fn(pred, target))
-        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log(self._val_main_loss_key(), loss, on_step=False, on_epoch=True, prog_bar=True, logger=True)
 
         if self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
@@ -359,17 +359,12 @@ class PseudobulkPerturbationModel(PerturbationModel):
             decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets).mean()
 
             # Log the validation metric
-            self.log("decoder_val_loss", decoder_loss)
+            self.log(self._val_expression_loss_key(), decoder_loss)
 
         return {"loss": loss, "predictions": pred}
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        pred = self.forward(batch, padded=False)
-        target = batch["pert_cell_emb"]
-        pred = pred.reshape(1, -1, self.output_dim)
-        target = target.reshape(1, -1, self.output_dim)
-        loss = self.loss_fn(pred, target).mean()
-        self.log("test_loss", loss)
+        _ = self.forward(batch, padded=False)
 
     def predict_step(self, batch, batch_idx, padded=True, **kwargs):
         """

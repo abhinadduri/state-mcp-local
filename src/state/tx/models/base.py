@@ -189,6 +189,28 @@ class PerturbationModel(ABC, LightningModule):
             return
         self.gene_decoder = LatentToGeneDecoder(**self.decoder_cfg)
 
+    def _main_loss_is_expression(self) -> bool:
+        """
+        Determine whether the primary train/val loss is in expression/count space.
+        """
+        if self.output_space == "embedding":
+            return False
+        return self.embed_key in {"X_hvg", None}
+
+    def _train_main_loss_key(self) -> str:
+        return "train/expression_loss" if self._main_loss_is_expression() else "train/embedding_loss"
+
+    def _val_main_loss_key(self) -> str:
+        return "val/expression_loss" if self._main_loss_is_expression() else "val/embedding_loss"
+
+    @staticmethod
+    def _train_expression_loss_key() -> str:
+        return "train/expression_loss"
+
+    @staticmethod
+    def _val_expression_loss_key() -> str:
+        return "val/expression_loss"
+
     def on_load_checkpoint(self, checkpoint: dict[str, tp.Any]) -> None:
         """
         Lightning calls this *before* the checkpoint's state_dict is loaded.
@@ -228,7 +250,7 @@ class PerturbationModel(ABC, LightningModule):
 
         # Compute main model loss
         main_loss = self.loss_fn(pred, batch["pert_cell_emb"])
-        self.log("train_loss", main_loss)
+        self.log(self._train_main_loss_key(), main_loss)
 
         # Process decoder if available
         decoder_loss = None
@@ -242,7 +264,7 @@ class PerturbationModel(ABC, LightningModule):
             decoder_loss = self.loss_fn(pert_cell_counts_preds, gene_targets)
 
             # Log decoder loss
-            self.log("decoder_loss", decoder_loss)
+            self.log(self._train_expression_loss_key(), decoder_loss)
 
             total_loss = main_loss + decoder_loss
         else:
@@ -257,14 +279,12 @@ class PerturbationModel(ABC, LightningModule):
 
         # TODO: remove unused
         # is_control = self.control_pert in batch["pert_name"]
-        self.log("val_loss", loss)
+        self.log(self._val_main_loss_key(), loss)
 
         return {"loss": loss, "predictions": pred}
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         latent_output = self(batch)
-        target = batch[self.embed_key]
-        loss = self.loss_fn(latent_output, target)
 
         output_dict = {
             "preds": latent_output,  # The distribution's sample
@@ -279,10 +299,6 @@ class PerturbationModel(ABC, LightningModule):
         if self.gene_decoder is not None:
             pert_cell_counts_preds = self.gene_decoder(latent_output)
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
-            decoder_loss = self.loss_fn(pert_cell_counts_preds, batch["pert_cell_counts"])
-            self.log("test_decoder_loss", decoder_loss, prog_bar=True)
-
-        self.log("test_loss", loss, prog_bar=True)
 
     def predict_step(self, batch, batch_idx, **kwargs):
         """
