@@ -190,9 +190,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 lora_cfg,
             )
 
-        # Project from input_dim to hidden_dim for transformer input
-        # self.project_to_hidden = nn.Linear(self.input_dim, self.hidden_dim)
-
         self.project_out = build_mlp(
             in_dim=self.hidden_dim,
             out_dim=self.output_dim,
@@ -294,7 +291,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             out_pred = self.project_out(res_pred) + basal
             out_pred = self.final_down_then_up(out_pred)
         elif self.predict_residual:
-            out_pred = self.project_out(res_pred) + control_cells
+            out_pred = self.project_out(res_pred + control_cells)
         else:
             out_pred = self.project_out(res_pred)
 
