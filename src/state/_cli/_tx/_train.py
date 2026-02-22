@@ -103,7 +103,6 @@ def run_tx_train(cfg: DictConfig):
             gene_dim=gene_dim,
             hidden_dims=hidden_dims,
             dropout=cfg["model"]["kwargs"].get("decoder_dropout", 0.1),
-            residual_decoder=cfg["model"]["kwargs"].get("residual_decoder", False),
         )
 
         # tuck it into the kwargs that will reach the LightningModule
@@ -281,7 +280,6 @@ def run_tx_train(cfg: DictConfig):
                     gene_dim=new_gene_dim,
                     hidden_dims=cfg["model"]["kwargs"].get("decoder_hidden_dims", [1024, 1024, 512]),
                     dropout=cfg["model"]["kwargs"].get("decoder_dropout", 0.1),
-                    residual_decoder=cfg["model"]["kwargs"].get("residual_decoder", False),
                 )
 
                 # Update the model's decoder_cfg and rebuild decoder
