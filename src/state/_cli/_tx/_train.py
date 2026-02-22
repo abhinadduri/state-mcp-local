@@ -72,13 +72,10 @@ def run_tx_train(cfg: DictConfig):
     assert output_space in {"embedding", "gene", "all"}, (
         f"data.kwargs.output_space must be one of 'embedding', 'gene', or 'all'; got {output_space!r}"
     )
-    embed_key = cfg["data"]["kwargs"].get("embed_key")
     if output_space == "embedding":
         checkpoint_monitor_metric = "val/embedding_loss"
-    elif embed_key == "X_hvg" or embed_key is None:
-        checkpoint_monitor_metric = "val/expression_loss"
     else:
-        checkpoint_monitor_metric = "val/embedding_loss"
+        checkpoint_monitor_metric = "val/expression_loss"
 
     data_module: PerturbationDataModule = get_datamodule(
         cfg["data"]["name"],
