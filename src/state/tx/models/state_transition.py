@@ -1,4 +1,5 @@
 import logging
+import math
 
 import numpy as np
 import torch
@@ -293,7 +294,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             out_pred = self.project_out(res_pred) + basal
             out_pred = self.final_down_then_up(out_pred)
         elif self.predict_residual:
-            out_pred = self.project_out(res_pred + control_cells)
+            out_pred = self.project_out(res_pred) + control_cells
         else:
             out_pred = self.project_out(res_pred)
 
@@ -421,3 +422,61 @@ class StateTransitionPerturbationModel(PerturbationModel):
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
         return output_dict
+
+    def configure_optimizers(self):
+        """
+        Configure optimizer and optional cosine LR decay.
+
+        This is intentionally scoped to StateTransitionPerturbationModel only.
+        """
+        optimizer_name = str(self.hparams.get("optimizer", "adam")).lower()
+        base_lr = float(self.hparams.get("lr", self.lr))
+        weight_decay = float(self.hparams.get("weight_decay", 0.0))
+
+        if optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(self.parameters(), lr=base_lr, weight_decay=weight_decay)
+        elif optimizer_name == "adam":
+            optimizer = torch.optim.Adam(self.parameters(), lr=base_lr, weight_decay=weight_decay)
+        else:
+            raise ValueError(f"Unsupported optimizer '{optimizer_name}'. Expected one of: adam, adamw.")
+
+        if not bool(self.hparams.get("use_cosine_decay", False)):
+            return optimizer
+
+        max_lr_cfg = self.hparams.get("max_lr", None)
+        max_lr = float(max_lr_cfg) if max_lr_cfg is not None else base_lr
+        if max_lr <= 0:
+            raise ValueError(f"max_lr must be > 0 when cosine decay is enabled. Received: {max_lr}")
+
+        decay_steps_cfg = self.hparams.get("lr_decay_steps", None)
+        if decay_steps_cfg is None:
+            decay_steps = int(self.hparams.get("max_steps", 0))
+        else:
+            decay_steps = int(decay_steps_cfg)
+        if decay_steps <= 0:
+            raise ValueError(
+                "lr_decay_steps must be a positive integer when cosine decay is enabled "
+                "(or training.max_steps must be set > 0)."
+            )
+
+        max_lr_fraction = float(self.hparams.get("max_lr_fraction", 0.1))
+        if not (0 < max_lr_fraction <= 1.0):
+            raise ValueError(f"max_lr_fraction must be in (0, 1]. Received: {max_lr_fraction}")
+
+        min_lr = max_lr * max_lr_fraction
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = max_lr
+
+        def _lr_lambda(step: int) -> float:
+            if step >= decay_steps:
+                return max_lr_fraction
+            decay_ratio = step / decay_steps
+            coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+            lr = min_lr + coeff * (max_lr - min_lr)
+            return lr / max_lr
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
