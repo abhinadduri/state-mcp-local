@@ -259,6 +259,14 @@ def run_tx_predict(args: ap.ArgumentParser):
             )
         cfg["data"]["kwargs"]["is_log1p"] = resolved_is_log1p
         cfg["data"]["kwargs"]["exp_counts"] = expected_exp_counts
+    resolved_exp_counts = bool(getattr(data_module, "exp_counts", cfg["data"]["kwargs"].get("exp_counts", False)))
+    metrics_is_log1p = not (nb_loss_enabled or resolved_exp_counts)
+    logger.info(
+        "Metrics config: setting pdex is_log1p=%s (nb_loss=%s, exp_counts=%s)",
+        metrics_is_log1p,
+        nb_loss_enabled,
+        resolved_exp_counts,
+    )
     logger.info("Loaded data module from %s", data_module_path)
 
     # Seed everything
@@ -602,7 +610,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
             )
 
-            pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
+            pdex_kwargs = dict(exp_post_agg=True, is_log1p=metrics_is_log1p)
             for ct in ct_split_real.keys():
                 real_ct = ct_split_real[ct]
                 pred_ct = ct_split_pred[ct]
@@ -838,7 +846,7 @@ def run_tx_predict(args: ap.ArgumentParser):
             f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
         )
 
-        pdex_kwargs = dict(exp_post_agg=True, is_log1p=True)
+        pdex_kwargs = dict(exp_post_agg=True, is_log1p=metrics_is_log1p)
 
         for ct in ct_split_real.keys():
             real_ct = ct_split_real[ct]
