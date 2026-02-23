@@ -541,9 +541,7 @@ def run_tx_predict(args: ap.ArgumentParser):
             adata_real = anndata.AnnData(X=real_bulk, obs=obs)
 
         if nb_loss_enabled:
-            logger.info(
-                "nb_loss=True in run config; skipping pseudobulk clipping of adata_pred/adata_real X values."
-            )
+            logger.info("nb_loss=True in run config; skipping pseudobulk clipping of adata_pred/adata_real X values.")
         else:
             clip_anndata_values(adata_pred, max_value=14.0)
             clip_anndata_values(adata_real, max_value=14.0)

@@ -85,9 +85,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         default_nb_embed_loss_weight = 1.0 if self.embed_key is not None else 0.0
         self.nb_embed_loss_weight = float(kwargs.get("nb_embed_loss_weight", default_nb_embed_loss_weight))
         if self.nb_loss and self.output_space not in {"gene", "all"}:
-            raise ValueError(
-                f"nb_loss=True requires output_space in {{'gene', 'all'}}; got {self.output_space!r}."
-            )
+            raise ValueError(f"nb_loss=True requires output_space in {{'gene', 'all'}}; got {self.output_space!r}.")
         if self.nb_loss:
             if self.gene_decoder is not None:
                 logger.info("nb_loss=True: disabling gene_decoder and decoder loss branches.")
@@ -301,7 +299,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             return x.reshape(-1, self.cell_sentence_len, x.shape[-1])
         return x.reshape(1, -1, x.shape[-1])
 
-    def _get_nb_target_tensor(self, batch: Dict[str, torch.Tensor], fallback_target: torch.Tensor, padded: bool) -> torch.Tensor:
+    def _get_nb_target_tensor(
+        self, batch: Dict[str, torch.Tensor], fallback_target: torch.Tensor, padded: bool
+    ) -> torch.Tensor:
         pert_counts = batch.get("pert_cell_counts", None)
         if pert_counts is not None:
             return self._reshape_sequence_tensor(pert_counts.to(fallback_target.device), padded)
