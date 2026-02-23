@@ -36,6 +36,9 @@ dependencies = [
 vectordb = [
     "lancedb>=0.24.0"
 ]
+mcp = [
+    "mcp>=1.0.0"
+]
 
 [dependency-groups]
 dev = ["ruff>=0.11.11", "vulture>=2.14", "ipython>=8.37.0"]
@@ -46,6 +49,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 state = "state.__main__:main"
+state-mcp = "state.mcp:main"
 
 [tool.pyright]
 venvPath = "."

@@ -1,6 +1,10 @@
 import argparse
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import pandas as pd
+
+
+class InferenceCancelledError(RuntimeError):
+    """Raised when tx inference is cancelled by an external caller."""
 
 
 def add_arguments_infer(parser: argparse.ArgumentParser):
@@ -109,6 +113,24 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         default=None,
         help="Upper bound on cells per perturbation after padding; subsamples excess cells if necessary.",
     )
+    parser.add_argument(
+        "--batched",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use batched padded inference (default: enabled). "
+            "Legacy unbatched mode is deprecated and no longer supported."
+        ),
+    )
+    parser.add_argument(
+        "--set-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Number of fixed-length cell sets to process per forward pass. "
+            "Defaults to training.batch_size from config."
+        ),
+    )
 
 
 def run_tx_infer(args: argparse.Namespace):
@@ -123,6 +145,32 @@ def run_tx_infer(args: argparse.Namespace):
     from tqdm import tqdm
 
     from ...tx.models.state_transition import StateTransitionPerturbationModel
+
+    progress_callback = getattr(args, "progress_callback", None)
+    cancel_check = getattr(args, "cancel_check", None)
+
+    def emit_event(kind: str, **payload: Any) -> None:
+        if not callable(progress_callback):
+            return
+        event = {"kind": kind, **payload}
+        try:
+            progress_callback(event)
+        except Exception as exc:
+            warnings.warn(f"Progress callback failed ({type(exc).__name__}: {exc})")
+
+    def ensure_not_cancelled() -> None:
+        if not callable(cancel_check):
+            return
+        try:
+            should_cancel = bool(cancel_check())
+        except Exception as exc:
+            warnings.warn(f"cancel_check failed ({type(exc).__name__}: {exc})")
+            should_cancel = False
+        if should_cancel:
+            emit_event("cancelled", phase="inference", message="Inference cancelled.")
+            raise InferenceCancelledError("Inference cancelled by request.")
+
+    emit_event("phase", phase="initializing", message="Initializing tx inference.")
 
     # -----------------------
     # Helpers
@@ -206,23 +254,72 @@ def run_tx_infer(args: argparse.Namespace):
 
     def prepare_batch(
         ctrl_basal_np: np.ndarray,
-        pert_onehots: torch.Tensor,
-        batch_indices: Optional[torch.Tensor],
-        pert_names: List[str],
+        pert_onehots_np: np.ndarray,
+        batch_indices_np: Optional[np.ndarray],
+        pert_names_by_set: List[str],
+        cell_set_len: int,
         device: torch.device,
     ) -> Dict[str, torch.Tensor | List[str]]:
         """
-        Construct a model batch with variable-length sentence (B=1, S=T, ...).
-        IMPORTANT: All tokens in this batch share the same perturbation.
+        Construct a model batch with fixed-length padded sets for batched inference.
+
+        Args:
+            ctrl_basal_np: Array of control features with shape [B, S, E].
+            pert_onehots_np: Array of perturbation one-hots with shape [B, S, P].
+            batch_indices_np: Optional integer batch indices with shape [B, S].
+            pert_names_by_set: Perturbation name for each set (length B).
+            cell_set_len: Sequence length S expected by the model in padded mode.
+            device: Target torch device.
         """
-        X_batch = torch.tensor(ctrl_basal_np, dtype=torch.float32, device=device)  # [T, E_in]
+        if ctrl_basal_np.ndim != 3:
+            raise ValueError(
+                f"Expected ctrl_basal_np shape [B, S, E], got shape {ctrl_basal_np.shape}"
+            )
+        if pert_onehots_np.ndim != 3:
+            raise ValueError(
+                f"Expected pert_onehots_np shape [B, S, P], got shape {pert_onehots_np.shape}"
+            )
+        if ctrl_basal_np.shape[:2] != pert_onehots_np.shape[:2]:
+            raise ValueError(
+                "ctrl_basal_np and pert_onehots_np must have matching [B, S] dimensions; "
+                f"got {ctrl_basal_np.shape[:2]} vs {pert_onehots_np.shape[:2]}"
+            )
+
+        bsz, seq_len, emb_dim = ctrl_basal_np.shape
+        if seq_len != cell_set_len:
+            raise ValueError(f"Expected sequence length {cell_set_len}, got {seq_len}")
+        if len(pert_names_by_set) != bsz:
+            raise ValueError(
+                f"Expected {bsz} perturbation names, got {len(pert_names_by_set)}"
+            )
+
+        X_batch = torch.tensor(
+            ctrl_basal_np.reshape(bsz * seq_len, emb_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        pert_batch = torch.tensor(
+            pert_onehots_np.reshape(bsz * seq_len, pert_onehots_np.shape[-1]),
+            dtype=torch.float32,
+            device=device,
+        )
+        pert_names = [p for p in pert_names_by_set for _ in range(seq_len)]
         batch = {
             "ctrl_cell_emb": X_batch,
-            "pert_emb": pert_onehots.to(device),  # [T, pert_dim] (same row repeated)
-            "pert_name": pert_names,  # list[str], all identical
+            "pert_emb": pert_batch,
+            "pert_name": pert_names,
         }
-        if batch_indices is not None:
-            batch["batch"] = batch_indices.to(device)  # [T]
+        if batch_indices_np is not None:
+            if batch_indices_np.shape != (bsz, seq_len):
+                raise ValueError(
+                    "batch_indices_np must have shape [B, S] to match inputs; "
+                    f"got {batch_indices_np.shape} for expected {(bsz, seq_len)}"
+                )
+            batch["batch"] = torch.tensor(
+                batch_indices_np.reshape(bsz * seq_len),
+                dtype=torch.long,
+                device=device,
+            )
         return batch
 
     def pad_adata_with_tsv(
@@ -357,9 +454,11 @@ def run_tx_infer(args: argparse.Namespace):
     # 1) Load config + dims + mappings
     # -----------------------
     config_path = os.path.join(args.model_dir, "config.yaml")
+    ensure_not_cancelled()
     cfg = load_config(config_path)
     if not args.quiet:
         print(f"Loaded config: {config_path}")
+    emit_event("phase", phase="config_loaded", message=f"Loaded config: {config_path}")
 
     # control_pert
     control_pert = args.control_pert
@@ -437,10 +536,43 @@ def run_tx_infer(args: argparse.Namespace):
         if not args.quiet:
             print(f"No --checkpoint given, using {checkpoint_path}")
 
-    model = StateTransitionPerturbationModel.load_from_checkpoint(checkpoint_path)
+    preferred_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if preferred_device.type == "cuda":
+        try:
+            model = StateTransitionPerturbationModel.load_from_checkpoint(
+                checkpoint_path,
+                map_location=preferred_device,
+            )
+            model = model.to(preferred_device)
+        except Exception as e:
+            warnings.warn(f"Failed to load model on CUDA ({e}); falling back to CPU.")
+            preferred_device = torch.device("cpu")
+            model = StateTransitionPerturbationModel.load_from_checkpoint(
+                checkpoint_path,
+                map_location=preferred_device,
+            )
+            model = model.to(preferred_device)
+    else:
+        model = StateTransitionPerturbationModel.load_from_checkpoint(
+            checkpoint_path,
+            map_location=preferred_device,
+        )
+        model = model.to(preferred_device)
+
     model.eval()
     device = next(model.parameters()).device
     cell_set_len = args.max_set_len if args.max_set_len is not None else getattr(model, "cell_sentence_len", 256)
+    if cell_set_len <= 0:
+        raise ValueError(f"Resolved cell_set_len must be a positive integer, got {cell_set_len}")
+    if not args.batched:
+        warnings.warn(
+            "--no-batched is deprecated. tx infer now always uses batched padded inference (padded=True)."
+        )
+    set_batch_size = args.set_batch_size
+    if set_batch_size is None:
+        set_batch_size = int(cfg.get("training", {}).get("batch_size", 1))
+    if set_batch_size <= 0:
+        raise ValueError(f"--set-batch-size must be a positive integer, got {set_batch_size}")
     uses_batch_encoder = getattr(model, "batch_encoder", None) is not None
     output_space = getattr(model, "output_space", cfg.get("data", {}).get("kwargs", {}).get("output_space", "gene"))
     nb_loss_enabled = bool(getattr(model, "nb_loss", cfg.get("model", {}).get("kwargs", {}).get("nb_loss", False)))
@@ -455,14 +587,35 @@ def run_tx_infer(args: argparse.Namespace):
     if not args.quiet:
         print(f"Model device: {device}")
         print(f"Model cell_set_len (max sequence length): {cell_set_len}")
+        print(f"Batched padded inference: enabled (set_batch_size={set_batch_size})")
         print(f"Model uses batch encoder: {bool(uses_batch_encoder)}")
         print(f"Model output space: {output_space}")
         print(f"Model nb_loss enabled: {nb_loss_enabled}")
+    emit_event(
+        "phase",
+        phase="model_loaded",
+        message=f"Model loaded on {device}.",
+        device=str(device),
+        cell_set_len=cell_set_len,
+        set_batch_size=set_batch_size,
+        batched=True,
+        output_space=output_space,
+        nb_loss=nb_loss_enabled,
+    )
 
     # -----------------------
     # 3) Load AnnData
     # -----------------------
+    ensure_not_cancelled()
     adata = sc.read_h5ad(args.adata)
+    emit_event(
+        "phase",
+        phase="adata_loaded",
+        message=f"Loaded AnnData: {args.adata}",
+        adata_path=args.adata,
+        n_obs=int(adata.n_obs),
+        n_vars=int(adata.n_vars),
+    )
 
     # optional TSV padding mode - pad with additional perturbation cells
     if args.tsv:
@@ -752,6 +905,17 @@ def run_tx_infer(args: argparse.Namespace):
         group_labels = np.array(["__ALL__"] * n_total)
         unique_groups = np.array(["__ALL__"])
 
+    group_pert_totals: dict[str, int] = {}
+    total_perts = 0
+    for g in unique_groups:
+        g_mask = group_labels == g
+        g_total = int(np.unique(pert_names_all[g_mask]).shape[0])
+        group_pert_totals[str(g)] = g_total
+        total_perts += g_total
+
+    perts_done = 0
+    cells_done = 0
+
     # Control pools (group-specific with fallback to global)
     all_control_indices = np.where(ctl_mask)[0]
 
@@ -771,12 +935,88 @@ def run_tx_infer(args: argparse.Namespace):
         if pert_dim and pert_dim > 0:
             default_pert_vec[0] = 1.0
 
+    internal_padding_tokens = 0
+
+    def ensure_counts_storage(target_dim: int):
+        nonlocal sim_counts
+        if sim_counts is not None:
+            if sim_counts.shape[1] != target_dim:
+                raise ValueError(
+                    "Predicted counts dimension mismatch: "
+                    f"expected {sim_counts.shape[1]} but got {target_dim}"
+                )
+            return
+
+        if output_space == "gene":
+            if counts_obsm_key and counts_obsm_key in adata.obsm:
+                existing = np.asarray(adata.obsm[counts_obsm_key])
+                if existing.shape[1] == target_dim:
+                    sim_counts = existing.astype(np.float32, copy=True)
+                    return
+                if not args.quiet:
+                    print(
+                        f"Dimension mismatch for existing obsm['{counts_obsm_key}'] "
+                        f"(got {existing.shape[1]} vs predictions {target_dim}). "
+                        "Reinitializing storage with zeros."
+                    )
+            sim_counts = np.zeros((n_total, target_dim), dtype=np.float32)
+            return
+
+        # output_space == "all"
+        if writes_to[0] == ".X":
+            sim_counts = sim_X
+        else:
+            sim_counts = np.zeros((n_total, target_dim), dtype=np.float32)
+
+    def write_pred_rows(row_indices: np.ndarray, pred_rows: np.ndarray):
+        nonlocal out_target
+        if writes_to[0] == ".X":
+            if pred_rows.shape[1] == sim_X.shape[1]:
+                sim_X[row_indices, :] = pred_rows
+            else:
+                if not args.quiet:
+                    print(
+                        f"Dimension mismatch for X (got {pred_rows.shape[1]} vs {sim_X.shape[1]}). "
+                        "Falling back to adata.obsm['X_state_pred']."
+                    )
+                if "X_state_pred" not in adata.obsm:
+                    adata.obsm["X_state_pred"] = np.zeros((n_total, pred_rows.shape[1]), dtype=np.float32)
+                adata.obsm["X_state_pred"][row_indices, :] = pred_rows
+                out_target = "obsm['X_state_pred']"
+        else:
+            if pred_rows.shape[1] == sim_obsm.shape[1]:
+                sim_obsm[row_indices, :] = pred_rows
+            else:
+                side_key = f"{writes_to[1]}_pred"
+                if not args.quiet:
+                    print(
+                        f"Dimension mismatch for obsm['{writes_to[1]}'] "
+                        f"(got {pred_rows.shape[1]} vs {sim_obsm.shape[1]}). "
+                        f"Writing to adata.obsm['{side_key}'] instead."
+                    )
+                if side_key not in adata.obsm:
+                    adata.obsm[side_key] = np.zeros((n_total, pred_rows.shape[1]), dtype=np.float32)
+                adata.obsm[side_key][row_indices, :] = pred_rows
+                out_target = f"obsm['{side_key}']"
+
     if not args.quiet:
-        print("Running virtual experiment (homogeneous per-perturbation forward passes; controls included)...")
+        print(
+            "Running virtual experiment (homogeneous per-perturbation forward passes; "
+            "batched fixed-length sets with replacement padding)..."
+        )
+    emit_event(
+        "phase",
+        phase="inference_started",
+        message="Started batched padded inference.",
+        groups_total=int(len(unique_groups)),
+        perturbations_total=int(total_perts),
+        cells_total=int(n_total),
+    )
 
     model_device = next(model.parameters()).device
     with torch.no_grad():
-        for g in unique_groups:
+        for group_index, g in enumerate(unique_groups, start=1):
+            ensure_not_cancelled()
             grp_idx = np.where(group_labels == g)[0]
             if len(grp_idx) == 0:
                 continue
@@ -788,17 +1028,33 @@ def run_tx_infer(args: argparse.Namespace):
                     print(f"Group '{g}': no control cells available anywhere; leaving rows unchanged.")
                 continue
 
-            # --- iterate by perturbation so each forward pass is homogeneous ---
+            emit_event(
+                "phase",
+                phase="group_started",
+                message=f"Started group '{g}'.",
+                group=str(g),
+                group_index=group_index,
+                groups_total=int(len(unique_groups)),
+                group_perturbations_total=int(group_pert_totals.get(str(g), 0)),
+                perturbations_done=int(perts_done),
+                perturbations_total=int(total_perts),
+                cells_done=int(cells_done),
+                cells_total=int(n_total),
+            )
+
+            # --- iterate by perturbation and batch multiple fixed-length sets ---
             grp_perts = np.unique(pert_names_all[grp_idx])
+            group_perts_done = 0
             POSTFIX_WIDTH = 30
             pbar = tqdm(
                 grp_perts,
                 desc=f"Group {g}",
-                bar_format="{l_bar}{bar}{r_bar}",  # r_bar already has n/total, time, rate, and postfix
+                bar_format="{l_bar}{bar}{r_bar}",
                 dynamic_ncols=True,
                 disable=args.quiet,
             )
             for p in pbar:
+                ensure_not_cancelled()
                 current_postfix = f"Pert: {p}"
                 pbar.set_postfix_str(f"{current_postfix:<{POSTFIX_WIDTH}.{POSTFIX_WIDTH}}")
 
@@ -806,7 +1062,6 @@ def run_tx_infer(args: argparse.Namespace):
                 if len(idxs) == 0:
                     continue
 
-                # one-hot vector for this perturbation (repeat across window)
                 map_key = pert_name_lookup.get(p, p)
                 vec = pert_onehot_map.get(map_key, None)
                 if vec is None:
@@ -814,116 +1069,146 @@ def run_tx_infer(args: argparse.Namespace):
                     if not args.quiet:
                         print(f"  (group {g}) pert '{p}' not in mapping; using control fallback one-hot.")
 
+                sentence_specs = []
                 start = 0
                 while start < len(idxs):
+                    ensure_not_cancelled()
                     end = min(start + cell_set_len, len(idxs))
-                    idx_window = idxs[start:end]
-                    win_size = len(idx_window)
+                    real_rows = idxs[start:end]
+                    real_n = len(real_rows)
+                    if real_n == 0:
+                        break
 
-                    # 1) Sample matched control basals (with replacement)
-                    sampled_ctrl_idx = rng.choice(grp_ctrl_pool, size=win_size, replace=True)
-                    ctrl_basal = X_in[sampled_ctrl_idx, :]  # [win, E_in]
-
-                    # 2) Build homogeneous pert one-hots
-                    pert_oh = vec.float().unsqueeze(0).repeat(win_size, 1)  # [win, pert_dim]
-
-                    # 3) Batch indices (optional)
-                    if uses_batch_encoder and batch_indices_all is not None:
-                        bi = torch.tensor(batch_indices_all[idx_window], dtype=torch.long)  # [win]
+                    if real_n < cell_set_len:
+                        fill_rows = rng.choice(real_rows, size=cell_set_len - real_n, replace=True)
+                        set_rows = np.concatenate([real_rows, fill_rows]).astype(np.int64, copy=False)
+                        internal_padding_tokens += int(cell_set_len - real_n)
                     else:
-                        bi = None
+                        set_rows = real_rows.astype(np.int64, copy=False)
 
-                    # 4) Forward pass (homogeneous pert in this window)
-                    batch = prepare_batch(
-                        ctrl_basal_np=ctrl_basal,
-                        pert_onehots=pert_oh,
-                        batch_indices=bi,
-                        pert_names=[p] * win_size,
-                        device=model_device,
+                    sampled_ctrl_idx = rng.choice(grp_ctrl_pool, size=cell_set_len, replace=True).astype(
+                        np.int64, copy=False
                     )
-                    batch_out = model.predict_step(batch, batch_idx=0, padded=False)
 
-                    # 5) Choose output to write
-                    if (
-                        counts_expected
-                        and writes_to[0] == ".X"
-                        and ("pert_cell_counts_preds" in batch_out)
-                        and (batch_out["pert_cell_counts_preds"] is not None)
-                    ):
-                        preds = (
-                            batch_out["pert_cell_counts_preds"].detach().cpu().numpy().astype(np.float32)
-                        )  # [win, G]
+                    if uses_batch_encoder and batch_indices_all is not None:
+                        set_batch_idx = batch_indices_all[set_rows].astype(np.int64, copy=False)
                     else:
-                        preds = batch_out["preds"].detach().cpu().numpy().astype(np.float32)  # [win, D]
+                        set_batch_idx = None
 
-                    counts_preds = None
-                    if counts_expected and ("pert_cell_counts_preds" in batch_out):
-                        counts_tensor = batch_out.get("pert_cell_counts_preds")
-                        if counts_tensor is not None:
-                            counts_preds = counts_tensor.detach().cpu().numpy().astype(np.float32)
+                    sentence_specs.append(
+                        {
+                            "real_rows": real_rows.astype(np.int64, copy=False),
+                            "real_n": real_n,
+                            "ctrl_rows": sampled_ctrl_idx,
+                            "set_batch_idx": set_batch_idx,
+                        }
+                    )
 
-                    if counts_preds is not None:
-                        if sim_counts is None:
-                            target_dim = counts_preds.shape[1]
-                            if output_space == "gene":
-                                if counts_obsm_key and counts_obsm_key in adata.obsm:
-                                    existing = np.asarray(adata.obsm[counts_obsm_key])
-                                    if existing.shape[1] == target_dim:
-                                        sim_counts = existing.astype(np.float32, copy=True)
-                                    else:
-                                        if not args.quiet:
-                                            print(
-                                                f"Dimension mismatch for existing obsm['{counts_obsm_key}'] "
-                                                f"(got {existing.shape[1]} vs predictions {target_dim}). "
-                                                "Reinitializing storage with zeros."
-                                            )
-                                        sim_counts = np.zeros((n_total, target_dim), dtype=np.float32)
-                                else:
-                                    sim_counts = np.zeros((n_total, target_dim), dtype=np.float32)
-                            else:  # output_space == "all"
-                                if writes_to[0] == ".X":
-                                    sim_counts = sim_X
-                                else:
-                                    sim_counts = np.zeros((n_total, target_dim), dtype=np.float32)
-                        if sim_counts.shape[1] != counts_preds.shape[1]:
+                    should_flush = len(sentence_specs) >= set_batch_size or end >= len(idxs)
+                    if should_flush:
+                        bsz = len(sentence_specs)
+                        ctrl_stack = np.stack([X_in[s["ctrl_rows"], :] for s in sentence_specs], axis=0).astype(
+                            np.float32, copy=False
+                        )
+                        if torch.is_tensor(vec):
+                            vec_np = vec.detach().cpu().numpy().astype(np.float32, copy=False)
+                        else:
+                            vec_np = np.asarray(vec, dtype=np.float32)
+                        if vec_np.ndim != 1:
                             raise ValueError(
-                                "Predicted counts dimension mismatch: "
-                                f"expected {sim_counts.shape[1]} but got {counts_preds.shape[1]}"
+                                f"Expected 1D perturbation vector for '{p}', got shape {vec_np.shape}"
                             )
-                        sim_counts[idx_window, :] = counts_preds
-                        counts_written = True
+                        pert_stack = np.tile(vec_np.reshape(1, 1, -1), (bsz, cell_set_len, 1))
 
-                    # 6) Write predictions for these rows (controls included)
-                    if writes_to[0] == ".X":
-                        if preds.shape[1] == sim_X.shape[1]:
-                            sim_X[idx_window, :] = preds
+                        if uses_batch_encoder and batch_indices_all is not None:
+                            batch_stack = np.stack([s["set_batch_idx"] for s in sentence_specs], axis=0).astype(
+                                np.int64, copy=False
+                            )
                         else:
-                            if not args.quiet:
-                                print(
-                                    f"Dimension mismatch for X (got {preds.shape[1]} vs {sim_X.shape[1]}). "
-                                    f"Falling back to adata.obsm['X_state_pred']."
-                                )
-                            if "X_state_pred" not in adata.obsm:
-                                adata.obsm["X_state_pred"] = np.zeros((n_total, preds.shape[1]), dtype=np.float32)
-                            adata.obsm["X_state_pred"][idx_window, :] = preds
-                            out_target = "obsm['X_state_pred']"
-                    else:
-                        if preds.shape[1] == sim_obsm.shape[1]:
-                            sim_obsm[idx_window, :] = preds
-                        else:
-                            side_key = f"{writes_to[1]}_pred"
-                            if not args.quiet:
-                                print(
-                                    f"Dimension mismatch for obsm['{writes_to[1]}'] "
-                                    f"(got {preds.shape[1]} vs {sim_obsm.shape[1]}). "
-                                    f"Writing to adata.obsm['{side_key}'] instead."
-                                )
-                            if side_key not in adata.obsm:
-                                adata.obsm[side_key] = np.zeros((n_total, preds.shape[1]), dtype=np.float32)
-                            adata.obsm[side_key][idx_window, :] = preds
-                            out_target = f"obsm['{side_key}']"
+                            batch_stack = None
 
-                    start = end  # next window
+                        batch = prepare_batch(
+                            ctrl_basal_np=ctrl_stack,
+                            pert_onehots_np=pert_stack,
+                            batch_indices_np=batch_stack,
+                            pert_names_by_set=[p] * bsz,
+                            cell_set_len=cell_set_len,
+                            device=model_device,
+                        )
+                        batch_out = model.predict_step(batch, batch_idx=0, padded=True)
+
+                        if (
+                            counts_expected
+                            and writes_to[0] == ".X"
+                            and ("pert_cell_counts_preds" in batch_out)
+                            and (batch_out["pert_cell_counts_preds"] is not None)
+                        ):
+                            preds_flat = (
+                                batch_out["pert_cell_counts_preds"].detach().cpu().numpy().astype(np.float32)
+                            )
+                        else:
+                            preds_flat = batch_out["preds"].detach().cpu().numpy().astype(np.float32)
+                        preds = preds_flat.reshape(bsz, cell_set_len, -1)
+
+                        counts_preds = None
+                        if counts_expected and ("pert_cell_counts_preds" in batch_out):
+                            counts_tensor = batch_out.get("pert_cell_counts_preds")
+                            if counts_tensor is not None:
+                                counts_flat = counts_tensor.detach().cpu().numpy().astype(np.float32)
+                                counts_preds = counts_flat.reshape(bsz, cell_set_len, -1)
+
+                        if counts_preds is not None:
+                            ensure_counts_storage(counts_preds.shape[2])
+                            counts_written = True
+
+                        for set_i, spec in enumerate(sentence_specs):
+                            real_n_local = int(spec["real_n"])
+                            real_rows_local = spec["real_rows"]
+
+                            pred_rows = preds[set_i, :real_n_local, :]
+                            write_pred_rows(real_rows_local, pred_rows)
+                            cells_done += real_n_local
+
+                            if counts_preds is not None and sim_counts is not None:
+                                sim_counts[real_rows_local, :] = counts_preds[set_i, :real_n_local, :]
+
+                        sentence_specs = []
+
+                    start = end  # next sentence
+
+                perts_done += 1
+                group_perts_done += 1
+                emit_event(
+                    "progress",
+                    phase="inference",
+                    message=f"Completed perturbation '{p}' in group '{g}'.",
+                    group=str(g),
+                    group_index=group_index,
+                    groups_total=int(len(unique_groups)),
+                    group_perturbations_done=int(group_perts_done),
+                    group_perturbations_total=int(group_pert_totals.get(str(g), 0)),
+                    perturbations_done=int(perts_done),
+                    perturbations_total=int(total_perts),
+                    cells_done=int(cells_done),
+                    cells_total=int(n_total),
+                    internal_padding_tokens=int(internal_padding_tokens),
+                )
+
+            emit_event(
+                "phase",
+                phase="group_completed",
+                message=f"Completed group '{g}'.",
+                group=str(g),
+                group_index=group_index,
+                groups_total=int(len(unique_groups)),
+                group_perturbations_done=int(group_perts_done),
+                group_perturbations_total=int(group_pert_totals.get(str(g), 0)),
+                perturbations_done=int(perts_done),
+                perturbations_total=int(total_perts),
+                cells_done=int(cells_done),
+                cells_total=int(n_total),
+                internal_padding_tokens=int(internal_padding_tokens),
+            )
 
     # Clip legacy decoder outputs only; NB count outputs remain unclipped.
     if output_space in {"gene", "all"}:
@@ -994,6 +1279,23 @@ def run_tx_infer(args: argparse.Namespace):
     else:
         adata.write_h5ad(output_path)
 
+    emit_event(
+        "summary",
+        phase="completed",
+        message="Inference completed successfully.",
+        output_path=output_path,
+        output_is_npy=bool(output_is_npy),
+        cells_total=int(n_total),
+        controls_simulated=int(n_controls),
+        treated_simulated=int(n_nonctl),
+        perturbations_done=int(perts_done),
+        perturbations_total=int(total_perts),
+        internal_padding_tokens=int(internal_padding_tokens),
+        counts_written=bool(counts_written),
+        counts_out_target=counts_out_target,
+        out_target=out_target,
+    )
+
     # -----------------------
     # 6) Summary
     # -----------------------
@@ -1001,6 +1303,7 @@ def run_tx_infer(args: argparse.Namespace):
     print(f"Input cells:         {n_total}")
     print(f"Controls simulated:  {n_controls}")
     print(f"Treated simulated:   {n_nonctl}")
+    print(f"Internal padded tokens dropped: {internal_padding_tokens}")
     if output_is_npy:
         shape_str = " x ".join(str(dim) for dim in pred_matrix.shape) if pred_matrix is not None else "unknown"
         print(f"Wrote predictions array (shape: {shape_str})")
