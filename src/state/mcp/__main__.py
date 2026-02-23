@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import multiprocessing as mp
+import os
+import signal
+import sys
 import threading
 import time
 import traceback
@@ -34,6 +38,18 @@ _SERVER_STATE: dict[str, str | None] = {"model_folder": None}
 
 _TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
 _JOB_LOG_LIMIT = 5000
+_MAX_EVENT_DRAIN = 2000
+_HEARTBEAT_INTERVAL_SECONDS = 10.0
+_CANCEL_GRACE_SECONDS = 30.0
+_TERMINATE_GRACE_SECONDS = 10.0
+
+
+def _get_worker_mp_context() -> mp.context.BaseContext:
+    # Prefer fork on POSIX to avoid `spawn` import/path edge cases in tool-hosted environments.
+    try:
+        return mp.get_context("fork")
+    except ValueError:
+        return mp.get_context("spawn")
 
 
 @dataclass
@@ -52,8 +68,19 @@ class InferenceJob:
     finished_at: str | None = None
     error: str | None = None
     cancel_requested: bool = False
+    cancel_requested_at: str | None = None
+    cancel_grace_deadline_monotonic: float | None = None
+    terminate_sent_at_monotonic: float | None = None
     last_event: dict[str, Any] | None = None
-    thread: threading.Thread | None = None
+    last_update_at: str = field(default_factory=lambda: _utc_now_iso())
+    last_update_monotonic: float = field(default_factory=time.monotonic)
+    adata_size_bytes: int | None = None
+    worker_pid: int | None = None
+    worker_exit_code: int | None = None
+    worker_log_path: str | None = None
+    process: mp.Process | None = None
+    cancel_flag_path: str | None = None
+    event_conn: Any | None = None
 
 
 _JOBS: dict[str, InferenceJob] = {}
@@ -64,7 +91,13 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _touch_job(job: InferenceJob) -> None:
+    job.last_update_at = _utc_now_iso()
+    job.last_update_monotonic = time.monotonic()
+
+
 def _append_job_log(job: InferenceJob, message: str) -> None:
+    _touch_job(job)
     line = f"{_utc_now_iso()} {message}"
     job.logs.append(line)
     if len(job.logs) > _JOB_LOG_LIMIT:
@@ -94,6 +127,7 @@ def _event_progress_percent(event: dict[str, Any]) -> float | None:
 
 
 def _record_job_event(job: InferenceJob, event: dict[str, Any]) -> None:
+    _touch_job(job)
     job.last_event = dict(event)
     progress = {
         "kind": event.get("kind"),
@@ -129,6 +163,223 @@ def _record_job_event(job: InferenceJob, event: dict[str, Any]) -> None:
 
     if should_log:
         _append_job_log(job, f"[{kind}] {message}")
+
+
+def _process_alive(process: mp.Process | None) -> bool:
+    if process is None:
+        return False
+    try:
+        return process.is_alive()
+    except Exception:
+        return False
+
+
+def _signal_name_for_exit_code(exit_code: int) -> str | None:
+    if exit_code >= 0:
+        return None
+    signal_number = -exit_code
+    try:
+        return signal.Signals(signal_number).name
+    except Exception:
+        return None
+
+
+def _release_job_runtime_resources(job: InferenceJob) -> None:
+    process = job.process
+    if process is not None:
+        try:
+            if process.exitcode is not None:
+                job.worker_exit_code = int(process.exitcode)
+        except Exception:
+            pass
+        try:
+            process.join(timeout=0)
+        except Exception:
+            pass
+    event_conn = job.event_conn
+    if event_conn is not None:
+        try:
+            event_conn.close()
+        except Exception:
+            pass
+    cancel_flag_path = job.cancel_flag_path
+    if isinstance(cancel_flag_path, str) and cancel_flag_path:
+        try:
+            Path(cancel_flag_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+    job.process = None
+    job.event_conn = None
+    job.cancel_flag_path = None
+
+
+def _apply_worker_message(job: InferenceJob, message: dict[str, Any]) -> None:
+    if not isinstance(message, dict):
+        return
+
+    msg_type = message.get("type")
+    if msg_type == "event":
+        event = message.get("event")
+        if isinstance(event, dict):
+            _record_job_event(job, event)
+        return
+
+    if msg_type == "heartbeat":
+        _touch_job(job)
+        current_progress = dict(job.progress)
+        current_progress["worker_heartbeat_at"] = job.last_update_at
+        job.progress = current_progress
+        return
+
+    if msg_type == "status":
+        _touch_job(job)
+        status_value = message.get("status")
+        if isinstance(status_value, str) and status_value:
+            if not (status_value == "running" and job.cancel_requested):
+                job.status = status_value
+        started_at = message.get("started_at")
+        if isinstance(started_at, str) and started_at:
+            job.started_at = started_at
+        finished_at = message.get("finished_at")
+        if isinstance(finished_at, str) and finished_at:
+            job.finished_at = finished_at
+        error = message.get("error")
+        if isinstance(error, str) and error.strip():
+            job.error = error
+        note = message.get("message")
+        if isinstance(note, str) and note.strip():
+            _append_job_log(job, note)
+        return
+
+    if msg_type == "traceback":
+        trace = message.get("traceback")
+        if isinstance(trace, str) and trace.strip():
+            _append_job_log(job, trace.strip())
+        return
+
+
+def _drain_job_events_locked(job: InferenceJob) -> None:
+    event_conn = job.event_conn
+    if event_conn is None:
+        return
+
+    drained = 0
+    while drained < _MAX_EVENT_DRAIN:
+        try:
+            if not event_conn.poll(0):
+                break
+            message = event_conn.recv()
+        except (EOFError, OSError, ValueError):
+            break
+        drained += 1
+        _apply_worker_message(job, message)
+
+    if drained >= _MAX_EVENT_DRAIN:
+        _append_job_log(job, f"[warning] Drained {_MAX_EVENT_DRAIN} worker events; additional events remain queued.")
+
+
+def _recommend_poll_interval_seconds(job: InferenceJob, *, for_logs: bool = False) -> float | None:
+    if job.status in _TERMINAL_JOB_STATUSES:
+        return None
+
+    if job.status == "queued":
+        interval = 3.0
+    elif job.status == "cancelling":
+        interval = 4.0
+    else:
+        phase = str(job.progress.get("phase") or "")
+        kind = str(job.progress.get("kind") or "")
+        if kind == "progress":
+            interval = 3.0
+        elif phase in {"initializing", "config_loaded", "model_loaded", "adata_loaded"}:
+            interval = 15.0
+        else:
+            interval = 8.0
+
+    adata_size = int(job.adata_size_bytes or 0)
+    if adata_size >= 10 * 1024**3:
+        interval = max(interval, 25.0)
+    elif adata_size >= 2 * 1024**3:
+        interval = max(interval, 12.0)
+
+    seconds_since_update = max(0.0, time.monotonic() - float(job.last_update_monotonic))
+    if job.status == "running" and seconds_since_update >= 120.0:
+        interval = max(interval, 20.0)
+
+    if for_logs:
+        interval = max(interval * 1.5, 6.0)
+
+    return round(interval, 1)
+
+
+def _sync_job_state_locked(job: InferenceJob) -> None:
+    _drain_job_events_locked(job)
+
+    process = job.process
+    if process is None:
+        return
+
+    if job.worker_pid is None and process.pid is not None:
+        job.worker_pid = int(process.pid)
+
+    now = time.monotonic()
+    if job.cancel_requested and _process_alive(process):
+        deadline = job.cancel_grace_deadline_monotonic
+        if deadline is not None and now >= deadline and job.terminate_sent_at_monotonic is None:
+            try:
+                process.terminate()
+                job.terminate_sent_at_monotonic = now
+                _append_job_log(job, "[cancelling] Cancellation grace elapsed; sent SIGTERM to worker process.")
+            except Exception as exc:
+                _append_job_log(job, f"[warning] Failed to terminate worker process cleanly: {type(exc).__name__}: {exc}")
+        elif (
+            job.terminate_sent_at_monotonic is not None
+            and now >= (job.terminate_sent_at_monotonic + _TERMINATE_GRACE_SECONDS)
+            and _process_alive(process)
+        ):
+            try:
+                process.kill()
+                job.terminate_sent_at_monotonic = now
+                _append_job_log(job, "[cancelling] Worker did not exit after SIGTERM; sent SIGKILL.")
+            except Exception as exc:
+                _append_job_log(job, f"[warning] Failed to force-kill worker process: {type(exc).__name__}: {exc}")
+
+    if _process_alive(process):
+        return
+
+    try:
+        exit_code = process.exitcode
+    except Exception:
+        exit_code = None
+    if isinstance(exit_code, int):
+        job.worker_exit_code = exit_code
+
+    if job.status not in _TERMINAL_JOB_STATUSES:
+        if job.cancel_requested:
+            job.status = "cancelled"
+            if not job.error:
+                if isinstance(exit_code, int) and exit_code < 0:
+                    signal_name = _signal_name_for_exit_code(exit_code)
+                    if signal_name:
+                        job.error = f"Inference cancelled by request (worker terminated by {signal_name})."
+                    else:
+                        job.error = f"Inference cancelled by request (worker exit code {exit_code})."
+                else:
+                    job.error = "Inference cancelled by request."
+            _append_job_log(job, "[cancelled] Inference cancelled.")
+        elif exit_code == 0:
+            job.status = "succeeded"
+            _append_job_log(job, "[succeeded] Inference job completed.")
+        else:
+            job.status = "failed"
+            if not job.error:
+                job.error = f"Worker process exited unexpectedly with code {exit_code}."
+            _append_job_log(job, f"[failed] {job.error}")
+
+    if job.finished_at is None:
+        job.finished_at = _utc_now_iso()
+
+    _release_job_runtime_resources(job)
 
 
 def _make_ctx_notifier(ctx: Context):
@@ -202,6 +453,7 @@ def _resolve_tx_inference_request(
     adata_resolved = str(Path(adata_path).expanduser().resolve())
     if not Path(adata_resolved).is_file():
         raise FileNotFoundError(f"AnnData file not found: {adata_resolved}")
+    adata_size_bytes = int(Path(adata_resolved).stat().st_size)
 
     resolved_model_folder = resolve_and_validate_model_folder(model_folder, _SERVER_STATE["model_folder"])
     defaults = infer_tx_inference_defaults(resolved_model_folder)
@@ -259,6 +511,7 @@ def _resolve_tx_inference_request(
     resolved_payload = {
         "model_folder": resolved_model_folder,
         "adata_path": adata_resolved,
+        "adata_size_bytes": adata_size_bytes,
         "output_path": resolved_output,
         "checkpoint_path": resolved_checkpoint,
         "resolved_args": {
@@ -284,62 +537,108 @@ def _resolve_tx_inference_request(
     return infer_args, resolved_payload
 
 
-def _run_inference_job(job_id: str, infer_args: Namespace) -> None:
+def _emit_worker_message(event_conn: Any, payload: dict[str, Any]) -> None:
+    try:
+        event_conn.send(payload)
+    except Exception:
+        return
+
+
+def _run_inference_job_worker(infer_args: Namespace, cancel_flag_path: str, event_conn: Any, worker_log_path: str) -> None:
     from .._cli._tx._infer import InferenceCancelledError, run_tx_infer
 
-    with _JOBS_LOCK:
-        job = _JOBS.get(job_id)
-        if job is None:
-            return
-        job.status = "running"
-        job.started_at = _utc_now_iso()
-        _append_job_log(job, "Inference job started.")
+    log_handle = None
+    if worker_log_path:
+        try:
+            Path(worker_log_path).parent.mkdir(parents=True, exist_ok=True)
+            log_handle = open(worker_log_path, "a", encoding="utf-8", buffering=1)
+            os.dup2(log_handle.fileno(), 1)
+            os.dup2(log_handle.fileno(), 2)
+            sys.stdout = log_handle
+            sys.stderr = log_handle
+        except Exception:
+            log_handle = None
+
+    heartbeat_stop = threading.Event()
+
+    def emit(payload: dict[str, Any]) -> None:
+        _emit_worker_message(event_conn, payload)
+
+    def heartbeat_loop() -> None:
+        while not heartbeat_stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
+            emit({"type": "heartbeat"})
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        daemon=True,
+        name="state_tx_worker_heartbeat",
+    )
+    heartbeat_thread.start()
 
     def cancel_check() -> bool:
-        with _JOBS_LOCK:
-            current = _JOBS.get(job_id)
-            if current is None:
-                return True
-            return bool(current.cancel_requested)
+        try:
+            return Path(cancel_flag_path).exists()
+        except Exception:
+            return False
 
     def progress_callback(event: dict[str, Any]) -> None:
-        with _JOBS_LOCK:
-            current = _JOBS.get(job_id)
-            if current is None:
-                return
-            _record_job_event(current, event)
+        emit({"type": "event", "event": dict(event)})
 
     setattr(infer_args, "cancel_check", cancel_check)
     setattr(infer_args, "progress_callback", progress_callback)
+    emit(
+        {
+            "type": "status",
+            "status": "running",
+            "started_at": _utc_now_iso(),
+            "message": "Inference job started.",
+        }
+    )
 
     try:
         run_tx_infer(infer_args)
     except InferenceCancelledError as exc:
-        with _JOBS_LOCK:
-            current = _JOBS.get(job_id)
-            if current is not None:
-                current.status = "cancelled"
-                current.error = str(exc)
-                current.finished_at = _utc_now_iso()
-                _append_job_log(current, f"[cancelled] {exc}")
-        return
-    except Exception as exc:
-        with _JOBS_LOCK:
-            current = _JOBS.get(job_id)
-            if current is not None:
-                current.status = "failed"
-                current.error = f"{type(exc).__name__}: {exc}"
-                current.finished_at = _utc_now_iso()
-                _append_job_log(current, f"[failed] {type(exc).__name__}: {exc}")
-                _append_job_log(current, traceback.format_exc().strip())
-        return
-
-    with _JOBS_LOCK:
-        current = _JOBS.get(job_id)
-        if current is not None:
-            current.status = "succeeded"
-            current.finished_at = _utc_now_iso()
-            _append_job_log(current, "[succeeded] Inference job completed.")
+        emit(
+            {
+                "type": "status",
+                "status": "cancelled",
+                "finished_at": _utc_now_iso(),
+                "error": str(exc),
+                "message": f"[cancelled] {exc}",
+            }
+        )
+    except BaseException as exc:  # pragma: no cover - defensive guard around worker process.
+        emit(
+            {
+                "type": "status",
+                "status": "failed",
+                "finished_at": _utc_now_iso(),
+                "error": f"{type(exc).__name__}: {exc}",
+                "message": f"[failed] {type(exc).__name__}: {exc}",
+            }
+        )
+        emit({"type": "traceback", "traceback": traceback.format_exc().strip()})
+    else:
+        emit(
+            {
+                "type": "status",
+                "status": "succeeded",
+                "finished_at": _utc_now_iso(),
+                "message": "[succeeded] Inference job completed.",
+            }
+        )
+    finally:
+        heartbeat_stop.set()
+        try:
+            event_conn.close()
+        except Exception:
+            pass
+        if log_handle is not None:
+            try:
+                log_handle.flush()
+                log_handle.close()
+            except Exception:
+                pass
 
 
 @mcp.tool()
@@ -485,6 +784,9 @@ def start_tx_inference(
     Start tx inference in the background and return a `job_id` immediately.
     Poll status with `get_tx_inference_status`, fetch logs with `get_tx_inference_logs`,
     and cancel with `cancel_tx_inference`.
+
+    Returns poll-hint metadata (`recommended_initial_poll_interval_seconds`) for
+    clients that want adaptive backoff on long-running jobs.
     """
     infer_args, resolved = _resolve_tx_inference_request(
         adata_path=adata_path,
@@ -519,63 +821,117 @@ def start_tx_inference(
         output_path=resolved["output_path"],
         checkpoint_path=resolved["checkpoint_path"],
         resolved_args=resolved["resolved_args"],
+        adata_size_bytes=resolved.get("adata_size_bytes"),
     )
     _append_job_log(job, "[queued] Inference job queued.")
 
-    thread = threading.Thread(
-        target=_run_inference_job,
-        args=(job_id, infer_args),
+    mp_ctx = _get_worker_mp_context()
+    parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
+    cancel_flag_path = str((Path("/tmp") / f"state_tx_cancel_{job_id}.flag").resolve())
+    worker_log_path = str((Path("/tmp") / f"state_tx_worker_{job_id}.log").resolve())
+    Path(cancel_flag_path).unlink(missing_ok=True)
+    process = mp_ctx.Process(
+        target=_run_inference_job_worker,
+        args=(infer_args, cancel_flag_path, child_conn, worker_log_path),
         daemon=True,
         name=f"state_tx_infer_{job_id[:8]}",
     )
-    job.thread = thread
+
+    job.event_conn = parent_conn
+    job.cancel_flag_path = cancel_flag_path
+    job.worker_log_path = worker_log_path
+    job.process = process
 
     with _JOBS_LOCK:
         _JOBS[job_id] = job
 
-    thread.start()
+    try:
+        process.start()
+        try:
+            child_conn.close()
+        except Exception:
+            pass
+    except Exception as exc:
+        with _JOBS_LOCK:
+            current = _JOBS.get(job_id)
+            if current is not None:
+                current.status = "failed"
+                current.error = f"Failed to launch worker process: {type(exc).__name__}: {exc}"
+                current.finished_at = _utc_now_iso()
+                _append_job_log(current, f"[failed] {current.error}")
+                _release_job_runtime_resources(current)
+        try:
+            child_conn.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"Unable to start tx inference worker process: {type(exc).__name__}: {exc}") from exc
+
+    with _JOBS_LOCK:
+        current = _JOBS.get(job_id)
+        if current is not None:
+            current.worker_pid = process.pid
+            _sync_job_state_locked(current)
+            poll_interval = _recommend_poll_interval_seconds(current)
+        else:
+            poll_interval = 5.0
 
     return {
         "status": "started",
         "job_id": job_id,
         **resolved,
+        "worker_pid": process.pid,
+        "worker_log_path": worker_log_path,
+        "recommended_initial_poll_interval_seconds": poll_interval,
     }
 
 
 @mcp.tool()
 def get_tx_inference_status(job_id: str) -> dict[str, Any]:
     """
-    Return status and progress for a background tx inference job.
+    Return status, progress, and adaptive polling hints for a background tx inference job.
     """
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         if job is None:
             raise KeyError(f"No inference job found for job_id={job_id!r}")
 
+        _sync_job_state_locked(job)
         progress = dict(job.progress)
+        seconds_since_update = max(0.0, time.monotonic() - float(job.last_update_monotonic))
+        recommended_poll = _recommend_poll_interval_seconds(job)
+        recommended_log_poll = _recommend_poll_interval_seconds(job, for_logs=True)
         return {
             "job_id": job.job_id,
             "status": job.status,
             "created_at": job.created_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+            "last_update_at": job.last_update_at,
+            "seconds_since_last_update": round(seconds_since_update, 3),
             "cancel_requested": job.cancel_requested,
+            "cancel_requested_at": job.cancel_requested_at,
             "error": job.error,
             "model_folder": job.model_folder,
             "adata_path": job.adata_path,
+            "adata_size_bytes": job.adata_size_bytes,
             "output_path": job.output_path,
             "checkpoint_path": job.checkpoint_path,
             "resolved_args": dict(job.resolved_args),
             "progress": progress,
             "last_event": dict(job.last_event) if isinstance(job.last_event, dict) else None,
             "log_line_count": len(job.logs),
+            "worker_pid": job.worker_pid,
+            "worker_exit_code": job.worker_exit_code,
+            "worker_log_path": job.worker_log_path,
+            "recommended_poll_interval_seconds": recommended_poll,
+            "recommended_log_poll_interval_seconds": recommended_log_poll,
         }
 
 
 @mcp.tool()
 def get_tx_inference_logs(job_id: str, from_line: int = 0, max_lines: int = 200) -> dict[str, Any]:
     """
-    Return buffered logs for a background tx inference job.
+    Return buffered logs for a background tx inference job plus a polling hint.
     """
     if from_line < 0:
         raise ValueError("`from_line` must be >= 0.")
@@ -587,29 +943,36 @@ def get_tx_inference_logs(job_id: str, from_line: int = 0, max_lines: int = 200)
         if job is None:
             raise KeyError(f"No inference job found for job_id={job_id!r}")
 
+        _sync_job_state_locked(job)
         start = min(from_line, len(job.logs))
         end = min(start + max_lines, len(job.logs))
         lines = job.logs[start:end]
+        recommended_poll = _recommend_poll_interval_seconds(job, for_logs=True)
 
     return {
         "job_id": job_id,
         "from_line": start,
         "next_line": end,
         "total_lines": len(job.logs),
+        "recommended_poll_interval_seconds": recommended_poll,
         "lines": lines,
     }
 
 
 @mcp.tool()
-def cancel_tx_inference(job_id: str) -> dict[str, Any]:
+def cancel_tx_inference(job_id: str, force: bool = False) -> dict[str, Any]:
     """
     Request cancellation for a background tx inference job.
+
+    A graceful cancellation signal is sent first. If `force=True`, the worker
+    process is also sent SIGTERM immediately.
     """
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
         if job is None:
             raise KeyError(f"No inference job found for job_id={job_id!r}")
 
+        _sync_job_state_locked(job)
         if job.status in _TERMINAL_JOB_STATUSES:
             return {
                 "job_id": job_id,
@@ -618,15 +981,54 @@ def cancel_tx_inference(job_id: str) -> dict[str, Any]:
                 "message": "Job is already in a terminal state.",
             }
 
+        now_iso = _utc_now_iso()
+        now_mono = time.monotonic()
+        first_request = not job.cancel_requested
+
         job.cancel_requested = True
+        if first_request:
+            job.cancel_requested_at = now_iso
+            job.cancel_grace_deadline_monotonic = now_mono + _CANCEL_GRACE_SECONDS
         if job.status in {"queued", "running"}:
             job.status = "cancelling"
-        _append_job_log(job, "[cancelling] Cancellation requested.")
+
+        if isinstance(job.cancel_flag_path, str) and job.cancel_flag_path:
+            try:
+                Path(job.cancel_flag_path).touch(exist_ok=True)
+            except Exception as exc:
+                _append_job_log(
+                    job,
+                    f"[warning] Failed to set cancellation flag at {job.cancel_flag_path}: {type(exc).__name__}: {exc}",
+                )
+
+        terminate_sent = False
+        if force and _process_alive(job.process):
+            try:
+                job.process.terminate()
+                terminate_sent = True
+                job.terminate_sent_at_monotonic = now_mono
+                _append_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
+            except Exception as exc:
+                _append_job_log(job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}")
+        elif first_request:
+            _append_job_log(
+                job,
+                f"[cancelling] Cancellation requested. Grace period is {_CANCEL_GRACE_SECONDS:.0f}s before force termination.",
+            )
+        else:
+            _append_job_log(job, "[cancelling] Cancellation requested.")
+
+        _sync_job_state_locked(job)
+        poll_interval = _recommend_poll_interval_seconds(job)
 
         return {
             "job_id": job_id,
             "status": job.status,
             "cancel_requested": job.cancel_requested,
+            "cancel_requested_at": job.cancel_requested_at,
+            "force": force,
+            "terminate_sent": terminate_sent,
+            "recommended_poll_interval_seconds": poll_interval,
         }
 
 
