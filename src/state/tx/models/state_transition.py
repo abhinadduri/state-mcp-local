@@ -4,9 +4,10 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from geomloss import SamplesLoss
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from .base import PerturbationModel
 from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
@@ -66,8 +67,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Save or store relevant hyperparams
         self.predict_residual = predict_residual
         self.output_space = output_space
-        self.n_encoder_layers = kwargs.get("n_encoder_layers", 2)
-        self.n_decoder_layers = kwargs.get("n_decoder_layers", 2)
+        self.n_encoder_layers = kwargs.get("n_encoder_layers", 1)
+        self.n_decoder_layers = kwargs.get("n_decoder_layers", 1)
         self.activation_class = get_activation_class(kwargs.get("activation", "gelu"))
         self.cell_sentence_len = kwargs.get("cell_set_len", 256)
         self.decoder_loss_weight = kwargs.get("decoder_weight", 1.0)
@@ -79,6 +80,25 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         self.distributional_loss = distributional_loss
         self.gene_dim = gene_dim
+        self.nb_loss = bool(kwargs.get("nb_loss", False))
+        self.nb_eps = float(kwargs.get("nb_eps", 1e-8))
+        default_nb_embed_loss_weight = 1.0 if self.embed_key is not None else 0.0
+        self.nb_embed_loss_weight = float(kwargs.get("nb_embed_loss_weight", default_nb_embed_loss_weight))
+        if self.nb_loss and self.output_space not in {"gene", "all"}:
+            raise ValueError(
+                f"nb_loss=True requires output_space in {{'gene', 'all'}}; got {self.output_space!r}."
+            )
+        if self.nb_loss:
+            if self.gene_decoder is not None:
+                logger.info("nb_loss=True: disabling gene_decoder and decoder loss branches.")
+            self.gene_decoder = None
+            self.gene_decoder_bool = False
+            self.decoder_cfg = None
+            try:
+                self.hparams["gene_decoder_bool"] = False  # type: ignore[index]
+                self.hparams["decoder_cfg"] = None  # type: ignore[index]
+            except Exception:
+                pass
 
         # Build the distributional loss from geomloss
         blur = kwargs.get("blur", 0.05)
@@ -101,6 +121,27 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
+        self.nb_parameter_head: Optional[nn.Module] = None
+        self.nb_target_dim = int(self.output_dim)
+        if self.nb_loss:
+            if self.output_space == "all":
+                self.nb_target_dim = int(self.gene_dim if self.gene_dim is not None else self.output_dim)
+            elif self.embed_key is not None and self.embed_key != "X_hvg":
+                self.nb_target_dim = int(self.hvg_dim if self.hvg_dim is not None else self.output_dim)
+
+            self.nb_parameter_head = build_mlp(
+                in_dim=self.output_dim,
+                out_dim=self.nb_target_dim * 2,
+                hidden_dim=self.hidden_dim,
+                n_layers=self.n_decoder_layers,
+                dropout=self.dropout,
+                activation=self.activation_class,
+            )
+            logger.info(
+                "NB loss enabled for state transition model (nb_target_dim=%d, nb_embed_loss_weight=%.3f).",
+                self.nb_target_dim,
+                self.nb_embed_loss_weight,
+            )
 
         # Add an optional encoder that introduces a batch variable
         self.batch_encoder = None
@@ -214,7 +255,105 @@ class StateTransitionPerturbationModel(PerturbationModel):
         """Define how we embed basal state input, if needed."""
         return self.basal_encoder(expr)
 
-    def forward(self, batch: dict, padded=True) -> torch.Tensor:
+    def _main_loss_is_expression(self) -> bool:
+        if self.nb_loss:
+            return True
+        return super()._main_loss_is_expression()
+
+    @staticmethod
+    def _suspected_discrete_torch(x: torch.Tensor, n_cells: int = 100) -> bool:
+        if x.numel() == 0:
+            return False
+        flat = x.reshape(-1, x.shape[-1])
+        top_n = min(flat.shape[0], n_cells)
+        rowsum = flat[:top_n].sum(dim=1)
+        frac_part = rowsum - rowsum.floor()
+        return bool(torch.all(torch.abs(frac_part) < 1e-7))
+
+    @staticmethod
+    def _suspected_log_torch(x: torch.Tensor) -> bool:
+        if x.numel() == 0:
+            return False
+        return bool(x.max().item() < 15.0)
+
+    def _to_count_space(self, x: torch.Tensor) -> torch.Tensor:
+        x_float = x.float()
+        is_discrete = self._suspected_discrete_torch(x_float)
+        is_log = self._suspected_log_torch(x_float)
+
+        if (not is_discrete) and is_log:
+            counts = torch.expm1(x_float)
+        else:
+            counts = x_float
+
+        counts = torch.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
+        return counts.clamp_min(0.0).round()
+
+    def _compute_set_library_sizes_from_control(self, ctrl_cells: torch.Tensor) -> torch.Tensor:
+        ctrl_counts = self._to_count_space(ctrl_cells)
+        per_cell_library_sizes = ctrl_counts.sum(dim=-1)
+        per_cell_library_sizes = torch.nan_to_num(per_cell_library_sizes, nan=0.0, posinf=0.0, neginf=0.0)
+        per_set_library_sizes = per_cell_library_sizes.median(dim=1, keepdim=True).values.clamp_min(1.0)
+        return per_set_library_sizes.unsqueeze(-1)
+
+    def _reshape_sequence_tensor(self, x: torch.Tensor, padded: bool) -> torch.Tensor:
+        if padded:
+            return x.reshape(-1, self.cell_sentence_len, x.shape[-1])
+        return x.reshape(1, -1, x.shape[-1])
+
+    def _get_nb_target_tensor(self, batch: Dict[str, torch.Tensor], fallback_target: torch.Tensor, padded: bool) -> torch.Tensor:
+        pert_counts = batch.get("pert_cell_counts", None)
+        if pert_counts is not None:
+            return self._reshape_sequence_tensor(pert_counts.to(fallback_target.device), padded)
+        return fallback_target
+
+    def _get_nb_control_tensor_for_library(
+        self,
+        batch: Dict[str, torch.Tensor],
+        fallback_ctrl: torch.Tensor,
+        padded: bool,
+    ) -> torch.Tensor:
+        ctrl_counts = batch.get("ctrl_cell_counts", None)
+        if ctrl_counts is not None:
+            return self._reshape_sequence_tensor(ctrl_counts.to(fallback_ctrl.device), padded)
+        return fallback_ctrl
+
+    def _compute_nb_nll_loss(
+        self,
+        nb_mean: torch.Tensor,
+        nb_dispersion: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        target_counts = self._to_count_space(target).to(nb_mean.dtype)
+        if nb_mean.shape != nb_dispersion.shape:
+            raise RuntimeError(
+                f"NB parameter shape mismatch: mean={tuple(nb_mean.shape)} dispersion={tuple(nb_dispersion.shape)}"
+            )
+        if target_counts.shape[-1] != nb_mean.shape[-1]:
+            raise RuntimeError(
+                "NB target dimension mismatch: "
+                f"target={target_counts.shape[-1]} vs nb_params={nb_mean.shape[-1]}. "
+                "Ensure pert_cell_counts has the expected gene dimension for NB training."
+            )
+        mu = nb_mean.clamp_min(self.nb_eps)
+        theta = nb_dispersion.clamp_min(self.nb_eps)
+        log_theta_mu_eps = torch.log(theta + mu + self.nb_eps)
+        log_nb = (
+            theta * (torch.log(theta + self.nb_eps) - log_theta_mu_eps)
+            + target_counts * (torch.log(mu + self.nb_eps) - log_theta_mu_eps)
+            + torch.lgamma(target_counts + theta)
+            - torch.lgamma(theta)
+            - torch.lgamma(target_counts + 1)
+        )
+        recon_loss_all = -log_nb
+        return torch.nanmean(recon_loss_all.reshape(recon_loss_all.shape[0], -1), dim=1)
+
+    def forward(
+        self,
+        batch: dict,
+        padded=True,
+        return_nb_params: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         The main forward call. Batch is a flattened sequence of cell sentences,
         which we reshape into sequences of length cell_sentence_len.
@@ -297,12 +436,29 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # apply relu if specified and we output to HVG space
         is_gene_space = self.hparams["embed_key"] == "X_hvg" or self.hparams["embed_key"] is None
-        if is_gene_space or self.gene_decoder is None:
+        if is_gene_space or (self.gene_decoder is None and not self.nb_loss):
             out_pred = self.relu(out_pred)
+
+        nb_mean = None
+        nb_dispersion = None
+        if self.nb_loss:
+            if self.nb_parameter_head is None:
+                raise RuntimeError("nb_loss=True but nb_parameter_head was not initialized.")
+            nb_params = self.nb_parameter_head(out_pred)
+            px_scale_logits, nb_dispersion_logits = torch.chunk(nb_params, chunks=2, dim=-1)
+            px_scale = F.softmax(px_scale_logits, dim=-1)
+            ctrl_for_library = self._get_nb_control_tensor_for_library(batch, basal, padded)
+            set_library_sizes = self._compute_set_library_sizes_from_control(ctrl_for_library)
+            nb_mean = px_scale * set_library_sizes
+            nb_dispersion = F.softplus(nb_dispersion_logits) + self.nb_eps
 
         output = out_pred.reshape(-1, self.output_dim)
 
-        return output
+        if not self.nb_loss or not return_nb_params:
+            return output
+        if nb_mean is None or nb_dispersion is None:
+            raise RuntimeError("nb_loss=True but NB parameters were not produced in forward().")
+        return output, nb_mean.reshape(-1, self.nb_target_dim), nb_dispersion.reshape(-1, self.nb_target_dim)
 
     def _compute_distribution_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """Apply the primary distributional loss."""
@@ -311,7 +467,10 @@ class StateTransitionPerturbationModel(PerturbationModel):
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, padded=True) -> torch.Tensor:
         """Training step logic for both main model and decoder."""
         # Get model predictions (in latent space)
-        pred = self.forward(batch, padded=padded)
+        if self.nb_loss:
+            pred, nb_mean_flat, nb_dispersion_flat = self.forward(batch, padded=padded, return_nb_params=True)
+        else:
+            pred = self.forward(batch, padded=padded)
 
         target = batch["pert_cell_emb"]
 
@@ -322,16 +481,34 @@ class StateTransitionPerturbationModel(PerturbationModel):
             pred = pred.reshape(1, -1, self.output_dim)
             target = target.reshape(1, -1, self.output_dim)
 
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
+        embedding_aux_loss = None
+        if self.nb_loss:
+            if padded:
+                nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+                nb_dispersion = nb_dispersion_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            else:
+                nb_mean = nb_mean_flat.reshape(1, -1, self.nb_target_dim)
+                nb_dispersion = nb_dispersion_flat.reshape(1, -1, self.nb_target_dim)
+
+            nb_target = self._get_nb_target_tensor(batch, target, padded)
+            per_set_main_losses = self._compute_nb_nll_loss(nb_mean, nb_dispersion, nb_target)
+            if self.nb_embed_loss_weight > 0.0:
+                embedding_aux_losses = self._compute_distribution_loss(pred, target)
+                embedding_aux_loss = torch.nanmean(embedding_aux_losses)
+                self.log("train/embedding_loss", embedding_aux_loss)
+        else:
+            per_set_main_losses = self._compute_distribution_loss(pred, target)
         main_loss = torch.nanmean(per_set_main_losses)
         self.log(self._train_main_loss_key(), main_loss)
 
         # Process decoder if available
         decoder_loss = None
         total_loss = main_loss
+        if embedding_aux_loss is not None:
+            total_loss = total_loss + self.nb_embed_loss_weight * embedding_aux_loss
 
         # Decoder loss in gene space, if a decoder is configured.
-        if self.gene_decoder is not None and "pert_cell_counts" in batch:
+        if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
             # Train decoder to map latent predictions to gene space
 
@@ -362,17 +539,33 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         """Validation step logic."""
-        pred = self.forward(batch)
+        if self.nb_loss:
+            pred, nb_mean_flat, nb_dispersion_flat = self.forward(batch, return_nb_params=True)
+        else:
+            pred = self.forward(batch)
 
         pred = pred.reshape(-1, self.cell_sentence_len, self.output_dim)
         target = batch["pert_cell_emb"]
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
+        embedding_aux_loss = None
+        if self.nb_loss:
+            nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            nb_dispersion = nb_dispersion_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            nb_target = self._get_nb_target_tensor(batch, target, padded=True)
+            per_set_main_losses = self._compute_nb_nll_loss(nb_mean, nb_dispersion, nb_target)
+            if self.nb_embed_loss_weight > 0.0:
+                embedding_aux_losses = self._compute_distribution_loss(pred, target)
+                embedding_aux_loss = torch.nanmean(embedding_aux_losses)
+                self.log("val/embedding_loss", embedding_aux_loss)
+        else:
+            per_set_main_losses = self._compute_distribution_loss(pred, target)
         loss = torch.nanmean(per_set_main_losses)
+        if embedding_aux_loss is not None:
+            loss = loss + self.nb_embed_loss_weight * embedding_aux_loss
         self.log(self._val_main_loss_key(), loss)
 
-        if self.gene_decoder is not None and "pert_cell_counts" in batch:
+        if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
 
             # Get model predictions from validation step
@@ -393,6 +586,21 @@ class StateTransitionPerturbationModel(PerturbationModel):
         return {"loss": loss, "predictions": pred}
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
+        if self.nb_loss:
+            pred, nb_mean_flat, nb_dispersion_flat = self.forward(batch, padded=False, return_nb_params=True)
+            target = batch["pert_cell_emb"]
+            pred = pred.reshape(1, -1, self.output_dim)
+            target = target.reshape(1, -1, self.output_dim)
+            nb_mean = nb_mean_flat.reshape(1, -1, self.nb_target_dim)
+            nb_dispersion = nb_dispersion_flat.reshape(1, -1, self.nb_target_dim)
+            nb_target = self._get_nb_target_tensor(batch, target, padded=False)
+            per_set_main_losses = self._compute_nb_nll_loss(nb_mean, nb_dispersion, nb_target)
+            loss = torch.nanmean(per_set_main_losses)
+            if self.nb_embed_loss_weight > 0.0:
+                embedding_aux_losses = self._compute_distribution_loss(pred, target)
+                loss = loss + self.nb_embed_loss_weight * torch.nanmean(embedding_aux_losses)
+            self.log("test_loss", loss)
+            return
         _ = self.forward(batch, padded=False)
 
     def predict_step(self, batch, batch_idx, padded=True, **kwargs):
@@ -400,7 +608,14 @@ class StateTransitionPerturbationModel(PerturbationModel):
         Typically used for final inference. We'll replicate old logic:s
          returning 'preds', 'X', 'pert_name', etc.
         """
-        latent_output = self.forward(batch, padded=padded)  # shape [B, ...]
+        if self.nb_loss:
+            latent_output, nb_mean_flat, nb_dispersion_flat = self.forward(
+                batch,
+                padded=padded,
+                return_nb_params=True,
+            )
+        else:
+            latent_output = self.forward(batch, padded=padded)  # shape [B, ...]
 
         output_dict = {
             "preds": latent_output,
@@ -414,7 +629,10 @@ class StateTransitionPerturbationModel(PerturbationModel):
             "ctrl_cell_barcode": batch.get("ctrl_cell_barcode", None),
         }
 
-        if self.gene_decoder is not None:
+        if self.nb_loss:
+            output_dict["pert_cell_counts_preds"] = nb_mean_flat.reshape(-1, self.nb_target_dim)
+            output_dict["pert_cell_counts_dispersion"] = nb_dispersion_flat.reshape(-1, self.nb_target_dim)
+        elif self.gene_decoder is not None:
             pert_cell_counts_preds = self.gene_decoder(latent_output)
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 

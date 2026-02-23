@@ -227,6 +227,33 @@ def run_tx_predict(args: ap.ArgumentParser):
         data_module.test_datasets = []
         data_module._setup_global_maps()
     data_module.setup(stage="test")
+    nb_loss_enabled = bool(cfg.get("model", {}).get("kwargs", {}).get("nb_loss", False))
+    output_space = cfg.get("data", {}).get("kwargs", {}).get("output_space", "gene")
+    if nb_loss_enabled and output_space not in {"gene", "all"}:
+        raise ValueError(
+            f"model.kwargs.nb_loss=True requires data.kwargs.output_space in {{'gene', 'all'}}; got {output_space!r}."
+        )
+    if nb_loss_enabled:
+        resolved_is_log1p = bool(getattr(data_module, "is_log1p", cfg["data"]["kwargs"].get("is_log1p", False)))
+        expected_exp_counts = resolved_is_log1p
+        current_exp_counts = bool(getattr(data_module, "exp_counts", False))
+        if current_exp_counts != expected_exp_counts:
+            logger.warning(
+                "nb_loss=True requires exp_counts to follow is_log1p. "
+                "Resolved is_log1p=%s, overriding exp_counts %s -> %s.",
+                resolved_is_log1p,
+                current_exp_counts,
+                expected_exp_counts,
+            )
+            data_module.exp_counts = expected_exp_counts
+        if data_module.embed_key not in {None, "X_hvg"} and not bool(getattr(data_module, "store_raw_basal", False)):
+            logger.warning(
+                "nb_loss=True with embed_key=%r and store_raw_basal=False. "
+                "NB library-size estimation will fall back to ctrl_cell_emb.",
+                data_module.embed_key,
+            )
+        cfg["data"]["kwargs"]["is_log1p"] = resolved_is_log1p
+        cfg["data"]["kwargs"]["exp_counts"] = expected_exp_counts
     logger.info("Loaded data module from %s", data_module_path)
 
     # Seed everything
@@ -513,9 +540,14 @@ def run_tx_predict(args: ap.ArgumentParser):
             adata_pred = anndata.AnnData(X=pred_bulk, obs=obs)
             adata_real = anndata.AnnData(X=real_bulk, obs=obs)
 
-        clip_anndata_values(adata_pred, max_value=14.0)
-        clip_anndata_values(adata_real, max_value=14.0)
-        logger.info("Clipped pseudobulk adata_pred and adata_real X values to [0.0, 14.0].")
+        if nb_loss_enabled:
+            logger.info(
+                "nb_loss=True in run config; skipping pseudobulk clipping of adata_pred/adata_real X values."
+            )
+        else:
+            clip_anndata_values(adata_pred, max_value=14.0)
+            clip_anndata_values(adata_real, max_value=14.0)
+            logger.info("Clipped pseudobulk adata_pred and adata_real X values to [0.0, 14.0].")
 
         if args.shared_only:
             try:
@@ -732,10 +764,13 @@ def run_tx_predict(args: ap.ArgumentParser):
         # adata_real = anndata.AnnData(X=final_reals, obs=obs, var=var)
         adata_real = anndata.AnnData(X=final_reals, obs=obs)
 
-    # Clip extreme values to keep cell-eval log1p checks happy.
-    clip_anndata_values(adata_pred, max_value=14.0)
-    clip_anndata_values(adata_real, max_value=14.0)
-    logger.info("Clipped adata_pred and adata_real X values to [0.0, 14.0] before evaluation.")
+    # Clip extreme values to keep cell-eval log1p checks happy unless NB loss is active.
+    if nb_loss_enabled:
+        logger.info("nb_loss=True in run config; skipping clipping of adata_pred/adata_real X values.")
+    else:
+        clip_anndata_values(adata_pred, max_value=14.0)
+        clip_anndata_values(adata_real, max_value=14.0)
+        logger.info("Clipped adata_pred and adata_real X values to [0.0, 14.0] before evaluation.")
 
     # Optionally filter to perturbations seen in at least one training context
     if args.shared_only:
