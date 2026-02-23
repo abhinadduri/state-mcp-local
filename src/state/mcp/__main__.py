@@ -406,7 +406,7 @@ async def run_tx_inference(
     max_cells_per_perturbation: int | None = None,
     batched: bool = True,
     set_batch_size: int | None = None,
-    quiet: bool = False,
+    quiet: bool = True,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """
@@ -479,7 +479,7 @@ def start_tx_inference(
     max_cells_per_perturbation: int | None = None,
     batched: bool = True,
     set_batch_size: int | None = None,
-    quiet: bool = False,
+    quiet: bool = True,
 ) -> dict[str, Any]:
     """
     Start tx inference in the background and return a `job_id` immediately.

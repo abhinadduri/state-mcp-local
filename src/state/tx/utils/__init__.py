@@ -8,6 +8,8 @@ import os
 from lightning.pytorch.callbacks import ModelCheckpoint
 from os.path import join
 
+logger = logging.getLogger(__name__)
+
 
 class RobustCSVLogger(BaseCSVLogger):
     """
@@ -112,15 +114,15 @@ def get_loggers(
                 wandb_logger.experiment.config.update(cfg)
             loggers.append(wandb_logger)
         except ImportError:
-            print("Warning: wandb is not installed. Skipping wandb logging.")
-            print("To enable wandb logging, install it with: pip install wandb")
+            logger.warning("wandb is not installed. Skipping wandb logging.")
+            logger.warning("To enable wandb logging, install it with: pip install wandb")
         except Exception as e:
-            print(f"Warning: Failed to initialize wandb logger: {e}")
-            print("Continuing without wandb logging.")
+            logger.warning("Failed to initialize wandb logger: %s", e)
+            logger.warning("Continuing without wandb logging.")
 
     # Ensure at least one logger is present
     if not loggers:
-        print("Warning: No loggers configured. Adding robust CSV logger as fallback.")
+        logger.warning("No loggers configured. Adding robust CSV logger as fallback.")
         csv_logger = RobustCSVLogger(save_dir=output_dir, name=name, version=0)
         loggers.append(csv_logger)
 

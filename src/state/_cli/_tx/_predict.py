@@ -112,7 +112,12 @@ def run_tx_predict(args: ap.ArgumentParser):
         logger.info(f"Starting test-time fine-tuning for {ft_epochs} epoch(s) on control cells only.")
         for epoch in range(ft_epochs):
             epoch_losses = []
-            pbar = tqdm(dataloader, desc=f"Finetune epoch {epoch + 1}/{ft_epochs}", leave=True)
+            pbar = tqdm(
+                dataloader,
+                desc=f"Finetune epoch {epoch + 1}/{ft_epochs}",
+                leave=True,
+                file=sys.stderr,
+            )
             for batch in pbar:
                 # Check if this batch contains control cells
                 first_pert = (
@@ -403,7 +408,9 @@ def run_tx_predict(args: ap.ArgumentParser):
         total_cells_seen = 0
 
         with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch")):
+            for batch_idx, batch in enumerate(
+                tqdm(test_loader, desc="Predicting", unit="batch", file=sys.stderr)
+            ):
                 batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
                 batch_preds = model.predict_step(batch, batch_idx, padded=False)
 
@@ -671,7 +678,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     all_ctrl_barcodes = []
 
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch")):
+        for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch", file=sys.stderr)):
             # Move each tensor in the batch to the model's device
             batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
@@ -731,14 +738,14 @@ def run_tx_predict(args: ap.ArgumentParser):
     logger.info("Creating anndatas from predictions from manual loop...")
 
     # Build pandas DataFrame for obs and var
-    print(batch_obs_key)
+    logger.info("Resolved batch obs key: %s", batch_obs_key)
     df_dict = {
         data_module.pert_col: all_pert_names,
         data_module.cell_type_key: all_celltypes,
         batch_obs_key: all_gem_groups,
     }
     if data_module.batch_col and data_module.batch_col != batch_obs_key:
-        print("\t\t STORING BATCH")
+        logger.info("Adding explicit batch column to output obs: %s", data_module.batch_col)
         df_dict[data_module.batch_col] = all_gem_groups
 
     if len(all_pert_barcodes) > 0:

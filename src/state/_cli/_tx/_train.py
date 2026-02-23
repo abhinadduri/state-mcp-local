@@ -40,7 +40,7 @@ def run_tx_train(cfg: DictConfig):
     # Setup output directory
     run_output_dir = join(cfg["output_dir"], cfg["name"])
     if os.path.exists(run_output_dir) and cfg["overwrite"]:
-        print(f"Output dir {run_output_dir} already exists, overwriting")
+        logger.warning("Output dir %s already exists, overwriting", run_output_dir)
         shutil.rmtree(run_output_dir)
     os.makedirs(run_output_dir, exist_ok=True)
 
@@ -132,8 +132,8 @@ def run_tx_train(cfg: DictConfig):
         data_module.save_state(f)
 
     dl = data_module.train_dataloader()
-    print("num_workers:", dl.num_workers)
-    print("batch size:", dl.batch_size)
+    logger.info("num_workers: %s", dl.num_workers)
+    logger.info("batch size: %s", dl.batch_size)
 
     var_dims = data_module.get_var_dims()  # {"gene_dim": …, "hvg_dim": …}
     if output_space == "gene":
@@ -178,8 +178,9 @@ def run_tx_train(cfg: DictConfig):
         data_module.get_var_dims(),
     )
 
-    print(
-        f"Model created. Estimated params size: {sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3:.2f} GB"
+    logger.info(
+        "Model created. Estimated params size: %.2f GB",
+        sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3,
     )
     loggers = get_loggers(
         output_dir=cfg["output_dir"],
@@ -275,9 +276,9 @@ def run_tx_train(cfg: DictConfig):
         trainer_kwargs["log_every_n_steps"] = cfg["training"]["log_every_n_steps"]
 
     # Build trainer
-    print(f"Building trainer with kwargs: {trainer_kwargs}")
+    logger.info("Building trainer with kwargs: %s", trainer_kwargs)
     trainer = pl.Trainer(**trainer_kwargs)
-    print("Trainer built successfully")
+    logger.info("Trainer built successfully")
 
     # Load checkpoint if exists
     checkpoint_path = join(ckpt_callbacks[0].dirpath, "last.ckpt")
@@ -286,9 +287,12 @@ def run_tx_train(cfg: DictConfig):
     else:
         logging.info(f"!! Resuming training from {checkpoint_path} !!")
 
-    print(f"Model device: {next(model.parameters()).device}")
-    print(f"CUDA memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-    print(f"CUDA memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+    logger.info("Model device: %s", next(model.parameters()).device)
+    if torch.cuda.is_available():
+        logger.info("CUDA memory allocated: %.2f GB", torch.cuda.memory_allocated() / 1024**3)
+        logger.info("CUDA memory reserved: %.2f GB", torch.cuda.memory_reserved() / 1024**3)
+    else:
+        logger.info("CUDA unavailable; skipping CUDA memory logging.")
 
     logger.info("Starting trainer fit.")
 
@@ -296,7 +300,7 @@ def run_tx_train(cfg: DictConfig):
     # this is mainly used for pretrain -> finetune workflows
     manual_init = cfg["model"]["kwargs"].get("init_from", None)
     if checkpoint_path is None and manual_init is not None:
-        print(f"Loading manual checkpoint from {manual_init}")
+        logger.info("Loading manual checkpoint from %s", manual_init)
         checkpoint_path = manual_init
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -308,10 +312,12 @@ def run_tx_train(cfg: DictConfig):
         current_output_space = cfg["data"]["kwargs"]["output_space"]
 
         if checkpoint_output_space != current_output_space:
-            print(
-                f"Output space mismatch: checkpoint has '{checkpoint_output_space}', current config has '{current_output_space}'"
+            logger.info(
+                "Output space mismatch: checkpoint has %r, current config has %r",
+                checkpoint_output_space,
+                current_output_space,
             )
-            print("Creating new decoder for the specified output space...")
+            logger.info("Creating new decoder for the specified output space...")
 
             if cfg["model"]["kwargs"].get("gene_decoder_bool", True) == False or cfg["model"]["kwargs"].get(
                 "nb_loss", False
@@ -335,7 +341,11 @@ def run_tx_train(cfg: DictConfig):
                 model.decoder_cfg = new_decoder_cfg
                 model._build_decoder()
                 model._decoder_externally_configured = True  # Mark that decoder was configured externally
-                print(f"Created new decoder for output_space='{current_output_space}' with gene_dim={new_gene_dim}")
+                logger.info(
+                    "Created new decoder for output_space=%r with gene_dim=%s",
+                    current_output_space,
+                    new_gene_dim,
+                )
 
         pert_encoder_weight_key = "pert_encoder.0.weight"
         if pert_encoder_weight_key in checkpoint_state:
@@ -343,8 +353,11 @@ def run_tx_train(cfg: DictConfig):
 
             # if the cell embedding dim doesn't match, or if it was HVGs, rebuild for transfer learning
             if checkpoint_pert_dim != model.pert_dim or cfg["data"]["kwargs"]["embed_key"] == "X_hvg":
-                print(
-                    f"pert_encoder input dimension mismatch: model.pert_dim = {model.pert_dim} but checkpoint expects {checkpoint_pert_dim}. Overriding model's pert_dim and rebuilding pert_encoder."
+                logger.info(
+                    "pert_encoder input dimension mismatch: model.pert_dim=%s, checkpoint expects %s. "
+                    "Overriding model pert dim and rebuilding pert_encoder.",
+                    model.pert_dim,
+                    checkpoint_pert_dim,
                 )
                 # Rebuild the pert_encoder with the new pert input dimension
                 from ...tx.models.utils import build_mlp
@@ -358,7 +371,7 @@ def run_tx_train(cfg: DictConfig):
                     activation=model.activation_class,
                 )
             else:
-                print("WARNING: pert_encoder will not be rebuilt since input dimension matches")
+                logger.warning("pert_encoder will not be rebuilt since input dimension matches")
 
         # Filter out mismatched size parameters
         filtered_state = {}
@@ -367,15 +380,18 @@ def run_tx_train(cfg: DictConfig):
                 if param.shape == model_state[name].shape:
                     filtered_state[name] = param
                 else:
-                    print(
-                        f"Skipping parameter {name} due to shape mismatch: checkpoint={param.shape}, model={model_state[name].shape}"
+                    logger.info(
+                        "Skipping parameter %s due to shape mismatch: checkpoint=%s, model=%s",
+                        name,
+                        param.shape,
+                        model_state[name].shape,
                     )
             else:
-                print(f"Skipping parameter {name} as it doesn't exist in the current model")
+                logger.info("Skipping parameter %s as it doesn't exist in the current model", name)
 
         # Load the filtered state dict
         model.load_state_dict(filtered_state, strict=False)
-        print("About to call trainer.fit() with manual checkpoint...")
+        logger.info("About to call trainer.fit() with manual checkpoint...")
 
         # Train - for clarity we pass None
         trainer.fit(
@@ -383,18 +399,18 @@ def run_tx_train(cfg: DictConfig):
             datamodule=data_module,
             ckpt_path=None,
         )
-        print("trainer.fit() completed with manual checkpoint")
+        logger.info("trainer.fit() completed with manual checkpoint")
     else:
-        print(f"About to call trainer.fit() with checkpoint_path={checkpoint_path}")
+        logger.info("About to call trainer.fit() with checkpoint_path=%s", checkpoint_path)
         # Train
         trainer.fit(
             model,
             datamodule=data_module,
             ckpt_path=checkpoint_path,
         )
-        print("trainer.fit() completed")
+        logger.info("trainer.fit() completed")
 
-    print("Training completed, saving final checkpoint...")
+    logger.info("Training completed, saving final checkpoint...")
 
     # at this point if checkpoint_path does not exist, manually create one
     checkpoint_path = join(ckpt_callbacks[0].dirpath, "final.ckpt")

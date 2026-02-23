@@ -193,7 +193,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 "model.kwargs.finetune_vci_decoder is no longer supported. "
                 "Ignoring it and using the standard latent-to-gene decoder path."
             )
-        print(self)
+        logger.debug("%s", self)
 
     def _build_networks(self, lora_cfg=None):
         """

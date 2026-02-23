@@ -134,8 +134,10 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
 
 
 def run_tx_infer(args: argparse.Namespace):
+    import logging
     import os
     import pickle
+    import sys
     import warnings
 
     import numpy as np
@@ -146,6 +148,7 @@ def run_tx_infer(args: argparse.Namespace):
 
     from ...tx.models.state_transition import StateTransitionPerturbationModel
 
+    logger = logging.getLogger(__name__)
     progress_callback = getattr(args, "progress_callback", None)
     cancel_check = getattr(args, "cancel_check", None)
 
@@ -171,6 +174,16 @@ def run_tx_infer(args: argparse.Namespace):
             raise InferenceCancelledError("Inference cancelled by request.")
 
     emit_event("phase", phase="initializing", message="Initializing tx inference.")
+
+    def info(msg: str, *fmt: Any) -> None:
+        if args.quiet:
+            return
+        logger.info(msg, *fmt)
+
+    def warn(msg: str, *fmt: Any) -> None:
+        if args.quiet:
+            return
+        logger.warning(msg, *fmt)
 
     # -----------------------
     # Helpers
@@ -370,7 +383,7 @@ def run_tx_infer(args: argparse.Namespace):
             raise ValueError(f"No control cells found with perturbation '{control_pert}' in column '{pert_col}'")
 
         if not quiet:
-            print(f"Found {len(control_indices)} control cells for padding")
+            info("Found %d control cells for padding", len(control_indices))
 
         # Collect cells to add
         new_cells_data = []
@@ -392,11 +405,11 @@ def run_tx_infer(args: argparse.Namespace):
 
         if len(new_cells_data) == 0:
             if not quiet:
-                print("No cells to add from TSV file")
+                info("No cells to add from TSV file")
             return adata
 
         if not quiet:
-            print(f"Adding {total_to_add} cells from TSV specification")
+            info("Adding %d cells from TSV specification", total_to_add)
 
         # Create new AnnData with padded cells
         original_n_obs = adata.n_obs
@@ -440,7 +453,7 @@ def run_tx_infer(args: argparse.Namespace):
         new_adata = sc.AnnData(X=new_X, obs=new_obs, var=new_var, obsm=new_obsm, varm=new_varm, uns=new_uns)
 
         if not quiet:
-            print(f"Padded AnnData: {original_n_obs} -> {new_n_obs} cells")
+            info("Padded AnnData: %d -> %d cells", original_n_obs, new_n_obs)
 
         return new_adata
 
@@ -448,7 +461,7 @@ def run_tx_infer(args: argparse.Namespace):
     # Logging
     # -----------------------
     if not args.quiet:
-        print("==> STATE: tx infer (virtual experiment)")
+        info("==> STATE: tx infer (virtual experiment)")
 
     # -----------------------
     # 1) Load config + dims + mappings
@@ -457,7 +470,7 @@ def run_tx_infer(args: argparse.Namespace):
     ensure_not_cancelled()
     cfg = load_config(config_path)
     if not args.quiet:
-        print(f"Loaded config: {config_path}")
+        info("Loaded config: %s", config_path)
     emit_event("phase", phase="config_loaded", message=f"Loaded config: {config_path}")
 
     # control_pert
@@ -472,7 +485,7 @@ def run_tx_infer(args: argparse.Namespace):
     if control_pert is None:
         control_pert = "non-targeting"
     if not args.quiet:
-        print(f"Control perturbation: {control_pert}")
+        info("Control perturbation: %s", control_pert)
     control_pert_str = str(control_pert)
 
     # choose cell type column
@@ -490,7 +503,10 @@ def run_tx_infer(args: argparse.Namespace):
         )
         args.celltype_col = guess
     if not args.quiet:
-        print(f"Grouping by cell type column: {args.celltype_col if args.celltype_col else '(not found; no grouping)'}")
+        info(
+            "Grouping by cell type column: %s",
+            args.celltype_col if args.celltype_col else "(not found; no grouping)",
+        )
 
     # choose batch column
     if args.batch_col is None:
@@ -521,10 +537,10 @@ def run_tx_infer(args: argparse.Namespace):
         args.model_dir, "batch_onehot_map"
     )
     if loaded_batch_onehot_map_path is not None and not args.quiet:
-        print(f"Loaded batch one-hot map from: {loaded_batch_onehot_map_path}")
+        info("Loaded batch one-hot map from: %s", loaded_batch_onehot_map_path)
     cell_type_onehot_map, loaded_cell_type_onehot_map_path, _ = load_onehot_map(args.model_dir, "cell_type_onehot_map")
     if loaded_cell_type_onehot_map_path is not None and not args.quiet:
-        print(f"Loaded cell type one-hot map from: {loaded_cell_type_onehot_map_path}")
+        info("Loaded cell type one-hot map from: %s", loaded_cell_type_onehot_map_path)
 
     # -----------------------
     # 2) Load model
@@ -534,7 +550,7 @@ def run_tx_infer(args: argparse.Namespace):
     else:
         checkpoint_path = os.path.join(args.model_dir, "checkpoints", "final.ckpt")
         if not args.quiet:
-            print(f"No --checkpoint given, using {checkpoint_path}")
+            info("No --checkpoint given, using %s", checkpoint_path)
 
     preferred_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if preferred_device.type == "cuda":
@@ -585,12 +601,12 @@ def run_tx_infer(args: argparse.Namespace):
         raise ValueError(f"nb_loss=True requires output_space in {{'gene', 'all'}}; got {output_space!r}.")
 
     if not args.quiet:
-        print(f"Model device: {device}")
-        print(f"Model cell_set_len (max sequence length): {cell_set_len}")
-        print(f"Batched padded inference: enabled (set_batch_size={set_batch_size})")
-        print(f"Model uses batch encoder: {bool(uses_batch_encoder)}")
-        print(f"Model output space: {output_space}")
-        print(f"Model nb_loss enabled: {nb_loss_enabled}")
+        info("Model device: %s", device)
+        info("Model cell_set_len (max sequence length): %s", cell_set_len)
+        info("Batched padded inference: enabled (set_batch_size=%s)", set_batch_size)
+        info("Model uses batch encoder: %s", bool(uses_batch_encoder))
+        info("Model output space: %s", output_space)
+        info("Model nb_loss enabled: %s", nb_loss_enabled)
     emit_event(
         "phase",
         phase="model_loaded",
@@ -620,7 +636,7 @@ def run_tx_infer(args: argparse.Namespace):
     # optional TSV padding mode - pad with additional perturbation cells
     if args.tsv:
         if not args.quiet:
-            print(f"==> TSV padding mode: loading {args.tsv}")
+            info("==> TSV padding mode: loading %s", args.tsv)
 
         # Initialize RNG for padding (separate from inference RNG for reproducibility)
         pad_rng = np.random.RandomState(args.seed)
@@ -644,16 +660,17 @@ def run_tx_infer(args: argparse.Namespace):
                 preview = ", ".join(missing_in_map[:5])
                 if len(missing_in_map) > 5:
                     preview += ", ..."
-                print(
-                    f"Warning: {len(missing_in_map)} requested cell types not found in saved mapping "
-                    f"(examples: {preview})."
+                warn(
+                    "%d requested cell types not found in saved mapping (examples: %s).",
+                    len(missing_in_map),
+                    preview,
                 )
         if args.celltype_col not in adata.obs:
             raise ValueError(f"Column '{args.celltype_col}' not in adata.obs")
         n0 = adata.n_obs
         adata = adata[adata.obs[args.celltype_col].isin(keep_cts)].copy()
         if not args.quiet:
-            print(f"Filtered to {adata.n_obs} cells (from {n0}) for cell types: {keep_cts}")
+            info("Filtered to %d cells (from %d) for cell types: %s", adata.n_obs, n0, keep_cts)
 
     needs_virtual_padding = args.all_perts or (args.min_cells is not None) or (args.max_cells is not None)
     if needs_virtual_padding:
@@ -691,9 +708,11 @@ def run_tx_infer(args: argparse.Namespace):
                     ctrl_template.obs = ctrl_template.obs.copy()
                     ctrl_template.obs[args.pert_col] = ctrl_template.obs[args.pert_col].astype(str)
                     if not args.quiet:
-                        print(
-                            "--all-perts: limiting virtual control template to "
-                            f"{ctrl_template.n_obs} cells per perturbation (requested {args.virtual_cells_per_pert})."
+                        info(
+                            "--all-perts: limiting virtual control template to %d cells per perturbation "
+                            "(requested %d).",
+                            ctrl_template.n_obs,
+                            args.virtual_cells_per_pert,
                         )
 
             virtual_blocks: List["sc.AnnData"] = []
@@ -710,12 +729,14 @@ def run_tx_infer(args: argparse.Namespace):
                 preview = ", ".join(missing_perts[:5])
                 if len(missing_perts) > 5:
                     preview += ", ..."
-                print(
-                    f"Added virtual control copies for {len(missing_perts)} perturbations"
-                    f" ({preview if preview else 'n/a'}). Total cells: {adata.n_obs}."
+                info(
+                    "Added virtual control copies for %d perturbations (%s). Total cells: %d.",
+                    len(missing_perts),
+                    preview if preview else "n/a",
+                    adata.n_obs,
                 )
         elif not args.quiet:
-            print("--all-perts requested, but all perturbations already present in AnnData.")
+            info("--all-perts requested, but all perturbations already present in AnnData.")
 
     # ensure each perturbation meets the minimum count by cloning controls
     if args.min_cells is not None:
@@ -756,12 +777,14 @@ def run_tx_infer(args: argparse.Namespace):
                 if len(virtual_blocks) > 5:
                     preview += ", ..."
                 total_added = sum(vb.n_obs for vb in virtual_blocks)
-                print(
-                    f"Added {total_added} padding cells to meet --min-cells "
-                    f"(examples: {preview if preview else 'n/a'}). Total cells: {adata.n_obs}."
+                info(
+                    "Added %d padding cells to meet --min-cells (examples: %s). Total cells: %d.",
+                    total_added,
+                    preview if preview else "n/a",
+                    adata.n_obs,
                 )
         elif not args.quiet:
-            print("--min-cells set, but all perturbations already meet the threshold.")
+            info("--min-cells set, but all perturbations already meet the threshold.")
 
     # cap the number of cells per perturbation by subsampling
     if args.max_cells is not None:
@@ -790,8 +813,10 @@ def run_tx_infer(args: argparse.Namespace):
             adata = adata[keep_mask].copy()
             if not args.quiet:
                 total_dropped = original_n - adata.n_obs
-                print(
-                    f"Subsampled perturbations exceeding --max-cells; dropped {total_dropped} cells. Total cells: {adata.n_obs}."
+                info(
+                    "Subsampled perturbations exceeding --max-cells; dropped %d cells. Total cells: %d.",
+                    total_dropped,
+                    adata.n_obs,
                 )
 
     # select features: embeddings or genes
@@ -805,8 +830,10 @@ def run_tx_infer(args: argparse.Namespace):
         writes_to = (".obsm", args.embed_key)  # write predictions to obsm[embed_key]
 
     if not args.quiet:
-        print(
-            f"Using {'adata.X' if args.embed_key is None else f'adata.obsm[{args.embed_key!r}]'} as input features: shape {X_in.shape}"
+        info(
+            "Using %s as input features: shape %s",
+            "adata.X" if args.embed_key is None else f"adata.obsm[{args.embed_key!r}]",
+            X_in.shape,
         )
 
     # pick pert names; ensure they are strings
@@ -849,13 +876,15 @@ def run_tx_infer(args: argparse.Namespace):
                         misses += 1
                         idxs[i] = 0  # fallback to zero
                 if misses and not args.quiet:
-                    print(
-                        f"Warning: {misses} / {len(raw_labels)} batch labels not found in saved mapping; using index 0 as fallback."
+                    warn(
+                        "%d / %d batch labels not found in saved mapping; using index 0 as fallback.",
+                        misses,
+                        len(raw_labels),
                     )
                 batch_indices_all = idxs
         else:
             if not args.quiet:
-                print("Batch encoder present, but no batch column found; proceeding without batch indices.")
+                info("Batch encoder present, but no batch column found; proceeding without batch indices.")
             uses_batch_encoder = False
 
     # -----------------------
@@ -869,7 +898,7 @@ def run_tx_infer(args: argparse.Namespace):
     n_total = adata.n_obs
     n_nonctl = n_total - n_controls
     if not args.quiet:
-        print(f"Cells: total={n_total}, control={n_controls}, non-control={n_nonctl}")
+        info("Cells: total=%d, control=%d, non-control=%d", n_total, n_controls, n_nonctl)
 
     # Where we will write predictions (initialize with originals; we overwrite all rows, including controls)
     if writes_to[0] == ".X":
@@ -954,10 +983,12 @@ def run_tx_infer(args: argparse.Namespace):
                     sim_counts = existing.astype(np.float32, copy=True)
                     return
                 if not args.quiet:
-                    print(
-                        f"Dimension mismatch for existing obsm['{counts_obsm_key}'] "
-                        f"(got {existing.shape[1]} vs predictions {target_dim}). "
-                        "Reinitializing storage with zeros."
+                    warn(
+                        "Dimension mismatch for existing obsm[%r] (got %d vs predictions %d). "
+                        "Reinitializing storage with zeros.",
+                        counts_obsm_key,
+                        existing.shape[1],
+                        target_dim,
                     )
             sim_counts = np.zeros((n_total, target_dim), dtype=np.float32)
             return
@@ -975,9 +1006,10 @@ def run_tx_infer(args: argparse.Namespace):
                 sim_X[row_indices, :] = pred_rows
             else:
                 if not args.quiet:
-                    print(
-                        f"Dimension mismatch for X (got {pred_rows.shape[1]} vs {sim_X.shape[1]}). "
-                        "Falling back to adata.obsm['X_state_pred']."
+                    warn(
+                        "Dimension mismatch for X (got %d vs %d). Falling back to adata.obsm['X_state_pred'].",
+                        pred_rows.shape[1],
+                        sim_X.shape[1],
                     )
                 if "X_state_pred" not in adata.obsm:
                     adata.obsm["X_state_pred"] = np.zeros((n_total, pred_rows.shape[1]), dtype=np.float32)
@@ -989,10 +1021,13 @@ def run_tx_infer(args: argparse.Namespace):
             else:
                 side_key = f"{writes_to[1]}_pred"
                 if not args.quiet:
-                    print(
-                        f"Dimension mismatch for obsm['{writes_to[1]}'] "
-                        f"(got {pred_rows.shape[1]} vs {sim_obsm.shape[1]}). "
-                        f"Writing to adata.obsm['{side_key}'] instead."
+                    warn(
+                        "Dimension mismatch for obsm[%r] (got %d vs %d). "
+                        "Writing to adata.obsm[%r] instead.",
+                        writes_to[1],
+                        pred_rows.shape[1],
+                        sim_obsm.shape[1],
+                        side_key,
                     )
                 if side_key not in adata.obsm:
                     adata.obsm[side_key] = np.zeros((n_total, pred_rows.shape[1]), dtype=np.float32)
@@ -1000,7 +1035,7 @@ def run_tx_infer(args: argparse.Namespace):
                 out_target = f"obsm['{side_key}']"
 
     if not args.quiet:
-        print(
+        info(
             "Running virtual experiment (homogeneous per-perturbation forward passes; "
             "batched fixed-length sets with replacement padding)..."
         )
@@ -1025,7 +1060,7 @@ def run_tx_infer(args: argparse.Namespace):
             grp_ctrl_pool = group_control_indices(g)
             if len(grp_ctrl_pool) == 0:
                 if not args.quiet:
-                    print(f"Group '{g}': no control cells available anywhere; leaving rows unchanged.")
+                    warn("Group %r: no control cells available anywhere; leaving rows unchanged.", g)
                 continue
 
             emit_event(
@@ -1052,6 +1087,7 @@ def run_tx_infer(args: argparse.Namespace):
                 bar_format="{l_bar}{bar}{r_bar}",
                 dynamic_ncols=True,
                 disable=args.quiet,
+                file=sys.stderr,
             )
             for p in pbar:
                 ensure_not_cancelled()
@@ -1067,7 +1103,7 @@ def run_tx_infer(args: argparse.Namespace):
                 if vec is None:
                     vec = default_pert_vec
                     if not args.quiet:
-                        print(f"  (group {g}) pert '{p}' not in mapping; using control fallback one-hot.")
+                        warn("Group %r perturbation %r not in mapping; using control fallback one-hot.", g, p)
 
                 sentence_specs = []
                 start = 0
@@ -1214,7 +1250,7 @@ def run_tx_infer(args: argparse.Namespace):
     if output_space in {"gene", "all"}:
         if nb_loss_enabled:
             if not args.quiet:
-                print("nb_loss=True: skipping clipping of simulated outputs.")
+                info("nb_loss=True: skipping clipping of simulated outputs.")
         else:
             if out_target == "X":
                 clip_array(sim_X)
@@ -1240,9 +1276,8 @@ def run_tx_infer(args: argparse.Namespace):
     output_is_npy = output_path.lower().endswith(".npy")
 
     if counts_expected and not counts_written and not args.quiet:
-        print(
-            "Warning: Model configured to produce gene counts, but no predicted counts were returned; "
-            "counts will not be saved."
+        warn(
+            "Model configured to produce gene counts, but no predicted counts were returned; counts will not be saved."
         )
 
     pred_matrix = None
@@ -1299,17 +1334,18 @@ def run_tx_infer(args: argparse.Namespace):
     # -----------------------
     # 6) Summary
     # -----------------------
-    print("\n=== Inference complete ===")
-    print(f"Input cells:         {n_total}")
-    print(f"Controls simulated:  {n_controls}")
-    print(f"Treated simulated:   {n_nonctl}")
-    print(f"Internal padded tokens dropped: {internal_padding_tokens}")
-    if output_is_npy:
-        shape_str = " x ".join(str(dim) for dim in pred_matrix.shape) if pred_matrix is not None else "unknown"
-        print(f"Wrote predictions array (shape: {shape_str})")
-        print(f"Saved NumPy file:    {output_path}")
-    else:
-        print(f"Wrote predictions to adata.{out_target}")
-        print(f"Saved:               {output_path}")
-    if counts_written and counts_out_target:
-        print(f"Saved count predictions to adata.{counts_out_target}")
+    if not args.quiet:
+        logger.info("=== Inference complete ===")
+        logger.info("Input cells: %d", n_total)
+        logger.info("Controls simulated: %d", n_controls)
+        logger.info("Treated simulated: %d", n_nonctl)
+        logger.info("Internal padded tokens dropped: %d", internal_padding_tokens)
+        if output_is_npy:
+            shape_str = " x ".join(str(dim) for dim in pred_matrix.shape) if pred_matrix is not None else "unknown"
+            logger.info("Wrote predictions array (shape: %s)", shape_str)
+            logger.info("Saved NumPy file: %s", output_path)
+        else:
+            logger.info("Wrote predictions to adata.%s", out_target)
+            logger.info("Saved: %s", output_path)
+        if counts_written and counts_out_target:
+            logger.info("Saved count predictions to adata.%s", counts_out_target)

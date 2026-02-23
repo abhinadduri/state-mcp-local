@@ -109,7 +109,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
                 "Ignoring it and using the standard latent-to-gene decoder path."
             )
 
-        print(self)
+        logger.debug("%s", self)
 
     def _decoder_in_features(self) -> Optional[int]:
         """
