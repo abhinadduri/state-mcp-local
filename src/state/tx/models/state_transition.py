@@ -84,6 +84,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.nb_eps = float(kwargs.get("nb_eps", 1e-8))
         default_nb_embed_loss_weight = 1.0 if self.embed_key is not None else 0.0
         self.nb_embed_loss_weight = float(kwargs.get("nb_embed_loss_weight", default_nb_embed_loss_weight))
+        if self.nb_loss and self.output_space == "embedding":
+            raise ValueError(
+                "nb_loss=True is incompatible with output_space='embedding'. "
+                "Use output_space='gene' or output_space='all'."
+            )
         if self.nb_loss and self.output_space not in {"gene", "all"}:
             raise ValueError(f"nb_loss=True requires output_space in {{'gene', 'all'}}; got {self.output_space!r}.")
         if self.nb_loss:

@@ -73,6 +73,11 @@ def run_tx_train(cfg: DictConfig):
         f"data.kwargs.output_space must be one of 'embedding', 'gene', or 'all'; got {output_space!r}"
     )
     nb_loss_enabled = bool(cfg["model"]["kwargs"].get("nb_loss", False))
+    if nb_loss_enabled and output_space == "embedding":
+        raise ValueError(
+            "model.kwargs.nb_loss=True is incompatible with data.kwargs.output_space='embedding'. "
+            "Use output_space='gene' or output_space='all'."
+        )
     if nb_loss_enabled and output_space not in {"gene", "all"}:
         raise ValueError(
             f"model.kwargs.nb_loss=True requires data.kwargs.output_space in {{'gene', 'all'}}; got {output_space!r}."
