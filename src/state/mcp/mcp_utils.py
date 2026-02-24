@@ -22,11 +22,12 @@ _REQUIRED_FILE_VARIANTS: Final[dict[str, tuple[str, ...]]] = {
 _CHECKPOINT_PRIORITY: Final[tuple[str, ...]] = ("final.ckpt", "best.ckpt", "last.ckpt")
 _EMB_CHECKPOINT_SUFFIXES: Final[tuple[str, ...]] = (".ckpt", ".safetensors")
 _EMB_CHECKPOINT_BASENAME_PRIORITY: Final[tuple[str, ...]] = (
+    "model.safetensors",
+    "checkpoint.safetensors",
     "last.ckpt",
     "best.ckpt",
     "final.ckpt",
     "checkpoint.ckpt",
-    "model.safetensors",
 )
 
 

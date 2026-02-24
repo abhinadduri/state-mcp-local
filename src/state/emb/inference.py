@@ -9,6 +9,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from torch import nn
+from typing import Any, Optional
 
 from .nn.model import StateEmbeddingModel
 from omegaconf import OmegaConf
@@ -95,10 +96,19 @@ class Inference:
         if self.model:
             raise ValueError("Model already initialized")
 
+        checkpoint_path = Path(checkpoint)
+        checkpoint_suffix = checkpoint_path.suffix.lower()
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        device = torch.device(device_type)
+
         # Load and initialize model for eval
         # If no cfg provided, try to restore it from the checkpoint
         cfg_to_use = self._vci_conf
-        if cfg_to_use is None:
+        if cfg_to_use is None and checkpoint_suffix == ".safetensors":
+            config_candidate = checkpoint_path.parent / "config.yaml"
+            if config_candidate.is_file():
+                cfg_to_use = OmegaConf.load(config_candidate)
+        if cfg_to_use is None and checkpoint_suffix != ".safetensors":
             try:
                 # Need full checkpoint to access embedded config and embeddings
                 ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -119,21 +129,26 @@ class Inference:
                 log.warning(f"Could not extract config from checkpoint: {e}")
 
         if cfg_to_use is None:
-            raise ValueError("No config found in checkpoint and no override provided. Provide --config to proceed.")
+            raise ValueError(
+                "No config found in checkpoint and no override provided. "
+                "Provide --config to proceed (required for .safetensors checkpoints)."
+            )
 
         # Keep internal cfg in sync
         self._vci_conf = cfg_to_use
-        self.model = StateEmbeddingModel.load_from_checkpoint(
-            checkpoint, dropout=0.0, strict=False, cfg=self._vci_conf, weights_only=False
-        )
+        if checkpoint_suffix == ".safetensors":
+            self.model = self._load_model_from_safetensors(checkpoint_path, device=device)
+        else:
+            self.model = StateEmbeddingModel.load_from_checkpoint(
+                checkpoint, dropout=0.0, strict=False, cfg=self._vci_conf, weights_only=False, map_location=device
+            )
 
         # Convert model to appropriate precision for faster inference
-        device_type = "cuda" if torch.cuda.is_available() else "cpu"
         precision = get_precision_config(device_type=device_type)
-        self.model = self.model.to(precision)
+        self.model = self.model.to(device=device, dtype=precision)
 
         # Resolve protein embeddings: prefer provided/packaged, then config
-        if self.protein_embeds is None:
+        if self.protein_embeds is None and checkpoint_suffix != ".safetensors":
             # Try to extract from the checkpoint payload even if cfg was provided externally
             try:
                 ckpt2 = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -141,6 +156,10 @@ class Inference:
                     self.protein_embeds = ckpt2["protein_embeds_dict"]
             except Exception:
                 pass
+        if self.protein_embeds is None and checkpoint_suffix == ".safetensors":
+            protein_candidate = checkpoint_path.parent / "protein_embeddings.pt"
+            if protein_candidate.is_file():
+                self.protein_embeds = torch.load(protein_candidate, map_location="cpu", weights_only=False)
         all_pe = self.protein_embeds or get_embeddings(self._vci_conf)
         if isinstance(all_pe, dict):
             all_pe = torch.vstack(list(all_pe.values()))
@@ -152,6 +171,73 @@ class Inference:
         if self.protein_embeds is None:
             # Final fallback to config path
             self.protein_embeds = torch.load(get_embedding_cfg(self._vci_conf).all_embeddings, weights_only=False)
+
+    def _load_model_from_safetensors(self, checkpoint_path: Path, device: torch.device) -> StateEmbeddingModel:
+        try:
+            from safetensors.torch import load_file as safetensors_load_file
+        except Exception as exc:
+            raise RuntimeError(
+                "Loading `.safetensors` requires `safetensors` to be installed in this environment."
+            ) from exc
+
+        model = self._init_model_from_cfg(self._vci_conf)
+        model = model.to(device=device)
+        device_str = "cpu"
+        if device.type == "cuda":
+            device_str = f"cuda:{device.index if device.index is not None else 0}"
+
+        state_dict = safetensors_load_file(str(checkpoint_path), device=device_str)
+        state_dict.pop("pe_embedding.weight", None)
+        if state_dict and all(k.startswith("model.") for k in state_dict.keys()):
+            state_dict = {k[len("model.") :]: v for k, v in state_dict.items()}
+
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        missing_keys = [k for k in incompatible.missing_keys if not k.startswith("gene_embedding_layer.")]
+        if missing_keys:
+            log.warning(
+                "Loaded safetensors with %s missing keys (sample: %s)",
+                len(missing_keys),
+                missing_keys[:10],
+            )
+        if incompatible.unexpected_keys:
+            log.warning(
+                "Loaded safetensors with %s unexpected keys (sample: %s)",
+                len(incompatible.unexpected_keys),
+                incompatible.unexpected_keys[:10],
+            )
+        return model
+
+    def _cfg_get(self, node: Any, key: str, default: Any = None) -> Any:
+        if node is None:
+            return default
+        if isinstance(node, dict):
+            return node.get(key, default)
+        return getattr(node, key, default)
+
+    def _init_model_from_cfg(self, cfg) -> StateEmbeddingModel:
+        if cfg is None:
+            raise ValueError("Cannot initialize model without a config.")
+
+        emb_cfg = get_embedding_cfg(cfg)
+        model_cfg = self._cfg_get(cfg, "model", {})
+        optimizer_cfg = self._cfg_get(cfg, "optimizer", {})
+
+        return StateEmbeddingModel(
+            token_dim=int(self._cfg_get(emb_cfg, "size")),
+            d_model=int(self._cfg_get(model_cfg, "emsize")),
+            nhead=int(self._cfg_get(model_cfg, "nhead")),
+            d_hid=int(self._cfg_get(model_cfg, "d_hid")),
+            nlayers=int(self._cfg_get(model_cfg, "nlayers")),
+            output_dim=int(self._cfg_get(model_cfg, "output_dim")),
+            dropout=float(self._cfg_get(model_cfg, "dropout", 0.0)),
+            warmup_steps=0,
+            compiled=False,
+            max_lr=float(self._cfg_get(optimizer_cfg, "max_lr", 4e-4)),
+            emb_cnt=int(self._cfg_get(emb_cfg, "num", 0) or 0),
+            emb_size=int(self._cfg_get(emb_cfg, "size")),
+            cfg=cfg,
+            collater=None,
+        )
 
     def init_from_model(self, model, protein_embeds=None):
         """

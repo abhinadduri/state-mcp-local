@@ -538,7 +538,7 @@ def _resolve_emb_inference_request(
     resolved_checkpoint = resolve_emb_checkpoint_path(
         checkpoint_path=checkpoint_path,
         model_folder=model_folder,
-        prefer_ckpt=True,
+        prefer_ckpt=False,
     )
     resolved_model_folder = str(Path(resolved_checkpoint).parent)
 
