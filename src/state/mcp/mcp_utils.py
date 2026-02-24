@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import glob
 import os
 import pickle
+import re
 from pathlib import Path
 from typing import Any, Final
 
+import numpy as np
 import yaml
 
 _REQUIRED_RUN_FILES: Final[tuple[str, ...]] = (
@@ -753,5 +756,577 @@ def inspect_model_folder(model_folder: str) -> dict[str, Any]:
         },
         "mapping_sizes": mapping_sizes,
         "inferred_inference_defaults": defaults,
+        "warnings": warnings,
+    }
+
+
+def _decode_string_like(value: Any) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def _safe_decode_array(values: Any) -> list[str]:
+    return [_decode_string_like(v) for v in values]
+
+
+def _array_shape_and_dtype(obj: Any) -> tuple[list[int] | None, str | None, bool]:
+    try:
+        import h5py
+    except Exception:
+        return None, None, False
+
+    if isinstance(obj, h5py.Dataset):
+        try:
+            shape = [int(x) for x in obj.shape]
+        except Exception:
+            shape = None
+        try:
+            dtype = str(obj.dtype)
+        except Exception:
+            dtype = None
+        return shape, dtype, False
+
+    if isinstance(obj, h5py.Group):
+        keys = set(obj.keys())
+        if {"indptr", "indices", "data"}.issubset(keys):
+            shape_attr = obj.attrs.get("shape")
+            shape: list[int] | None = None
+            if shape_attr is not None:
+                try:
+                    shape = [int(x) for x in shape_attr]
+                except Exception:
+                    shape = None
+            dtype = None
+            try:
+                dtype = str(obj["data"].dtype)
+            except Exception:
+                dtype = None
+            return shape, dtype, True
+    return None, None, False
+
+
+def _summarize_obs_column(
+    obs_group: Any,
+    column: str,
+    *,
+    n_obs: int | None,
+    max_top_values: int,
+    max_scan_values: int,
+    warnings: list[str],
+) -> dict[str, Any]:
+    try:
+        import h5py
+    except Exception as exc:
+        return {
+            "name": column,
+            "dtype": "unknown",
+            "n_unique": 0,
+            "top_values": [],
+            "warnings": [f"h5py unavailable while summarizing obs column {column!r}: {exc}"],
+        }
+
+    obj = obs_group[column]
+    top_values: list[dict[str, Any]] = []
+    n_unique = 0
+    sampled = False
+    dtype_summary = "unknown"
+    col_warnings: list[str] = []
+
+    if isinstance(obj, h5py.Group) and {"categories", "codes"}.issubset(set(obj.keys())):
+        categories = _safe_decode_array(obj["categories"][:])
+        codes = np.asarray(obj["codes"][:])
+        valid_codes = codes[codes >= 0]
+        try:
+            bincount = np.bincount(valid_codes.astype(np.int64), minlength=len(categories))
+            nonzero = np.where(bincount > 0)[0]
+            n_unique = int(len(nonzero))
+            ranked = sorted(nonzero.tolist(), key=lambda i: int(bincount[i]), reverse=True)[:max_top_values]
+            top_values = [
+                {"value": categories[i], "count": int(bincount[i])}
+                for i in ranked
+            ]
+        except Exception:
+            if valid_codes.size > 0:
+                unique_codes, counts = np.unique(valid_codes, return_counts=True)
+                n_unique = int(len(unique_codes))
+                pairs = sorted(
+                    ((int(c), int(n)) for c, n in zip(unique_codes.tolist(), counts.tolist(), strict=False)),
+                    key=lambda x: x[1],
+                    reverse=True,
+                )[:max_top_values]
+                top_values = [
+                    {
+                        "value": categories[idx] if 0 <= idx < len(categories) else str(idx),
+                        "count": count,
+                    }
+                    for idx, count in pairs
+                ]
+        dtype_summary = f"categorical[{str(obj['categories'].dtype)}]"
+    elif isinstance(obj, h5py.Dataset):
+        total_values = int(obj.shape[0]) if obj.shape else int(n_obs or 0)
+        scan_n = min(total_values, max_scan_values)
+        sampled = scan_n < total_values
+        if sampled:
+            col_warnings.append(
+                f"Column {column!r} scanned on first {scan_n} / {total_values} values for cardinality summary."
+            )
+        try:
+            if len(obj.shape) > 1:
+                raw_values = obj[:scan_n, ...]
+                decoded = [str(v.tolist() if hasattr(v, "tolist") else v) for v in raw_values]
+            else:
+                raw_values = obj[:scan_n]
+                decoded = _safe_decode_array(raw_values)
+            uniques, counts = np.unique(np.asarray(decoded, dtype=object), return_counts=True)
+            n_unique = int(len(uniques))
+            pairs = sorted(
+                zip(uniques.tolist(), counts.tolist(), strict=False),
+                key=lambda x: int(x[1]),
+                reverse=True,
+            )[:max_top_values]
+            top_values = [{"value": str(val), "count": int(count)} for val, count in pairs]
+        except Exception as exc:
+            col_warnings.append(f"Unable to summarize column values: {type(exc).__name__}: {exc}")
+        dtype_summary = str(obj.dtype)
+    else:
+        col_warnings.append(f"Unsupported obs column backing type: {type(obj).__name__}")
+
+    warnings.extend(col_warnings)
+    return {
+        "name": column,
+        "dtype": dtype_summary,
+        "n_unique": n_unique,
+        "top_values": top_values,
+        "sampled": sampled,
+    }
+
+
+def _find_candidate_columns(obs_names: list[str]) -> dict[str, list[str]]:
+    lower_to_name = {name.lower(): name for name in obs_names}
+
+    def _rank(priority: list[str], tokens: list[str]) -> list[str]:
+        ranked: list[str] = []
+        for key in priority:
+            candidate = lower_to_name.get(key.lower())
+            if candidate is not None and candidate not in ranked:
+                ranked.append(candidate)
+        for name in obs_names:
+            lname = name.lower()
+            if any(tok in lname for tok in tokens) and name not in ranked:
+                ranked.append(name)
+        return ranked
+
+    return {
+        "perturbation": _rank(
+            [
+                "gene",
+                "target_gene",
+                "perturbation",
+                "drugname_drugconc",
+                "condition",
+                "guide",
+                "sgRNA",
+                "pert_col",
+            ],
+            ["pert", "drug", "target", "guide", "sg"],
+        ),
+        "cell_type": _rank(
+            [
+                "cell_type",
+                "celltype",
+                "cell_line",
+                "celltype_col",
+                "cellType",
+                "ctype",
+            ],
+            ["cell", "ctype", "line"],
+        ),
+        "batch": _rank(
+            [
+                "gem_group",
+                "batch",
+                "batch_col",
+                "donor",
+                "plate",
+                "lane",
+                "sample",
+                "experiment",
+                "replicate",
+            ],
+            ["batch", "gem", "donor", "plate", "lane", "sample", "rep"],
+        ),
+    }
+
+
+def inspect_adata_schema(adata_path: str, max_top_values: int = 25) -> dict[str, Any]:
+    """
+    Inspect an AnnData file and return schema metadata useful for guided ST training setup.
+    """
+    if max_top_values <= 0:
+        raise ValueError("`max_top_values` must be > 0.")
+
+    resolved = str(Path(adata_path).expanduser().resolve())
+    adata_obj = Path(resolved)
+    if not adata_obj.exists():
+        raise FileNotFoundError(f"AnnData file not found: {resolved}")
+    if not adata_obj.is_file():
+        raise ValueError(f"AnnData path is not a file: {resolved}")
+
+    try:
+        import h5py
+    except Exception as exc:
+        raise RuntimeError(f"h5py is required to inspect AnnData schemas: {exc}") from exc
+
+    warnings: list[str] = []
+    obs_columns: list[dict[str, Any]] = []
+    obsm_summaries: list[dict[str, Any]] = []
+
+    n_obs: int | None = None
+    n_vars: int | None = None
+    x_shape: list[int] | None = None
+    x_dtype: str | None = None
+    x_is_sparse = False
+
+    with h5py.File(resolved, "r") as f:
+        if "X" in f:
+            x_shape, x_dtype, x_is_sparse = _array_shape_and_dtype(f["X"])
+            if x_shape is not None and len(x_shape) == 2:
+                n_obs, n_vars = int(x_shape[0]), int(x_shape[1])
+        else:
+            warnings.append("Missing top-level X matrix.")
+
+        if n_obs is None and "obs" in f:
+            obs_group = f["obs"]
+            if isinstance(obs_group, h5py.Group):
+                if "_index" in obs_group:
+                    try:
+                        n_obs = int(obs_group["_index"].shape[0])
+                    except Exception:
+                        pass
+                if n_obs is None:
+                    for key in obs_group.keys():
+                        obj = obs_group[key]
+                        if isinstance(obj, h5py.Dataset) and len(obj.shape) >= 1:
+                            n_obs = int(obj.shape[0])
+                            break
+                        if isinstance(obj, h5py.Group) and "codes" in obj:
+                            n_obs = int(obj["codes"].shape[0])
+                            break
+
+        if n_vars is None and "var" in f:
+            var_group = f["var"]
+            if isinstance(var_group, h5py.Group):
+                if "_index" in var_group:
+                    try:
+                        n_vars = int(var_group["_index"].shape[0])
+                    except Exception:
+                        pass
+                if n_vars is None:
+                    for key in var_group.keys():
+                        obj = var_group[key]
+                        if isinstance(obj, h5py.Dataset) and len(obj.shape) >= 1:
+                            n_vars = int(obj.shape[0])
+                            break
+                        if isinstance(obj, h5py.Group) and "codes" in obj:
+                            n_vars = int(obj["codes"].shape[0])
+                            break
+
+        if "obs" in f and isinstance(f["obs"], h5py.Group):
+            obs_group = f["obs"]
+            for key in sorted(obs_group.keys()):
+                if key == "_index":
+                    continue
+                obs_columns.append(
+                    _summarize_obs_column(
+                        obs_group,
+                        key,
+                        n_obs=n_obs,
+                        max_top_values=max_top_values,
+                        max_scan_values=200000,
+                        warnings=warnings,
+                    )
+                )
+        else:
+            warnings.append("Missing obs group in AnnData file.")
+
+        if "obsm" in f and isinstance(f["obsm"], h5py.Group):
+            obsm_group = f["obsm"]
+            for key in sorted(obsm_group.keys()):
+                shape, dtype, is_sparse = _array_shape_and_dtype(obsm_group[key])
+                obsm_summaries.append(
+                    {
+                        "key": key,
+                        "shape": shape,
+                        "dtype": dtype,
+                        "is_sparse": is_sparse,
+                    }
+                )
+
+    obs_names = [entry["name"] for entry in obs_columns]
+    candidate_columns = _find_candidate_columns(obs_names)
+
+    perturbation_candidates = candidate_columns.get("perturbation", [])[:3]
+    scan_columns = set(perturbation_candidates) if perturbation_candidates else set(obs_names)
+    control_tokens = ("non-target", "control", "dmso", "vehicle", "nt_", "nt-", "ctrl")
+    control_candidates: list[dict[str, Any]] = []
+    n_obs_float = float(n_obs or 0)
+    for summary in obs_columns:
+        if summary["name"] not in scan_columns:
+            continue
+        for item in summary.get("top_values", []):
+            value = str(item.get("value", ""))
+            count = int(item.get("count", 0))
+            lower_value = value.lower()
+            if any(token in lower_value for token in control_tokens):
+                control_candidates.append(
+                    {
+                        "column": summary["name"],
+                        "value": value,
+                        "count": count,
+                        "fraction": round((count / n_obs_float), 6) if n_obs_float > 0 else None,
+                    }
+                )
+    control_candidates = sorted(control_candidates, key=lambda x: int(x.get("count") or 0), reverse=True)
+
+    return {
+        "adata_path": resolved,
+        "n_obs": n_obs,
+        "n_vars": n_vars,
+        "x": {
+            "shape": x_shape,
+            "dtype": x_dtype,
+            "is_sparse": x_is_sparse,
+        },
+        "obs_columns": obs_columns,
+        "obsm": obsm_summaries,
+        "candidate_columns": candidate_columns,
+        "control_label_candidates": control_candidates,
+        "warnings": warnings,
+    }
+
+
+def _is_glob_pattern(text: str) -> bool:
+    return any(char in text for char in "*?[]{}")
+
+
+def _expand_braces(pattern: str) -> list[str]:
+    match = re.search(r"\{([^}]+)\}", pattern)
+    if match is None:
+        return [pattern]
+    before = pattern[: match.start()]
+    after = pattern[match.end() :]
+    options = [part.strip() for part in match.group(1).split(",") if part.strip()]
+    if not options:
+        return [pattern]
+    expanded: list[str] = []
+    for option in options:
+        expanded.extend(_expand_braces(before + option + after))
+    return expanded
+
+
+def _find_dataset_files(dataset_path: str) -> list[str]:
+    path_text = str(dataset_path).strip()
+    if not path_text:
+        return []
+
+    files: list[Path] = []
+    if _is_glob_pattern(path_text):
+        patterns = _expand_braces(path_text)
+        for pattern in patterns:
+            if pattern.endswith(".h5") or pattern.endswith(".h5ad"):
+                matches = [Path(p) for p in sorted(glob.glob(pattern))]
+                files.extend(matches)
+            else:
+                files.extend(Path(p) for p in sorted(glob.glob(pattern.rstrip("/") + "/*.h5")))
+                files.extend(Path(p) for p in sorted(glob.glob(pattern.rstrip("/") + "/*.h5ad")))
+    else:
+        path = Path(path_text).expanduser()
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            files.extend(sorted(path.glob("*.h5")))
+            files.extend(sorted(path.glob("*.h5ad")))
+
+    deduped = sorted({str(p.resolve()) for p in files if p.exists() and p.is_file()})
+    return deduped
+
+
+def _load_toml_mapping(toml_path: Path) -> dict[str, Any]:
+    try:
+        import tomllib  # Python 3.11+
+    except Exception:
+        import tomli as tomllib  # type: ignore
+
+    with toml_path.open("rb") as f:
+        payload = tomllib.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected top-level TOML mapping in {toml_path}, got {type(payload).__name__}")
+    return payload
+
+
+def inspect_tx_split_toml(
+    toml_path: str,
+    sample_files_per_dataset: int = 1,
+    inspect_sample_schemas: bool = True,
+) -> dict[str, Any]:
+    """
+    Inspect a STATE TX split TOML and return training/split and schema-relevant metadata.
+    """
+    if sample_files_per_dataset <= 0:
+        raise ValueError("`sample_files_per_dataset` must be > 0.")
+
+    resolved = str(Path(toml_path).expanduser().resolve())
+    toml_obj = Path(resolved)
+    if not toml_obj.exists():
+        raise FileNotFoundError(f"TOML config not found: {resolved}")
+    if not toml_obj.is_file():
+        raise ValueError(f"TOML path is not a file: {resolved}")
+
+    payload = _load_toml_mapping(toml_obj)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    datasets_section = payload.get("datasets", {})
+    training_section = payload.get("training", {})
+    zeroshot_section = payload.get("zeroshot", {})
+    fewshot_section = payload.get("fewshot", {})
+
+    if not isinstance(datasets_section, dict):
+        errors.append("`[datasets]` must be a mapping.")
+        datasets_section = {}
+    if not isinstance(training_section, dict):
+        errors.append("`[training]` must be a mapping.")
+        training_section = {}
+    if not isinstance(zeroshot_section, dict):
+        errors.append("`[zeroshot]` must be a mapping when present.")
+        zeroshot_section = {}
+    if not isinstance(fewshot_section, dict):
+        errors.append("`[fewshot]` must be a mapping when present.")
+        fewshot_section = {}
+
+    if not datasets_section:
+        errors.append("Missing required `[datasets]` section or it is empty.")
+    if not training_section:
+        errors.append("Missing required `[training]` section or it is empty.")
+
+    dataset_entries: list[dict[str, Any]] = []
+    dataset_sample_files: dict[str, list[str]] = {}
+    for dataset_name, raw_path in sorted(datasets_section.items()):
+        path_text = str(raw_path)
+        expanded_path = str(Path(path_text).expanduser())
+        kind = "glob" if _is_glob_pattern(path_text) else ("file" if Path(expanded_path).is_file() else "dir")
+        files = _find_dataset_files(path_text)
+        exists = bool(files) if kind == "glob" else Path(expanded_path).exists()
+        sample_files = files[:sample_files_per_dataset]
+        dataset_sample_files[dataset_name] = sample_files
+        if not exists:
+            warnings.append(f"Dataset path for {dataset_name!r} does not resolve to files: {path_text}")
+        dataset_entries.append(
+            {
+                "name": str(dataset_name),
+                "path": path_text,
+                "path_kind": kind,
+                "exists": bool(exists),
+                "sample_files": sample_files,
+            }
+        )
+
+    referenced_datasets = set(training_section.keys())
+    for context in zeroshot_section.keys():
+        dataset_name = str(context).split(".", 1)[0]
+        referenced_datasets.add(dataset_name)
+    for context in fewshot_section.keys():
+        dataset_name = str(context).split(".", 1)[0]
+        referenced_datasets.add(dataset_name)
+    missing_dataset_paths = sorted(referenced_datasets - set(datasets_section.keys()))
+    if missing_dataset_paths:
+        errors.append(
+            "Datasets referenced in training/splits but missing from `[datasets]`: "
+            + ", ".join(missing_dataset_paths)
+        )
+
+    zeroshot_entries: list[dict[str, Any]] = []
+    for context, split in sorted(zeroshot_section.items()):
+        split_str = str(split)
+        if split_str not in {"val", "test", "train"}:
+            warnings.append(
+                f"Unexpected zeroshot split value for {context!r}: {split_str!r} (expected 'val' or 'test')."
+            )
+        zeroshot_entries.append({"context": str(context), "split": split_str})
+
+    fewshot_entries: list[dict[str, Any]] = []
+    for context, split_cfg in sorted(fewshot_section.items()):
+        if not isinstance(split_cfg, dict):
+            warnings.append(f"Fewshot context {context!r} is not a mapping; skipping split counts.")
+            fewshot_entries.append({"context": str(context), "val_count": 0, "test_count": 0})
+            continue
+        val_list = split_cfg.get("val", [])
+        test_list = split_cfg.get("test", [])
+        if not isinstance(val_list, list):
+            warnings.append(f"Fewshot context {context!r} has non-list `val`; treating as empty.")
+            val_list = []
+        if not isinstance(test_list, list):
+            warnings.append(f"Fewshot context {context!r} has non-list `test`; treating as empty.")
+            test_list = []
+        fewshot_entries.append(
+            {
+                "context": str(context),
+                "val_count": int(len(val_list)),
+                "test_count": int(len(test_list)),
+            }
+        )
+
+    schema_from_samples: dict[str, Any] = {
+        "obs_common": [],
+        "obsm_common": [],
+        "dataset_diffs": [],
+    }
+    if inspect_sample_schemas:
+        obs_sets: dict[str, set[str]] = {}
+        obsm_sets: dict[str, set[str]] = {}
+        for dataset_name, sample_files in dataset_sample_files.items():
+            if not sample_files:
+                continue
+            try:
+                schema = inspect_adata_schema(sample_files[0], max_top_values=5)
+            except Exception as exc:
+                warnings.append(
+                    f"Failed to inspect sample schema for dataset {dataset_name!r} ({sample_files[0]}): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            obs_sets[dataset_name] = {str(col.get("name")) for col in schema.get("obs_columns", [])}
+            obsm_sets[dataset_name] = {str(item.get("key")) for item in schema.get("obsm", [])}
+
+        if obs_sets:
+            obs_common = set.intersection(*obs_sets.values())
+            schema_from_samples["obs_common"] = sorted(obs_common)
+            obs_union = set.union(*obs_sets.values())
+            for dataset_name, columns in sorted(obs_sets.items()):
+                missing = sorted(obs_union - columns)
+                if missing:
+                    schema_from_samples["dataset_diffs"].append(
+                        f"{dataset_name}: missing obs columns seen elsewhere: {', '.join(missing[:10])}"
+                    )
+        if obsm_sets:
+            obsm_common = set.intersection(*obsm_sets.values())
+            schema_from_samples["obsm_common"] = sorted(obsm_common)
+            obsm_union = set.union(*obsm_sets.values())
+            for dataset_name, keys in sorted(obsm_sets.items()):
+                missing = sorted(obsm_union - keys)
+                if missing:
+                    schema_from_samples["dataset_diffs"].append(
+                        f"{dataset_name}: missing obsm keys seen elsewhere: {', '.join(missing[:10])}"
+                    )
+
+    return {
+        "toml_path": resolved,
+        "datasets": dataset_entries,
+        "training": {str(k): str(v) for k, v in training_section.items()},
+        "zeroshot": zeroshot_entries,
+        "fewshot": fewshot_entries,
+        "schema_from_samples": schema_from_samples,
+        "errors": errors,
         "warnings": warnings,
     }
