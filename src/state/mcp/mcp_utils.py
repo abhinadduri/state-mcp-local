@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
 import pickle
 import re
@@ -1163,6 +1164,868 @@ def _load_toml_mapping(toml_path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected top-level TOML mapping in {toml_path}, got {type(payload).__name__}")
     return payload
+
+
+_CONTROL_LABEL_TOKENS: Final[tuple[str, ...]] = (
+    "non-target",
+    "control",
+    "dmso",
+    "vehicle",
+    "nt_",
+    "nt-",
+    "ctrl",
+)
+
+
+def _validate_dataset_paths_mapping(dataset_paths: dict[str, Any]) -> dict[str, str]:
+    if not isinstance(dataset_paths, dict) or not dataset_paths:
+        raise ValueError("`dataset_paths` must be a non-empty mapping of dataset name -> path/glob.")
+
+    normalized: dict[str, str] = {}
+    for raw_name, raw_path in sorted(dataset_paths.items()):
+        name = str(raw_name).strip()
+        path = str(raw_path).strip()
+        if not name:
+            raise ValueError("Dataset names in `dataset_paths` must be non-empty.")
+        if not path:
+            raise ValueError(f"Dataset path for {name!r} must be non-empty.")
+        normalized[name] = path
+    return normalized
+
+
+def _pick_column_candidate(candidates: Any, fallback: str) -> str:
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return fallback
+
+
+def _resolve_split_columns(
+    dataset_paths: dict[str, str],
+    cell_type_column: str | None,
+    perturbation_column: str | None,
+) -> tuple[str, str, dict[str, Any] | None, list[str]]:
+    warnings: list[str] = []
+    resolved_cell_type = (
+        cell_type_column.strip() if isinstance(cell_type_column, str) and cell_type_column.strip() else None
+    )
+    resolved_perturbation = (
+        perturbation_column.strip()
+        if isinstance(perturbation_column, str) and perturbation_column.strip()
+        else None
+    )
+
+    sample_schema: dict[str, Any] | None = None
+    if resolved_cell_type is not None and resolved_perturbation is not None:
+        return resolved_cell_type, resolved_perturbation, sample_schema, warnings
+
+    sample_file: str | None = None
+    for dataset_name, dataset_path in sorted(dataset_paths.items()):
+        files = _find_dataset_files(dataset_path)
+        if files:
+            sample_file = files[0]
+            break
+        warnings.append(f"Dataset {dataset_name!r} did not resolve to files while inferring split columns.")
+
+    if sample_file is None:
+        raise ValueError(
+            "Unable to infer split columns because no dataset files could be resolved. "
+            "Provide `cell_type_column` and `perturbation_column` explicitly."
+        )
+
+    sample_schema = inspect_adata_schema(sample_file, max_top_values=10)
+    candidate_columns = sample_schema.get("candidate_columns", {})
+    if not isinstance(candidate_columns, dict):
+        candidate_columns = {}
+
+    if resolved_cell_type is None:
+        resolved_cell_type = _pick_column_candidate(candidate_columns.get("cell_type"), "cell_type")
+        warnings.append(
+            f"Inferred `cell_type_column={resolved_cell_type!r}` from sample AnnData schema at {sample_file}."
+        )
+    if resolved_perturbation is None:
+        resolved_perturbation = _pick_column_candidate(candidate_columns.get("perturbation"), "gene")
+        warnings.append(
+            f"Inferred `perturbation_column={resolved_perturbation!r}` from sample AnnData schema at {sample_file}."
+        )
+
+    return resolved_cell_type, resolved_perturbation, sample_schema, warnings
+
+
+def _extract_obs_categorical(obj: Any) -> tuple[list[str], np.ndarray] | None:
+    try:
+        import h5py
+    except Exception:
+        return None
+
+    if not isinstance(obj, h5py.Group):
+        return None
+    if not {"categories", "codes"}.issubset(set(obj.keys())):
+        return None
+
+    categories = _safe_decode_array(obj["categories"][:])
+    codes = np.asarray(obj["codes"][:], dtype=np.int64)
+    return categories, codes
+
+
+def _read_obs_column_values_as_strings(obs_group: Any, column: str) -> np.ndarray:
+    try:
+        import h5py
+    except Exception as exc:
+        raise RuntimeError(f"h5py is required for split source inspection: {exc}") from exc
+
+    obj = obs_group[column]
+    categorical = _extract_obs_categorical(obj)
+    if categorical is not None:
+        categories, codes = categorical
+        out = np.empty(codes.shape[0], dtype=object)
+        out[:] = ""
+        valid = codes >= 0
+        if np.any(valid):
+            valid_codes = codes[valid]
+            mapped = [
+                categories[int(code)] if 0 <= int(code) < len(categories) else str(int(code))
+                for code in valid_codes.tolist()
+            ]
+            out[valid] = np.asarray(mapped, dtype=object)
+        return out
+
+    if isinstance(obj, h5py.Dataset):
+        raw = obj[:]
+        if len(obj.shape) > 1:
+            return np.asarray(
+                [
+                    str(item.tolist() if hasattr(item, "tolist") else item)
+                    for item in raw
+                ],
+                dtype=object,
+            )
+        return np.asarray(_safe_decode_array(raw), dtype=object)
+
+    raise ValueError(f"Unsupported obs column type for {column!r}: {type(obj).__name__}")
+
+
+def _scan_split_context_counts(
+    dataset_paths: dict[str, str],
+    *,
+    cell_type_column: str,
+    perturbation_column: str,
+) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, Any]], dict[str, list[str]], list[str], list[str]]:
+    try:
+        import h5py
+    except Exception as exc:
+        raise RuntimeError(f"h5py is required for split source inspection: {exc}") from exc
+
+    context_counts: dict[str, dict[str, int]] = {}
+    context_meta: dict[str, dict[str, Any]] = {}
+    dataset_files: dict[str, list[str]] = {}
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    for dataset_name, dataset_path in sorted(dataset_paths.items()):
+        files = _find_dataset_files(dataset_path)
+        dataset_files[dataset_name] = files
+        if not files:
+            warnings.append(f"Dataset {dataset_name!r} did not resolve to any .h5/.h5ad files from {dataset_path!r}.")
+            continue
+
+        for file_path in files:
+            try:
+                with h5py.File(file_path, "r") as handle:
+                    if "obs" not in handle or not isinstance(handle["obs"], h5py.Group):
+                        warnings.append(f"File {file_path} is missing an `obs` group; skipping.")
+                        continue
+
+                    obs_group = handle["obs"]
+                    if cell_type_column not in obs_group:
+                        warnings.append(
+                            f"File {file_path} is missing obs/{cell_type_column!r}; skipping for split inspection."
+                        )
+                        continue
+                    if perturbation_column not in obs_group:
+                        warnings.append(
+                            f"File {file_path} is missing obs/{perturbation_column!r}; skipping for split inspection."
+                        )
+                        continue
+
+                    ct_obj = obs_group[cell_type_column]
+                    pert_obj = obs_group[perturbation_column]
+                    ct_categorical = _extract_obs_categorical(ct_obj)
+                    pert_categorical = _extract_obs_categorical(pert_obj)
+
+                    if ct_categorical is not None and pert_categorical is not None:
+                        ct_categories, ct_codes = ct_categorical
+                        pert_categories, pert_codes = pert_categorical
+                        if ct_codes.shape[0] != pert_codes.shape[0]:
+                            warnings.append(
+                                f"File {file_path} has mismatched row counts between "
+                                f"{cell_type_column!r} and {perturbation_column!r}; skipping."
+                            )
+                            continue
+
+                        valid = (ct_codes >= 0) & (pert_codes >= 0)
+                        if np.any(valid):
+                            pair_codes = np.stack(
+                                (ct_codes[valid].astype(np.int64), pert_codes[valid].astype(np.int64)),
+                                axis=1,
+                            )
+                            unique_pairs, pair_counts = np.unique(pair_codes, axis=0, return_counts=True)
+                            for (ct_code, pert_code), count in zip(
+                                unique_pairs.tolist(),
+                                pair_counts.tolist(),
+                                strict=False,
+                            ):
+                                ct_index = int(ct_code)
+                                pert_index = int(pert_code)
+                                ct_name = (
+                                    ct_categories[ct_index]
+                                    if 0 <= ct_index < len(ct_categories)
+                                    else str(ct_index)
+                                )
+                                pert_name = (
+                                    pert_categories[pert_index]
+                                    if 0 <= pert_index < len(pert_categories)
+                                    else str(pert_index)
+                                )
+                                ct_name = str(ct_name).strip()
+                                pert_name = str(pert_name).strip()
+                                if not ct_name or not pert_name:
+                                    continue
+
+                                context = f"{dataset_name}.{ct_name}"
+                                counts_by_pert = context_counts.setdefault(context, {})
+                                counts_by_pert[pert_name] = counts_by_pert.get(pert_name, 0) + int(count)
+                                meta = context_meta.setdefault(
+                                    context,
+                                    {"dataset": dataset_name, "cell_type": ct_name, "source_files": set()},
+                                )
+                                meta["source_files"].add(file_path)
+                        continue
+
+                    cell_types = _read_obs_column_values_as_strings(obs_group, cell_type_column)
+                    perturbations = _read_obs_column_values_as_strings(obs_group, perturbation_column)
+                    if cell_types.shape[0] != perturbations.shape[0]:
+                        warnings.append(
+                            f"File {file_path} has mismatched row counts between "
+                            f"{cell_type_column!r} and {perturbation_column!r}; skipping."
+                        )
+                        continue
+
+                    for ct_name_raw, pert_name_raw in zip(cell_types.tolist(), perturbations.tolist(), strict=False):
+                        ct_name = str(ct_name_raw).strip()
+                        pert_name = str(pert_name_raw).strip()
+                        if not ct_name or not pert_name:
+                            continue
+                        context = f"{dataset_name}.{ct_name}"
+                        counts_by_pert = context_counts.setdefault(context, {})
+                        counts_by_pert[pert_name] = counts_by_pert.get(pert_name, 0) + 1
+                        meta = context_meta.setdefault(
+                            context,
+                            {"dataset": dataset_name, "cell_type": ct_name, "source_files": set()},
+                        )
+                        meta["source_files"].add(file_path)
+            except Exception as exc:
+                errors.append(
+                    f"Failed to inspect {file_path} for split metadata: {type(exc).__name__}: {exc}"
+                )
+
+    for meta in context_meta.values():
+        source_files = sorted(str(p) for p in meta.get("source_files", set()))
+        meta["source_files"] = source_files
+        meta["source_file_count"] = len(source_files)
+
+    return context_counts, context_meta, dataset_files, warnings, errors
+
+
+def _infer_control_candidates(context_counts: dict[str, dict[str, int]]) -> list[dict[str, Any]]:
+    aggregate: dict[str, int] = {}
+    for counts in context_counts.values():
+        for perturbation, count in counts.items():
+            aggregate[perturbation] = aggregate.get(perturbation, 0) + int(count)
+
+    ranked = sorted(aggregate.items(), key=lambda item: item[1], reverse=True)
+    candidates: list[dict[str, Any]] = []
+    for perturbation, count in ranked:
+        lower = perturbation.lower()
+        if any(token in lower for token in _CONTROL_LABEL_TOKENS):
+            candidates.append({"value": perturbation, "count": int(count)})
+    return candidates
+
+
+def _summarize_context_counts(
+    context_counts: dict[str, dict[str, int]],
+    context_meta: dict[str, dict[str, Any]],
+    *,
+    control_perturbation: str | None,
+    max_top_perturbations: int,
+    max_contexts: int,
+) -> tuple[list[dict[str, Any]], int]:
+    if max_contexts <= 0:
+        raise ValueError("`max_contexts` must be > 0.")
+
+    contexts = sorted(context_counts.keys())
+    total_contexts = len(contexts)
+    selected_contexts = contexts[:max_contexts]
+
+    summaries: list[dict[str, Any]] = []
+    for context in selected_contexts:
+        counts = context_counts.get(context, {})
+        total_cells = int(sum(int(v) for v in counts.values()))
+        control_cells = int(counts.get(control_perturbation, 0)) if control_perturbation is not None else 0
+        non_control_cells = total_cells - control_cells
+        ranked = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        top_perturbations = [
+            {"perturbation": perturbation, "count": int(count)}
+            for perturbation, count in ranked[:max_top_perturbations]
+        ]
+        meta = context_meta.get(context, {})
+        summaries.append(
+            {
+                "context": context,
+                "dataset": str(meta.get("dataset") or context.split(".", 1)[0]),
+                "cell_type": str(meta.get("cell_type") or context.split(".", 1)[-1]),
+                "source_file_count": int(meta.get("source_file_count") or 0),
+                "source_files": list(meta.get("source_files") or []),
+                "total_cells": total_cells,
+                "control_cells": control_cells,
+                "non_control_cells": non_control_cells,
+                "unique_perturbations": len(counts),
+                "top_perturbations": top_perturbations,
+            }
+        )
+
+    return summaries, total_contexts
+
+
+def _normalize_fraction(name: str, value: float) -> float:
+    parsed = float(value)
+    if parsed < 0.0 or parsed > 1.0:
+        raise ValueError(f"`{name}` must be within [0, 1], got {value!r}.")
+    return parsed
+
+
+def _deterministic_context_seed(base_seed: int, context: str) -> int:
+    digest = hashlib.sha256(f"{base_seed}:{context}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=False)
+
+
+def _random_split_perturbations(
+    perturbations: list[str],
+    *,
+    test_fraction: float,
+    val_fraction: float,
+    seed: int,
+    context: str,
+) -> tuple[list[str], list[str]]:
+    shuffled = list(perturbations)
+    rng = np.random.default_rng(_deterministic_context_seed(seed, context))
+    rng.shuffle(shuffled)
+
+    n_total = len(shuffled)
+    n_val = int(n_total * val_fraction)
+    n_test = int(n_total * test_fraction)
+    if n_val + n_test > n_total:
+        raise ValueError(
+            f"Invalid fractions for context {context!r}: val={val_fraction}, test={test_fraction}, "
+            f"sum exceeds 1.0."
+        )
+
+    val_items = sorted(shuffled[:n_val])
+    test_items = sorted(shuffled[n_val : n_val + n_test])
+    return val_items, test_items
+
+
+def _normalize_zeroshot_contexts(zeroshot_contexts: dict[str, Any] | None) -> dict[str, str]:
+    if zeroshot_contexts is None:
+        return {}
+    if not isinstance(zeroshot_contexts, dict):
+        raise ValueError("`zeroshot_contexts` must be a mapping of `dataset.cell_type` -> split.")
+
+    normalized: dict[str, str] = {}
+    for raw_context, raw_split in sorted(zeroshot_contexts.items()):
+        context = str(raw_context).strip()
+        split = str(raw_split).strip().lower()
+        if not context:
+            raise ValueError("`zeroshot_contexts` contains an empty context key.")
+        if split not in {"train", "val", "test"}:
+            raise ValueError(
+                f"Invalid zeroshot split {raw_split!r} for context {context!r}. "
+                "Expected one of: train, val, test."
+            )
+        normalized[context] = split
+    return normalized
+
+
+def _normalize_fewshot_overrides(
+    fewshot_overrides: dict[str, Any] | None,
+) -> tuple[dict[str, dict[str, list[str]]], list[str]]:
+    if fewshot_overrides is None:
+        return {}, []
+    if not isinstance(fewshot_overrides, dict):
+        raise ValueError("`fewshot_overrides` must be a mapping of context -> {val/test lists}.")
+
+    warnings: list[str] = []
+    normalized: dict[str, dict[str, list[str]]] = {}
+    for raw_context, raw_spec in sorted(fewshot_overrides.items()):
+        context = str(raw_context).strip()
+        if not context:
+            raise ValueError("`fewshot_overrides` contains an empty context key.")
+        if not isinstance(raw_spec, dict):
+            raise ValueError(f"Fewshot override for context {context!r} must be a mapping.")
+
+        val_raw = raw_spec.get("val", [])
+        test_raw = raw_spec.get("test", [])
+        if not isinstance(val_raw, list):
+            raise ValueError(f"Fewshot override for context {context!r} has non-list `val`.")
+        if not isinstance(test_raw, list):
+            raise ValueError(f"Fewshot override for context {context!r} has non-list `test`.")
+
+        val_values = sorted({str(item).strip() for item in val_raw if str(item).strip()})
+        test_values = sorted({str(item).strip() for item in test_raw if str(item).strip()})
+        overlap = sorted(set(val_values) & set(test_values))
+        if overlap:
+            warnings.append(
+                f"Fewshot context {context!r} has {len(overlap)} perturbations in both val and test; "
+                "this is allowed and will duplicate those perturbations across both splits."
+            )
+
+        normalized[context] = {"val": val_values, "test": test_values}
+
+    return normalized, warnings
+
+
+def _toml_quote_double(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _toml_quote_single(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _toml_list_literal(values: list[str]) -> str:
+    return "[" + ", ".join(_toml_quote_single(item) for item in values) + "]"
+
+
+def _render_tx_split_toml(
+    *,
+    dataset_paths: dict[str, str],
+    training_section: dict[str, str],
+    zeroshot_section: dict[str, str],
+    fewshot_section: dict[str, dict[str, list[str]]],
+) -> str:
+    lines: list[str] = []
+    lines.append("[datasets]")
+    for dataset_name, dataset_path in sorted(dataset_paths.items()):
+        lines.append(f"{_toml_quote_double(dataset_name)} = {_toml_quote_double(dataset_path)}")
+    lines.append("")
+
+    lines.append("[training]")
+    for dataset_name, split in sorted(training_section.items()):
+        lines.append(f"{_toml_quote_double(dataset_name)} = {_toml_quote_double(split)}")
+    lines.append("")
+
+    lines.append("[zeroshot]")
+    for context, split in sorted(zeroshot_section.items()):
+        lines.append(f"{_toml_quote_double(context)} = {_toml_quote_double(split)}")
+    lines.append("")
+
+    lines.append("[fewshot]")
+    for context, spec in sorted(fewshot_section.items()):
+        escaped_context = context.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'[fewshot."{escaped_context}"]')
+        lines.append(f"val = {_toml_list_literal(list(spec.get('val', [])))}")
+        lines.append(f"test = {_toml_list_literal(list(spec.get('test', [])))}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def inspect_tx_split_sources(
+    dataset_paths: dict[str, Any],
+    cell_type_column: str | None = None,
+    perturbation_column: str | None = None,
+    control_perturbation: str | None = None,
+    max_top_perturbations: int = 10,
+    max_contexts: int = 200,
+) -> dict[str, Any]:
+    """
+    Inspect dataset sources for TX split/TOML authoring and return context-level summaries.
+
+    This expands glob-style dataset paths, scans contexts (`dataset.cell_type`) and perturbation
+    counts, and suggests split-relevant columns when omitted.
+    """
+    if max_top_perturbations <= 0:
+        raise ValueError("`max_top_perturbations` must be > 0.")
+    if max_contexts <= 0:
+        raise ValueError("`max_contexts` must be > 0.")
+
+    normalized_paths = _validate_dataset_paths_mapping(dataset_paths)
+    resolved_cell_type, resolved_perturbation, sample_schema, column_warnings = _resolve_split_columns(
+        normalized_paths,
+        cell_type_column=cell_type_column,
+        perturbation_column=perturbation_column,
+    )
+
+    context_counts, context_meta, dataset_files, scan_warnings, scan_errors = _scan_split_context_counts(
+        normalized_paths,
+        cell_type_column=resolved_cell_type,
+        perturbation_column=resolved_perturbation,
+    )
+    control_candidates = _infer_control_candidates(context_counts)
+
+    resolved_control = (
+        control_perturbation.strip() if isinstance(control_perturbation, str) and control_perturbation.strip() else None
+    )
+    if resolved_control is None and control_candidates:
+        resolved_control = str(control_candidates[0]["value"])
+        column_warnings.append(
+            f"Inferred control perturbation label {resolved_control!r} from perturbation distributions."
+        )
+
+    context_summaries, total_contexts = _summarize_context_counts(
+        context_counts,
+        context_meta,
+        control_perturbation=resolved_control,
+        max_top_perturbations=max_top_perturbations,
+        max_contexts=max_contexts,
+    )
+
+    datasets_payload = [
+        {
+            "name": dataset_name,
+            "path": dataset_path,
+            "resolved_file_count": len(dataset_files.get(dataset_name, [])),
+            "sample_files": list(dataset_files.get(dataset_name, []))[:3],
+        }
+        for dataset_name, dataset_path in sorted(normalized_paths.items())
+    ]
+
+    candidate_columns = {}
+    if isinstance(sample_schema, dict):
+        raw_candidates = sample_schema.get("candidate_columns", {})
+        if isinstance(raw_candidates, dict):
+            candidate_columns = raw_candidates
+
+    return {
+        "datasets": datasets_payload,
+        "resolved_columns": {
+            "cell_type_column": resolved_cell_type,
+            "perturbation_column": resolved_perturbation,
+            "control_perturbation": resolved_control,
+        },
+        "candidate_columns": candidate_columns,
+        "context_count_total": total_contexts,
+        "context_count_returned": len(context_summaries),
+        "contexts": context_summaries,
+        "control_candidates": control_candidates[:25],
+        "warnings": column_warnings + scan_warnings,
+        "errors": scan_errors,
+    }
+
+
+def plan_tx_split_toml(
+    dataset_paths: dict[str, Any],
+    training_datasets: list[str] | None = None,
+    cell_type_column: str | None = None,
+    perturbation_column: str | None = None,
+    control_perturbation: str | None = None,
+    random_holdout_contexts: list[str] | None = None,
+    random_test_fraction: float = 0.7,
+    random_val_fraction: float = 0.0,
+    random_seed: int = 0,
+    zeroshot_contexts: dict[str, Any] | None = None,
+    fewshot_overrides: dict[str, Any] | None = None,
+    output_path: str | None = None,
+    overwrite: bool = False,
+    include_toml: bool = False,
+    preview_lines: int = 120,
+    max_contexts_in_summary: int = 200,
+) -> dict[str, Any]:
+    """
+    Build a TX split TOML from dataset paths plus random/manual split directives.
+
+    Common pattern:
+    - set `[training]` datasets
+    - optionally set full-context `[zeroshot]` entries
+    - optionally generate random fewshot perturbation holdouts for specific contexts
+      (e.g., hold out 70% perturbations in `replogle.rpe1`)
+    - optionally overlay manual `fewshot_overrides`
+
+    Set `output_path` to write the TOML to disk.
+    """
+    if preview_lines <= 0:
+        raise ValueError("`preview_lines` must be > 0.")
+    if max_contexts_in_summary <= 0:
+        raise ValueError("`max_contexts_in_summary` must be > 0.")
+
+    normalized_paths = _validate_dataset_paths_mapping(dataset_paths)
+    resolved_cell_type, resolved_perturbation, _, column_warnings = _resolve_split_columns(
+        normalized_paths,
+        cell_type_column=cell_type_column,
+        perturbation_column=perturbation_column,
+    )
+
+    context_counts, context_meta, dataset_files, scan_warnings, scan_errors = _scan_split_context_counts(
+        normalized_paths,
+        cell_type_column=resolved_cell_type,
+        perturbation_column=resolved_perturbation,
+    )
+    control_candidates = _infer_control_candidates(context_counts)
+    resolved_control = (
+        control_perturbation.strip() if isinstance(control_perturbation, str) and control_perturbation.strip() else None
+    )
+    warnings: list[str] = []
+    warnings.extend(column_warnings)
+    warnings.extend(scan_warnings)
+    warnings.extend(scan_errors)
+
+    if resolved_control is None and control_candidates:
+        resolved_control = str(control_candidates[0]["value"])
+        warnings.append(
+            f"Inferred control perturbation label {resolved_control!r} from perturbation distributions."
+        )
+    elif resolved_control is not None:
+        observed = any(resolved_control in counts for counts in context_counts.values())
+        if not observed:
+            warnings.append(
+                f"Requested control perturbation label {resolved_control!r} was not observed in scanned contexts."
+            )
+
+    test_fraction = _normalize_fraction("random_test_fraction", random_test_fraction)
+    val_fraction = _normalize_fraction("random_val_fraction", random_val_fraction)
+    if test_fraction + val_fraction > 1.0:
+        raise ValueError(
+            "`random_test_fraction + random_val_fraction` must be <= 1.0."
+        )
+    if random_seed < 0:
+        raise ValueError("`random_seed` must be >= 0.")
+
+    if training_datasets is None:
+        selected_training_datasets = sorted(normalized_paths.keys())
+    else:
+        cleaned = sorted({str(item).strip() for item in training_datasets if str(item).strip()})
+        unknown = sorted(set(cleaned) - set(normalized_paths.keys()))
+        if unknown:
+            raise ValueError(
+                "Unknown dataset names in `training_datasets`: " + ", ".join(unknown)
+            )
+        selected_training_datasets = cleaned
+    training_section = {dataset: "train" for dataset in selected_training_datasets}
+
+    zeroshot_section = _normalize_zeroshot_contexts(zeroshot_contexts)
+    fewshot_manual, manual_warnings = _normalize_fewshot_overrides(fewshot_overrides)
+    warnings.extend(manual_warnings)
+
+    available_contexts = set(context_counts.keys())
+    unknown_zeroshot_contexts = sorted(set(zeroshot_section.keys()) - available_contexts)
+    if unknown_zeroshot_contexts:
+        raise ValueError(
+            "Unknown contexts in `zeroshot_contexts`: " + ", ".join(unknown_zeroshot_contexts)
+        )
+    unknown_manual_contexts = sorted(set(fewshot_manual.keys()) - available_contexts)
+    if unknown_manual_contexts:
+        raise ValueError(
+            "Unknown contexts in `fewshot_overrides`: " + ", ".join(unknown_manual_contexts)
+        )
+
+    random_contexts = sorted(
+        {str(item).strip() for item in (random_holdout_contexts or []) if str(item).strip()}
+    )
+    unknown_random_contexts = sorted(set(random_contexts) - available_contexts)
+    if unknown_random_contexts:
+        raise ValueError(
+            "Unknown contexts in `random_holdout_contexts`: " + ", ".join(unknown_random_contexts)
+        )
+
+    random_assignments: dict[str, dict[str, list[str]]] = {}
+    random_assignment_summary: list[dict[str, Any]] = []
+    for context in random_contexts:
+        if context in zeroshot_section:
+            warnings.append(
+                f"Skipping random holdout for context {context!r} because it is already assigned in `zeroshot_contexts`."
+            )
+            continue
+
+        perts = sorted(context_counts[context].keys())
+        if resolved_control is not None:
+            perts = [pert for pert in perts if pert != resolved_control]
+
+        val_items, test_items = _random_split_perturbations(
+            perts,
+            test_fraction=test_fraction,
+            val_fraction=val_fraction,
+            seed=random_seed,
+            context=context,
+        )
+        if test_fraction > 0 and perts and not test_items:
+            warnings.append(
+                f"Context {context!r} has too few perturbations for requested "
+                f"test fraction {test_fraction}; test split resolved to 0 perturbations."
+            )
+        if val_fraction > 0 and perts and not val_items:
+            warnings.append(
+                f"Context {context!r} has too few perturbations for requested "
+                f"val fraction {val_fraction}; val split resolved to 0 perturbations."
+            )
+
+        random_assignments[context] = {"val": val_items, "test": test_items}
+        random_assignment_summary.append(
+            {
+                "context": context,
+                "non_control_perturbation_count": len(perts),
+                "val_count": len(val_items),
+                "test_count": len(test_items),
+                "train_count": max(0, len(perts) - len(val_items) - len(test_items)),
+                "val_preview": val_items[:20],
+                "test_preview": test_items[:20],
+            }
+        )
+
+    fewshot_section = dict(random_assignments)
+    for context, spec in fewshot_manual.items():
+        if context in fewshot_section:
+            warnings.append(
+                f"Manual fewshot override replaced random assignment for context {context!r}."
+            )
+        fewshot_section[context] = {"val": list(spec.get("val", [])), "test": list(spec.get("test", []))}
+
+    toml_text = _render_tx_split_toml(
+        dataset_paths=normalized_paths,
+        training_section=training_section,
+        zeroshot_section=zeroshot_section,
+        fewshot_section=fewshot_section,
+    )
+
+    written_output_path: str | None = None
+    if output_path is not None and str(output_path).strip():
+        resolved_output = Path(output_path).expanduser().resolve()
+        if resolved_output.exists() and not overwrite:
+            raise FileExistsError(
+                f"Output TOML already exists at {resolved_output}. Set `overwrite=True` to replace it."
+            )
+        resolved_output.parent.mkdir(parents=True, exist_ok=True)
+        resolved_output.write_text(toml_text, encoding="utf-8")
+        written_output_path = str(resolved_output)
+
+    split_cell_counts = {"train": 0, "val": 0, "test": 0}
+    context_assignments: list[dict[str, Any]] = []
+    assignment_mode_counts: dict[str, int] = {}
+    for context in sorted(context_counts.keys()):
+        counts = context_counts[context]
+        dataset_name = context.split(".", 1)[0]
+        total_cells = int(sum(int(v) for v in counts.values()))
+        control_cells = int(counts.get(resolved_control, 0)) if resolved_control is not None else 0
+
+        if context in zeroshot_section:
+            split = zeroshot_section[context]
+            mode = f"zeroshot:{split}"
+            train_cells = control_cells
+            val_cells = 0
+            test_cells = 0
+            non_control_cells = total_cells - control_cells
+            if split == "train":
+                train_cells += non_control_cells
+            elif split == "val":
+                val_cells += non_control_cells
+            elif split == "test":
+                test_cells += non_control_cells
+        elif context in fewshot_section:
+            mode = "fewshot"
+            spec = fewshot_section[context]
+            val_set = set(spec.get("val", []))
+            test_set = set(spec.get("test", []))
+            train_cells = 0
+            val_cells = 0
+            test_cells = 0
+            for perturbation, count in counts.items():
+                count_int = int(count)
+                if resolved_control is not None and perturbation == resolved_control:
+                    train_cells += count_int
+                    continue
+                in_val = perturbation in val_set
+                in_test = perturbation in test_set
+                if in_val:
+                    val_cells += count_int
+                if in_test:
+                    test_cells += count_int
+                if not in_val and not in_test:
+                    train_cells += count_int
+        elif dataset_name in training_section:
+            mode = "training"
+            train_cells = total_cells
+            val_cells = 0
+            test_cells = 0
+        else:
+            mode = "excluded"
+            train_cells = 0
+            val_cells = 0
+            test_cells = 0
+
+        split_cell_counts["train"] += int(train_cells)
+        split_cell_counts["val"] += int(val_cells)
+        split_cell_counts["test"] += int(test_cells)
+        assignment_mode_counts[mode] = assignment_mode_counts.get(mode, 0) + 1
+        context_assignments.append(
+            {
+                "context": context,
+                "mode": mode,
+                "total_cells": total_cells,
+                "control_cells": control_cells,
+                "assigned_cells": {
+                    "train": int(train_cells),
+                    "val": int(val_cells),
+                    "test": int(test_cells),
+                },
+            }
+        )
+
+    preview = toml_text.splitlines()[:preview_lines]
+    if len(toml_text.splitlines()) > preview_lines:
+        preview.append("... (truncated)")
+
+    context_assignments = context_assignments[:max_contexts_in_summary]
+    context_summaries, total_contexts = _summarize_context_counts(
+        context_counts,
+        context_meta,
+        control_perturbation=resolved_control,
+        max_top_perturbations=8,
+        max_contexts=max_contexts_in_summary,
+    )
+
+    return {
+        "status": "ready",
+        "datasets": [
+            {
+                "name": dataset_name,
+                "path": dataset_path,
+                "resolved_file_count": len(dataset_files.get(dataset_name, [])),
+                "sample_files": list(dataset_files.get(dataset_name, []))[:3],
+            }
+            for dataset_name, dataset_path in sorted(normalized_paths.items())
+        ],
+        "resolved_columns": {
+            "cell_type_column": resolved_cell_type,
+            "perturbation_column": resolved_perturbation,
+            "control_perturbation": resolved_control,
+        },
+        "training_datasets": selected_training_datasets,
+        "zeroshot_contexts": zeroshot_section,
+        "fewshot_context_count": len(fewshot_section),
+        "random_assignment_summary": random_assignment_summary,
+        "split_cell_counts": split_cell_counts,
+        "context_count_total": total_contexts,
+        "context_summaries": context_summaries,
+        "context_assignment_mode_counts": assignment_mode_counts,
+        "context_assignments": context_assignments,
+        "control_candidates": control_candidates[:25],
+        "toml_preview": preview,
+        "output_path": written_output_path,
+        "toml_text": toml_text if include_toml else None,
+        "warnings": warnings,
+    }
 
 
 def inspect_tx_split_toml(

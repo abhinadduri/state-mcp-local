@@ -23,10 +23,12 @@ from .mcp_utils import (
     inspect_adata_schema as inspect_adata_schema_file,
     inspect_emb_checkpoint as inspect_emb_checkpoint_file,
     inspect_model_folder,
+    inspect_tx_split_sources as inspect_tx_split_sources_file,
     inspect_tx_split_toml as inspect_tx_split_toml_file,
     inspect_tx_checkpoint as inspect_tx_checkpoint_file,
     normalize_and_validate_emb_inference_dir,
     normalize_and_validate_run_dir,
+    plan_tx_split_toml as plan_tx_split_toml_file,
     resolve_emb_checkpoint_path,
     resolve_and_validate_model_folder,
 )
@@ -2334,6 +2336,74 @@ def inspect_tx_split_toml(
         toml_path=toml_path,
         sample_files_per_dataset=sample_files_per_dataset,
         inspect_sample_schemas=inspect_sample_schemas,
+    )
+
+
+@mcp.tool()
+def inspect_tx_split_sources(
+    dataset_paths: dict[str, str],
+    cell_type_column: str | None = None,
+    perturbation_column: str | None = None,
+    control_perturbation: str | None = None,
+    max_top_perturbations: int = 10,
+    max_contexts: int = 200,
+) -> dict[str, Any]:
+    """
+    Inspect dataset paths for split authoring and return context-level perturbation summaries.
+
+    This is intended as a guided precursor to TOML generation.
+    """
+    return inspect_tx_split_sources_file(
+        dataset_paths=dataset_paths,
+        cell_type_column=cell_type_column,
+        perturbation_column=perturbation_column,
+        control_perturbation=control_perturbation,
+        max_top_perturbations=max_top_perturbations,
+        max_contexts=max_contexts,
+    )
+
+
+@mcp.tool()
+def plan_tx_split_toml(
+    dataset_paths: dict[str, str],
+    training_datasets: list[str] | None = None,
+    cell_type_column: str | None = None,
+    perturbation_column: str | None = None,
+    control_perturbation: str | None = None,
+    random_holdout_contexts: list[str] | None = None,
+    random_test_fraction: float = 0.7,
+    random_val_fraction: float = 0.0,
+    random_seed: int = 0,
+    zeroshot_contexts: dict[str, str] | None = None,
+    fewshot_overrides: dict[str, dict[str, list[str]]] | None = None,
+    output_path: str | None = None,
+    overwrite: bool = False,
+    include_toml: bool = False,
+    preview_lines: int = 120,
+    max_contexts_in_summary: int = 200,
+) -> dict[str, Any]:
+    """
+    Build a TX split TOML from dataset paths and split directives.
+
+    Supports random fewshot holdouts per context, plus zeroshot and manual fewshot overrides.
+    """
+    return plan_tx_split_toml_file(
+        dataset_paths=dataset_paths,
+        training_datasets=training_datasets,
+        cell_type_column=cell_type_column,
+        perturbation_column=perturbation_column,
+        control_perturbation=control_perturbation,
+        random_holdout_contexts=random_holdout_contexts,
+        random_test_fraction=random_test_fraction,
+        random_val_fraction=random_val_fraction,
+        random_seed=random_seed,
+        zeroshot_contexts=zeroshot_contexts,
+        fewshot_overrides=fewshot_overrides,
+        output_path=output_path,
+        overwrite=overwrite,
+        include_toml=include_toml,
+        preview_lines=preview_lines,
+        max_contexts_in_summary=max_contexts_in_summary,
     )
 
 
