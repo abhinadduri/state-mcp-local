@@ -1,19 +1,10 @@
 from __future__ import annotations
 
-import csv
-import multiprocessing as mp
 import os
-import shlex
-import signal
 import shutil
 import subprocess
-import sys
-import threading
 import time
-import traceback
 from argparse import ArgumentParser, Namespace
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -33,6 +24,54 @@ from .mcp_utils import (
     resolve_and_validate_model_folder,
 )
 
+from ._jobs import (
+    InferenceJob,
+    TrainJob,
+    _CANCEL_GRACE_SECONDS,
+    _FALLBACK_SESSION_KEY,
+    _JOBS,
+    _JOBS_LOCK,
+    _SESSION_SERVER_STATE_LOCK,
+    _TERMINAL_JOB_STATUSES,
+    _TRAIN_JOBS_LOCK,
+    _append_job_log,
+    _append_train_job_log,
+    _get_job_locked,
+    _get_session_jobs_locked,
+    _get_session_server_state_locked,
+    _get_session_train_idempotency_locked,
+    _get_session_train_jobs_locked,
+    _get_train_job_locked,
+    _get_worker_mp_context,
+    _touch_job,
+    _touch_train_job,
+    _utc_now_iso,
+)
+
+from ._slurm import (
+    _build_emb_transform_cli_args,
+    _build_tx_infer_cli_args,
+    _resolve_backend_mode,
+    _submit_slurm_job,
+    _submit_tx_train_slurm_job,
+)
+
+from ._workers import (
+    _run_emb_inference_job_worker,
+    _run_inference_job_worker,
+    _run_tx_train_job_worker,
+)
+
+from ._sync import (
+    _process_alive,
+    _recommend_poll_interval_seconds,
+    _recommend_train_poll_interval_seconds,
+    _release_job_runtime_resources,
+    _release_train_job_runtime_resources,
+    _sync_job_state_locked,
+    _sync_train_job_state_locked,
+)
+
 try:
     from mcp.server.fastmcp import FastMCP
 except ImportError as exc:  # pragma: no cover - import-time dependency guidance
@@ -43,115 +82,12 @@ except ImportError as exc:  # pragma: no cover - import-time dependency guidance
 
 mcp = FastMCP("state")
 
-# Session-scoped state, partitioned by MCP client/session key.
-_FALLBACK_SESSION_KEY = "__default__"
-_SESSION_SERVER_STATE: dict[str, dict[str, str | None]] = {}
-_SESSION_SERVER_STATE_LOCK = threading.Lock()
-
-_TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled"}
-_JOB_LOG_LIMIT = 5000
-_MAX_EVENT_DRAIN = 2000
-_HEARTBEAT_INTERVAL_SECONDS = 10.0
-_CANCEL_GRACE_SECONDS = 30.0
-_TERMINATE_GRACE_SECONDS = 10.0
-
 
 def _env_int(name: str) -> int | None:
     value = os.getenv(name)
     if value is None or not value.strip():
         return None
     return int(value)
-
-
-def _get_worker_mp_context() -> mp.context.BaseContext:
-    # Prefer fork on POSIX to avoid `spawn` import/path edge cases in tool-hosted environments.
-    try:
-        return mp.get_context("fork")
-    except ValueError:
-        return mp.get_context("spawn")
-
-
-@dataclass
-class InferenceJob:
-    job_id: str
-    status: str
-    created_at: str
-    model_folder: str
-    adata_path: str
-    output_path: str
-    checkpoint_path: str
-    resolved_args: dict[str, Any]
-    inference_kind: str = "tx"
-    progress: dict[str, Any] = field(default_factory=dict)
-    logs: list[str] = field(default_factory=list)
-    started_at: str | None = None
-    finished_at: str | None = None
-    error: str | None = None
-    cancel_requested: bool = False
-    cancel_requested_at: str | None = None
-    cancel_grace_deadline_monotonic: float | None = None
-    terminate_sent_at_monotonic: float | None = None
-    last_event: dict[str, Any] | None = None
-    last_update_at: str = field(default_factory=lambda: _utc_now_iso())
-    last_update_monotonic: float = field(default_factory=time.monotonic)
-    adata_size_bytes: int | None = None
-    worker_pid: int | None = None
-    worker_exit_code: int | None = None
-    worker_log_path: str | None = None
-    process: mp.Process | None = None
-    cancel_flag_path: str | None = None
-    event_conn: Any | None = None
-
-
-_JOBS: dict[str, dict[str, InferenceJob]] = {}
-_JOBS_LOCK = threading.Lock()
-
-
-@dataclass
-class TrainJob:
-    job_id: str
-    status: str
-    created_at: str
-    run_dir: str | None
-    backend: str
-    backend_profile: str | None
-    hydra_overrides: list[str]
-    resolved_plan: dict[str, Any]
-    idempotency_key: str | None = None
-    progress: dict[str, Any] = field(default_factory=dict)
-    logs: list[str] = field(default_factory=list)
-    started_at: str | None = None
-    finished_at: str | None = None
-    error: str | None = None
-    cancel_requested: bool = False
-    cancel_requested_at: str | None = None
-    cancel_grace_deadline_monotonic: float | None = None
-    terminate_sent_at_monotonic: float | None = None
-    last_event: dict[str, Any] | None = None
-    last_update_at: str = field(default_factory=lambda: _utc_now_iso())
-    last_update_monotonic: float = field(default_factory=time.monotonic)
-    worker_pid: int | None = None
-    worker_exit_code: int | None = None
-    worker_log_path: str | None = None
-    worker_error_log_path: str | None = None
-    worker_log_read_offset: int = 0
-    scheduler_job_id: str | None = None
-    process: mp.Process | None = None
-    cancel_flag_path: str | None = None
-    event_conn: Any | None = None
-
-
-_TRAIN_JOBS: dict[str, dict[str, TrainJob]] = {}
-_TRAIN_JOBS_LOCK = threading.Lock()
-_TRAIN_IDEMPOTENCY: dict[str, dict[str, str]] = {}
-
-
-class EmbInferenceCancelledError(RuntimeError):
-    pass
-
-
-class TxTrainCancelledError(RuntimeError):
-    pass
 
 
 def _get_current_session_key() -> str:
@@ -202,63 +138,6 @@ def _get_current_session_key() -> str:
     return _FALLBACK_SESSION_KEY
 
 
-def _get_session_server_state_locked(session_key: str) -> dict[str, str | None]:
-    state = _SESSION_SERVER_STATE.get(session_key)
-    if state is None:
-        state = {"tx_model_folder": None}
-        _SESSION_SERVER_STATE[session_key] = state
-    return state
-
-
-def _get_session_jobs_locked(session_key: str) -> dict[str, InferenceJob]:
-    jobs = _JOBS.get(session_key)
-    if jobs is None:
-        jobs = {}
-        _JOBS[session_key] = jobs
-    return jobs
-
-
-def _get_session_train_jobs_locked(session_key: str) -> dict[str, TrainJob]:
-    jobs = _TRAIN_JOBS.get(session_key)
-    if jobs is None:
-        jobs = {}
-        _TRAIN_JOBS[session_key] = jobs
-    return jobs
-
-
-def _get_session_train_idempotency_locked(session_key: str) -> dict[str, str]:
-    mapping = _TRAIN_IDEMPOTENCY.get(session_key)
-    if mapping is None:
-        mapping = {}
-        _TRAIN_IDEMPOTENCY[session_key] = mapping
-    return mapping
-
-
-def _get_job_locked(
-    job_id: str,
-    jobs_by_id: dict[str, InferenceJob],
-    *,
-    expected_kind: str | None = None,
-) -> InferenceJob:
-    job = jobs_by_id.get(job_id)
-    if job is None:
-        raise KeyError(f"No inference job found for job_id={job_id!r}")
-    if expected_kind is not None and job.inference_kind != expected_kind:
-        raise KeyError(f"Job {job_id!r} is `{job.inference_kind}` inference, expected `{expected_kind}`.")
-    return job
-
-
-def _get_train_job_locked(job_id: str, jobs_by_id: dict[str, TrainJob]) -> TrainJob:
-    job = jobs_by_id.get(job_id)
-    if job is None:
-        raise KeyError(f"No training job found for job_id={job_id!r}")
-    return job
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _has_wandb_credentials() -> tuple[bool, str]:
     api_key = os.getenv("WANDB_API_KEY")
     if isinstance(api_key, str) and api_key.strip():
@@ -285,766 +164,6 @@ def _normalize_wandb_mode(use_wandb: str) -> str:
     if mode not in {"auto", "true", "false"}:
         raise ValueError("`use_wandb` must be one of: 'auto', 'true', 'false'.")
     return mode
-
-
-def _resolve_backend_mode(backend: str) -> tuple[str, str]:
-    mode = str(backend or "auto").strip().lower()
-    if mode not in {"auto", "local", "slurm"}:
-        raise ValueError("`backend` must be one of: 'auto', 'local', 'slurm'.")
-
-    if mode == "local":
-        return "local", "Explicit backend override."
-    if mode == "slurm":
-        if shutil.which("sbatch") is None:
-            raise ValueError("`backend='slurm'` requested, but `sbatch` was not found in PATH.")
-        return "slurm", "Explicit backend override."
-
-    if shutil.which("sbatch") is not None:
-        return "slurm", "Detected `sbatch` in PATH; using slurm backend."
-    return "local", "No `sbatch` detected; using local backend."
-
-
-def _touch_job(job: InferenceJob) -> None:
-    job.last_update_at = _utc_now_iso()
-    job.last_update_monotonic = time.monotonic()
-
-
-def _append_job_log(job: InferenceJob, message: str) -> None:
-    _touch_job(job)
-    line = f"{_utc_now_iso()} {message}"
-    job.logs.append(line)
-    if len(job.logs) > _JOB_LOG_LIMIT:
-        del job.logs[: len(job.logs) - _JOB_LOG_LIMIT]
-
-
-def _touch_train_job(job: TrainJob) -> None:
-    job.last_update_at = _utc_now_iso()
-    job.last_update_monotonic = time.monotonic()
-
-
-def _append_train_job_log(job: TrainJob, message: str) -> None:
-    _touch_train_job(job)
-    line = f"{_utc_now_iso()} {message}"
-    job.logs.append(line)
-    if len(job.logs) > _JOB_LOG_LIMIT:
-        del job.logs[: len(job.logs) - _JOB_LOG_LIMIT]
-
-
-def _ingest_train_worker_log_lines(job: TrainJob) -> None:
-    log_path = job.worker_log_path
-    if not isinstance(log_path, str) or not log_path.strip():
-        return
-    path_obj = Path(log_path)
-    if not path_obj.is_file():
-        return
-
-    try:
-        with path_obj.open("rb") as f:
-            f.seek(job.worker_log_read_offset)
-            chunk = f.read()
-            job.worker_log_read_offset = f.tell()
-    except Exception:
-        return
-
-    if not chunk:
-        return
-    try:
-        text = chunk.decode("utf-8", errors="replace")
-    except Exception:
-        return
-    for line in text.splitlines():
-        line = line.rstrip()
-        if not line:
-            continue
-        _append_train_job_log(job, f"[worker] {line}")
-
-
-def _extract_override_value(overrides: list[str], key: str) -> str | None:
-    needle = key.strip()
-    for override in reversed(overrides):
-        if "=" not in override:
-            continue
-        raw_key, raw_value = override.split("=", 1)
-        normalized_key = raw_key.strip().lstrip("+~")
-        if normalized_key == needle:
-            return raw_value.strip()
-    return None
-
-
-def _extract_train_max_steps(job: TrainJob) -> int | None:
-    max_steps_raw = _extract_override_value(job.hydra_overrides, "training.max_steps")
-    if max_steps_raw is None:
-        return None
-    try:
-        value = int(float(max_steps_raw))
-    except Exception:
-        return None
-    if value <= 0:
-        return None
-    return value
-
-
-def _extract_train_metrics_progress(job: TrainJob) -> dict[str, Any] | None:
-    if not isinstance(job.run_dir, str) or not job.run_dir.strip():
-        return None
-    metrics_path = Path(job.run_dir) / "version_0" / "metrics.csv"
-    if not metrics_path.is_file():
-        return None
-
-    last_row: dict[str, str] | None = None
-    try:
-        with metrics_path.open("r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if not isinstance(row, dict):
-                    continue
-                if any((value is not None and str(value).strip()) for value in row.values()):
-                    last_row = {str(k): str(v) for k, v in row.items() if k is not None}
-    except Exception:
-        return None
-
-    if last_row is None:
-        return None
-
-    progress: dict[str, Any] = {"phase": "training"}
-    step_raw = last_row.get("step")
-    current_step: int | None = None
-    if isinstance(step_raw, str) and step_raw.strip():
-        try:
-            current_step = int(float(step_raw))
-        except Exception:
-            current_step = None
-    max_steps = _extract_train_max_steps(job)
-    if current_step is not None:
-        progress["current_step"] = current_step
-    if max_steps is not None:
-        progress["max_steps"] = max_steps
-    if current_step is not None and max_steps is not None and max_steps > 0:
-        percent = max(0.0, min(100.0, (float(current_step) / float(max_steps)) * 100.0))
-        progress["percent"] = round(percent, 3)
-
-    metric_priority = (
-        "val/expression_loss",
-        "val/embedding_loss",
-        "train/expression_loss",
-        "train/embedding_loss",
-    )
-    for metric_name in metric_priority:
-        value_raw = last_row.get(metric_name)
-        if not isinstance(value_raw, str) or not value_raw.strip():
-            continue
-        try:
-            metric_value = float(value_raw)
-        except Exception:
-            continue
-        progress["last_metric"] = {"name": metric_name, "value": metric_value}
-        break
-    return progress
-
-def _event_progress_percent(event: dict[str, Any]) -> float | None:
-    progress_value = event.get("progress")
-    total_value = event.get("total")
-    if isinstance(progress_value, (int, float)) and isinstance(total_value, (int, float)) and total_value > 0:
-        percent = (float(progress_value) / float(total_value)) * 100.0
-        return max(0.0, min(100.0, percent))
-
-    done = event.get("perturbations_done")
-    total = event.get("perturbations_total")
-    if isinstance(done, (int, float)) and isinstance(total, (int, float)) and total > 0:
-        percent = (float(done) / float(total)) * 100.0
-        return max(0.0, min(100.0, percent))
-
-    done = event.get("cells_done")
-    total = event.get("cells_total")
-    if isinstance(done, (int, float)) and isinstance(total, (int, float)) and total > 0:
-        percent = (float(done) / float(total)) * 100.0
-        return max(0.0, min(100.0, percent))
-
-    return None
-
-
-def _record_job_event(job: InferenceJob, event: dict[str, Any]) -> None:
-    _touch_job(job)
-    job.last_event = dict(event)
-    progress = {
-        "kind": event.get("kind"),
-        "phase": event.get("phase"),
-        "group": event.get("group"),
-        "groups_total": event.get("groups_total"),
-        "group_index": event.get("group_index"),
-        "group_perturbations_done": event.get("group_perturbations_done"),
-        "group_perturbations_total": event.get("group_perturbations_total"),
-        "perturbations_done": event.get("perturbations_done"),
-        "perturbations_total": event.get("perturbations_total"),
-        "cells_done": event.get("cells_done"),
-        "cells_total": event.get("cells_total"),
-        "internal_padding_tokens": event.get("internal_padding_tokens"),
-        "message": event.get("message"),
-    }
-    percent = _event_progress_percent(event)
-    if percent is not None:
-        progress["percent"] = percent
-    job.progress = progress
-
-    message = event.get("message")
-    if not isinstance(message, str) or not message.strip():
-        return
-
-    kind = str(event.get("kind") or "event")
-    should_log = True
-    if kind == "progress":
-        done = event.get("perturbations_done")
-        total = event.get("perturbations_total")
-        if isinstance(done, int) and isinstance(total, int) and total > 0:
-            should_log = done in {1, total} or done % 25 == 0
-
-    if should_log:
-        _append_job_log(job, f"[{kind}] {message}")
-
-
-def _record_train_job_event(job: TrainJob, event: dict[str, Any]) -> None:
-    _touch_train_job(job)
-    job.last_event = dict(event)
-
-    progress = {
-        "kind": event.get("kind"),
-        "phase": event.get("phase"),
-        "message": event.get("message"),
-        "current_step": event.get("current_step"),
-        "max_steps": event.get("max_steps"),
-    }
-    percent = _event_progress_percent(event)
-    if percent is None:
-        current_step = event.get("current_step")
-        max_steps = event.get("max_steps")
-        if isinstance(current_step, (int, float)) and isinstance(max_steps, (int, float)) and max_steps > 0:
-            percent = (float(current_step) / float(max_steps)) * 100.0
-    if percent is not None:
-        progress["percent"] = max(0.0, min(100.0, float(percent)))
-    job.progress = progress
-
-    message = event.get("message")
-    if isinstance(message, str) and message.strip():
-        kind = str(event.get("kind") or "event")
-        _append_train_job_log(job, f"[{kind}] {message}")
-
-
-def _process_alive(process: mp.Process | None) -> bool:
-    if process is None:
-        return False
-    try:
-        return process.is_alive()
-    except Exception:
-        return False
-
-
-def _signal_name_for_exit_code(exit_code: int) -> str | None:
-    if exit_code >= 0:
-        return None
-    signal_number = -exit_code
-    try:
-        return signal.Signals(signal_number).name
-    except Exception:
-        return None
-
-
-def _release_job_runtime_resources(job: InferenceJob) -> None:
-    process = job.process
-    if process is not None:
-        try:
-            if process.exitcode is not None:
-                job.worker_exit_code = int(process.exitcode)
-        except Exception:
-            pass
-        try:
-            process.join(timeout=0)
-        except Exception:
-            pass
-    event_conn = job.event_conn
-    if event_conn is not None:
-        try:
-            event_conn.close()
-        except Exception:
-            pass
-    cancel_flag_path = job.cancel_flag_path
-    if isinstance(cancel_flag_path, str) and cancel_flag_path:
-        try:
-            Path(cancel_flag_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-    job.process = None
-    job.event_conn = None
-    job.cancel_flag_path = None
-
-
-def _release_train_job_runtime_resources(job: TrainJob) -> None:
-    process = job.process
-    if process is not None:
-        try:
-            if process.exitcode is not None:
-                job.worker_exit_code = int(process.exitcode)
-        except Exception:
-            pass
-        try:
-            process.join(timeout=0)
-        except Exception:
-            pass
-    event_conn = job.event_conn
-    if event_conn is not None:
-        try:
-            event_conn.close()
-        except Exception:
-            pass
-    cancel_flag_path = job.cancel_flag_path
-    if isinstance(cancel_flag_path, str) and cancel_flag_path:
-        try:
-            Path(cancel_flag_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-    job.process = None
-    job.event_conn = None
-    job.cancel_flag_path = None
-
-
-def _apply_worker_message(job: InferenceJob, message: dict[str, Any]) -> None:
-    if not isinstance(message, dict):
-        return
-
-    msg_type = message.get("type")
-    if msg_type == "event":
-        event = message.get("event")
-        if isinstance(event, dict):
-            _record_job_event(job, event)
-        return
-
-    if msg_type == "heartbeat":
-        _touch_job(job)
-        current_progress = dict(job.progress)
-        current_progress["worker_heartbeat_at"] = job.last_update_at
-        job.progress = current_progress
-        return
-
-    if msg_type == "status":
-        _touch_job(job)
-        status_value = message.get("status")
-        if isinstance(status_value, str) and status_value:
-            if not (status_value == "running" and job.cancel_requested):
-                job.status = status_value
-        started_at = message.get("started_at")
-        if isinstance(started_at, str) and started_at:
-            job.started_at = started_at
-        finished_at = message.get("finished_at")
-        if isinstance(finished_at, str) and finished_at:
-            job.finished_at = finished_at
-        error = message.get("error")
-        if isinstance(error, str) and error.strip():
-            job.error = error
-        note = message.get("message")
-        if isinstance(note, str) and note.strip():
-            _append_job_log(job, note)
-        return
-
-    if msg_type == "traceback":
-        trace = message.get("traceback")
-        if isinstance(trace, str) and trace.strip():
-            _append_job_log(job, trace.strip())
-        return
-
-
-def _apply_train_worker_message(job: TrainJob, message: dict[str, Any]) -> None:
-    if not isinstance(message, dict):
-        return
-
-    msg_type = message.get("type")
-    if msg_type == "event":
-        event = message.get("event")
-        if isinstance(event, dict):
-            _record_train_job_event(job, event)
-        return
-
-    if msg_type == "heartbeat":
-        _touch_train_job(job)
-        current_progress = dict(job.progress)
-        current_progress["worker_heartbeat_at"] = job.last_update_at
-        job.progress = current_progress
-        return
-
-    if msg_type == "status":
-        _touch_train_job(job)
-        status_value = message.get("status")
-        if isinstance(status_value, str) and status_value:
-            if not (status_value == "running" and job.cancel_requested):
-                job.status = status_value
-        started_at = message.get("started_at")
-        if isinstance(started_at, str) and started_at:
-            job.started_at = started_at
-        finished_at = message.get("finished_at")
-        if isinstance(finished_at, str) and finished_at:
-            job.finished_at = finished_at
-        error = message.get("error")
-        if isinstance(error, str) and error.strip():
-            job.error = error
-        note = message.get("message")
-        if isinstance(note, str) and note.strip():
-            _append_train_job_log(job, note)
-        return
-
-    if msg_type == "traceback":
-        trace = message.get("traceback")
-        if isinstance(trace, str) and trace.strip():
-            _append_train_job_log(job, trace.strip())
-        return
-
-
-def _drain_job_events_locked(job: InferenceJob) -> None:
-    event_conn = job.event_conn
-    if event_conn is None:
-        return
-
-    drained = 0
-    while drained < _MAX_EVENT_DRAIN:
-        try:
-            if not event_conn.poll(0):
-                break
-            message = event_conn.recv()
-        except (EOFError, OSError, ValueError):
-            break
-        drained += 1
-        _apply_worker_message(job, message)
-
-    if drained >= _MAX_EVENT_DRAIN:
-        _append_job_log(job, f"[warning] Drained {_MAX_EVENT_DRAIN} worker events; additional events remain queued.")
-
-
-def _drain_train_job_events_locked(job: TrainJob) -> None:
-    event_conn = job.event_conn
-    if event_conn is None:
-        return
-
-    drained = 0
-    while drained < _MAX_EVENT_DRAIN:
-        try:
-            if not event_conn.poll(0):
-                break
-            message = event_conn.recv()
-        except (EOFError, OSError, ValueError):
-            break
-        drained += 1
-        _apply_train_worker_message(job, message)
-
-    if drained >= _MAX_EVENT_DRAIN:
-        _append_train_job_log(job, f"[warning] Drained {_MAX_EVENT_DRAIN} worker events; additional events remain queued.")
-
-
-def _recommend_poll_interval_seconds(job: InferenceJob, *, for_logs: bool = False) -> float | None:
-    if job.status in _TERMINAL_JOB_STATUSES:
-        return None
-
-    if job.status == "queued":
-        interval = 3.0
-    elif job.status == "cancelling":
-        interval = 4.0
-    else:
-        phase = str(job.progress.get("phase") or "")
-        kind = str(job.progress.get("kind") or "")
-        if kind == "progress":
-            interval = 3.0
-        elif phase in {"initializing", "config_loaded", "model_loaded", "adata_loaded"}:
-            interval = 15.0
-        else:
-            interval = 8.0
-
-    adata_size = int(job.adata_size_bytes or 0)
-    if adata_size >= 10 * 1024**3:
-        interval = max(interval, 25.0)
-    elif adata_size >= 2 * 1024**3:
-        interval = max(interval, 12.0)
-
-    seconds_since_update = max(0.0, time.monotonic() - float(job.last_update_monotonic))
-    if job.status == "running" and seconds_since_update >= 120.0:
-        interval = max(interval, 20.0)
-
-    if for_logs:
-        interval = max(interval * 1.5, 6.0)
-
-    return round(interval, 1)
-
-
-def _sync_job_state_locked(job: InferenceJob) -> None:
-    _drain_job_events_locked(job)
-
-    process = job.process
-    if process is None:
-        return
-
-    if job.worker_pid is None and process.pid is not None:
-        job.worker_pid = int(process.pid)
-
-    now = time.monotonic()
-    if job.cancel_requested and _process_alive(process):
-        deadline = job.cancel_grace_deadline_monotonic
-        if deadline is not None and now >= deadline and job.terminate_sent_at_monotonic is None:
-            try:
-                process.terminate()
-                job.terminate_sent_at_monotonic = now
-                _append_job_log(job, "[cancelling] Cancellation grace elapsed; sent SIGTERM to worker process.")
-            except Exception as exc:
-                _append_job_log(job, f"[warning] Failed to terminate worker process cleanly: {type(exc).__name__}: {exc}")
-        elif (
-            job.terminate_sent_at_monotonic is not None
-            and now >= (job.terminate_sent_at_monotonic + _TERMINATE_GRACE_SECONDS)
-            and _process_alive(process)
-        ):
-            try:
-                process.kill()
-                job.terminate_sent_at_monotonic = now
-                _append_job_log(job, "[cancelling] Worker did not exit after SIGTERM; sent SIGKILL.")
-            except Exception as exc:
-                _append_job_log(job, f"[warning] Failed to force-kill worker process: {type(exc).__name__}: {exc}")
-
-    if _process_alive(process):
-        return
-
-    try:
-        exit_code = process.exitcode
-    except Exception:
-        exit_code = None
-    if isinstance(exit_code, int):
-        job.worker_exit_code = exit_code
-
-    if job.status not in _TERMINAL_JOB_STATUSES:
-        if job.cancel_requested:
-            job.status = "cancelled"
-            if not job.error:
-                if isinstance(exit_code, int) and exit_code < 0:
-                    signal_name = _signal_name_for_exit_code(exit_code)
-                    if signal_name:
-                        job.error = f"Inference cancelled by request (worker terminated by {signal_name})."
-                    else:
-                        job.error = f"Inference cancelled by request (worker exit code {exit_code})."
-                else:
-                    job.error = "Inference cancelled by request."
-            _append_job_log(job, "[cancelled] Inference cancelled.")
-        elif exit_code == 0:
-            job.status = "succeeded"
-            _append_job_log(job, "[succeeded] Inference job completed.")
-        else:
-            job.status = "failed"
-            if not job.error:
-                job.error = f"Worker process exited unexpectedly with code {exit_code}."
-            _append_job_log(job, f"[failed] {job.error}")
-
-    if job.finished_at is None:
-        job.finished_at = _utc_now_iso()
-
-    _release_job_runtime_resources(job)
-
-
-def _recommend_train_poll_interval_seconds(job: TrainJob, *, for_logs: bool = False) -> float | None:
-    if job.status in _TERMINAL_JOB_STATUSES:
-        return None
-
-    if job.status == "queued":
-        interval = 4.0
-    elif job.status == "cancelling":
-        interval = 4.0
-    else:
-        phase = str(job.progress.get("phase") or "")
-        if phase in {"validating", "config_loaded", "trainer_initializing"}:
-            interval = 10.0
-        elif phase == "training":
-            interval = 6.0
-        else:
-            interval = 8.0
-
-    seconds_since_update = max(0.0, time.monotonic() - float(job.last_update_monotonic))
-    if job.status == "running" and seconds_since_update >= 180.0:
-        interval = max(interval, 20.0)
-
-    if for_logs:
-        interval = max(interval * 1.5, 6.0)
-
-    return round(interval, 1)
-
-
-def _query_slurm_state(scheduler_job_id: str) -> str | None:
-    if not scheduler_job_id:
-        return None
-
-    if shutil.which("sacct") is not None:
-        try:
-            result = subprocess.run(
-                ["sacct", "-j", scheduler_job_id, "--format=State", "-n", "-P"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0 and isinstance(result.stdout, str) and result.stdout.strip():
-                for raw_line in result.stdout.splitlines():
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    state = line.split("|", 1)[0].strip()
-                    if not state:
-                        continue
-                    return state.split()[0].strip().upper()
-        except Exception:
-            pass
-
-    if shutil.which("squeue") is not None:
-        try:
-            result = subprocess.run(
-                ["squeue", "-h", "-j", scheduler_job_id, "-o", "%T"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 0 and isinstance(result.stdout, str) and result.stdout.strip():
-                return result.stdout.strip().splitlines()[0].strip().upper()
-        except Exception:
-            pass
-
-    return None
-
-
-def _map_slurm_state_to_train_status(state: str) -> str:
-    normalized = str(state or "").strip().upper()
-    if normalized in {
-        "PENDING",
-        "CONFIGURING",
-        "RESIZING",
-        "SUSPENDED",
-        "REQUEUE_FED",
-        "REQUEUED",
-    }:
-        return "queued"
-    if normalized in {"RUNNING", "COMPLETING", "STAGE_OUT"}:
-        return "running"
-    if normalized in {"COMPLETED"}:
-        return "succeeded"
-    if normalized in {"CANCELLED", "PREEMPTED"}:
-        return "cancelled"
-    if normalized in {
-        "FAILED",
-        "BOOT_FAIL",
-        "DEADLINE",
-        "NODE_FAIL",
-        "OUT_OF_MEMORY",
-        "TIMEOUT",
-    }:
-        return "failed"
-    return "running"
-
-
-def _sync_train_job_state_locked(job: TrainJob) -> None:
-    _ingest_train_worker_log_lines(job)
-
-    metrics_progress = _extract_train_metrics_progress(job)
-    if isinstance(metrics_progress, dict):
-        current_progress = dict(job.progress)
-        current_progress.update(metrics_progress)
-        job.progress = current_progress
-        _touch_train_job(job)
-
-    if job.backend == "slurm":
-        if isinstance(job.scheduler_job_id, str) and job.scheduler_job_id.strip():
-            state = _query_slurm_state(job.scheduler_job_id)
-            if isinstance(state, str) and state:
-                mapped = _map_slurm_state_to_train_status(state)
-                current_progress = dict(job.progress)
-                current_progress["scheduler_state"] = state
-                job.progress = current_progress
-                _touch_train_job(job)
-
-                if mapped == "running" and job.started_at is None:
-                    job.started_at = _utc_now_iso()
-
-                if mapped in _TERMINAL_JOB_STATUSES:
-                    if job.status not in _TERMINAL_JOB_STATUSES:
-                        job.status = mapped
-                    if mapped == "failed" and not job.error:
-                        job.error = f"Slurm job ended in state {state}."
-                    if mapped == "cancelled" and not job.error:
-                        job.error = f"Slurm job cancelled (state={state})."
-                    if job.finished_at is None:
-                        job.finished_at = _utc_now_iso()
-                elif job.status != "cancelling":
-                    job.status = mapped
-        return
-
-    _drain_train_job_events_locked(job)
-
-    process = job.process
-    if process is None:
-        return
-
-    if job.worker_pid is None and process.pid is not None:
-        job.worker_pid = int(process.pid)
-
-    now = time.monotonic()
-    if job.cancel_requested and _process_alive(process):
-        deadline = job.cancel_grace_deadline_monotonic
-        if deadline is not None and now >= deadline and job.terminate_sent_at_monotonic is None:
-            try:
-                process.terminate()
-                job.terminate_sent_at_monotonic = now
-                _append_train_job_log(job, "[cancelling] Cancellation grace elapsed; sent SIGTERM to worker process.")
-            except Exception as exc:
-                _append_train_job_log(
-                    job,
-                    f"[warning] Failed to terminate worker process cleanly: {type(exc).__name__}: {exc}",
-                )
-        elif (
-            job.terminate_sent_at_monotonic is not None
-            and now >= (job.terminate_sent_at_monotonic + _TERMINATE_GRACE_SECONDS)
-            and _process_alive(process)
-        ):
-            try:
-                process.kill()
-                job.terminate_sent_at_monotonic = now
-                _append_train_job_log(job, "[cancelling] Worker did not exit after SIGTERM; sent SIGKILL.")
-            except Exception as exc:
-                _append_train_job_log(
-                    job,
-                    f"[warning] Failed to force-kill worker process: {type(exc).__name__}: {exc}",
-                )
-
-    if _process_alive(process):
-        return
-
-    try:
-        exit_code = process.exitcode
-    except Exception:
-        exit_code = None
-    if isinstance(exit_code, int):
-        job.worker_exit_code = exit_code
-
-    if job.status not in _TERMINAL_JOB_STATUSES:
-        if job.cancel_requested:
-            job.status = "cancelled"
-            if not job.error:
-                if isinstance(exit_code, int) and exit_code < 0:
-                    signal_name = _signal_name_for_exit_code(exit_code)
-                    if signal_name:
-                        job.error = f"Training cancelled by request (worker terminated by {signal_name})."
-                    else:
-                        job.error = f"Training cancelled by request (worker exit code {exit_code})."
-                else:
-                    job.error = "Training cancelled by request."
-            _append_train_job_log(job, "[cancelled] Training cancelled.")
-        elif exit_code == 0:
-            job.status = "succeeded"
-            _append_train_job_log(job, "[succeeded] Training job completed.")
-        else:
-            job.status = "failed"
-            if not job.error:
-                job.error = f"Worker process exited unexpectedly with code {exit_code}."
-            _append_train_job_log(job, f"[failed] {job.error}")
-
-    if job.finished_at is None:
-        job.finished_at = _utc_now_iso()
-
-    _release_train_job_runtime_resources(job)
 
 
 def _resolve_tx_inference_request(
@@ -1301,6 +420,20 @@ def _build_tx_train_plan(
     use_wandb: str,
     backend: str,
     backend_profile: str | None,
+    slurm_partition: str | None,
+    slurm_gpus: int | None,
+    slurm_cpus_per_task: int | None,
+    slurm_mem: str | None,
+    slurm_time: str | None,
+    wandb_project: str | None,
+    wandb_entity: str | None,
+    wandb_tags: list[str] | None,
+    hidden_dim: int | None,
+    cell_set_len: int | None,
+    nb_loss: bool | None,
+    batch_encoder: bool | None,
+    ckpt_every_n_steps: int | None,
+    num_workers: int | None,
     extra_overrides: list[str] | None,
 ) -> dict[str, Any]:
     missing_fields: list[str] = []
@@ -1335,6 +468,23 @@ def _build_tx_train_plan(
     model_preset_clean = str(model_preset or "").strip()
     if not model_preset_clean:
         validation_errors.append("`model_preset` must be a non-empty model config name.")
+
+    if slurm_gpus is not None and slurm_gpus <= 0:
+        validation_errors.append("`slurm_gpus` must be > 0 when provided.")
+    if slurm_cpus_per_task is not None and slurm_cpus_per_task <= 0:
+        validation_errors.append("`slurm_cpus_per_task` must be > 0 when provided.")
+    if hidden_dim is not None and hidden_dim <= 0:
+        validation_errors.append("`hidden_dim` must be > 0 when provided.")
+    if cell_set_len is not None and cell_set_len <= 0:
+        validation_errors.append("`cell_set_len` must be > 0 when provided.")
+    if ckpt_every_n_steps is not None and ckpt_every_n_steps <= 0:
+        validation_errors.append("`ckpt_every_n_steps` must be > 0 when provided.")
+    if num_workers is not None and num_workers < 0:
+        validation_errors.append("`num_workers` must be >= 0 when provided.")
+
+    resolved_num_workers = num_workers
+    if resolved_num_workers is None and slurm_cpus_per_task is not None:
+        resolved_num_workers = slurm_cpus_per_task
 
     cleaned_extra_overrides: list[str] = []
     if extra_overrides is not None:
@@ -1508,6 +658,32 @@ def _build_tx_train_plan(
         _add_override("name", resolved_name)
         _add_override("use_wandb", "true" if wandb_enabled else "false")
 
+        # W&B overrides
+        if wandb_project is not None:
+            _add_override("wandb.project", wandb_project)
+        if wandb_entity is not None:
+            _add_override("wandb.entity", wandb_entity)
+        if wandb_tags is not None:
+            _add_override("wandb.tags", "[" + ",".join(wandb_tags) + "]")
+
+        # Model architecture overrides
+        if hidden_dim is not None:
+            _add_override("model.kwargs.hidden_dim", hidden_dim)
+        if cell_set_len is not None:
+            _add_override("model.kwargs.cell_set_len", cell_set_len)
+        if nb_loss is not None:
+            _add_override("model.kwargs.nb_loss", str(nb_loss).lower())
+        if batch_encoder is not None:
+            _add_override("model.kwargs.batch_encoder", str(batch_encoder).lower())
+
+        # Training overrides
+        if ckpt_every_n_steps is not None:
+            _add_override("training.ckpt_every_n_steps", ckpt_every_n_steps)
+
+        # Data overrides
+        if resolved_num_workers is not None:
+            _add_override("data.kwargs.num_workers", resolved_num_workers)
+
     for extra in cleaned_extra_overrides:
         extra_key = _normalized_override_key(extra)
         if extra_key is not None and extra_key in curated_keys:
@@ -1551,10 +727,26 @@ def _build_tx_train_plan(
                 "batch_column": resolved_batch_column,
                 "control_perturbation": resolved_control_pert,
             },
+            "resolved_slurm": {
+                "partition": slurm_partition,
+                "gpus": slurm_gpus,
+                "cpus_per_task": slurm_cpus_per_task,
+                "mem": slurm_mem,
+                "time": slurm_time,
+            },
+            "resolved_wandb": {
+                "project": wandb_project,
+                "entity": wandb_entity,
+                "tags": wandb_tags,
+            },
             "resolved_model": {
                 "model_preset": model_preset_clean,
                 "embed_key": resolved_embed_key,
                 "output_space": resolved_output_space,
+                "hidden_dim": hidden_dim,
+                "cell_set_len": cell_set_len,
+                "nb_loss": nb_loss,
+                "batch_encoder": batch_encoder,
             },
             "resolved_training": {
                 "max_steps": max_steps,
@@ -1562,562 +754,19 @@ def _build_tx_train_plan(
                 "learning_rate": learning_rate,
                 "val_freq": val_freq,
                 "seed": seed,
+                "ckpt_every_n_steps": ckpt_every_n_steps,
+            },
+            "resolved_data": {
+                "num_workers": resolved_num_workers,
             },
         },
         "toml_inspection": toml_inspection,
     }
 
 
-def _resolve_slurm_backend_profile_args(backend_profile: str | None) -> tuple[list[str], str]:
-    if backend_profile is None or not str(backend_profile).strip():
-        return [], "No slurm profile arguments provided."
-
-    profile_text = str(backend_profile).strip()
-    env_key = "STATE_MCP_TX_TRAIN_SLURM_PROFILE_" + "".join(
-        char.upper() if char.isalnum() else "_" for char in profile_text
-    )
-    env_value = os.getenv(env_key)
-    if isinstance(env_value, str) and env_value.strip():
-        return shlex.split(env_value), f"Loaded slurm args from ${env_key}."
-
-    if profile_text.startswith("-") or " " in profile_text:
-        return shlex.split(profile_text), "Parsed backend_profile as raw sbatch arguments."
-
-    return [f"--partition={profile_text}"], "Interpreted backend_profile as a slurm partition name."
-
-
-def _parse_sbatch_job_id(raw_stdout: str) -> str | None:
-    if not isinstance(raw_stdout, str):
-        return None
-    for raw_line in raw_stdout.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        token = line.split(";", 1)[0].strip().split()[0]
-        if token:
-            return token
-    return None
-
-
-def _submit_tx_train_slurm_job(
-    *,
-    job_id: str,
-    run_dir: str | None,
-    hydra_overrides: list[str],
-    backend_profile: str | None,
-) -> dict[str, Any]:
-    if shutil.which("sbatch") is None:
-        raise RuntimeError("`sbatch` was not found in PATH.")
-
-    if run_dir is None or not str(run_dir).strip():
-        run_dir_path = (Path("/tmp") / f"state_tx_train_{job_id}").resolve()
-    else:
-        run_dir_path = Path(run_dir).expanduser().resolve()
-    run_dir_path.mkdir(parents=True, exist_ok=True)
-
-    profile_args, profile_reason = _resolve_slurm_backend_profile_args(backend_profile)
-
-    python_exe = str(Path(sys.executable).resolve())
-    src_root = str(Path(__file__).resolve().parents[2])
-    train_cmd = [python_exe, "-m", "state", "tx", "train", *hydra_overrides]
-    train_cmd_str = " ".join(shlex.quote(arg) for arg in train_cmd)
-    wrapped_command = f"PYTHONPATH={shlex.quote(src_root)}:${{PYTHONPATH:-}} {train_cmd_str}"
-
-    out_template = str(run_dir_path / "slurm-%j.out")
-    err_template = str(run_dir_path / "slurm-%j.err")
-    sbatch_cmd = [
-        "sbatch",
-        "--parsable",
-        "--job-name",
-        f"state_tx_train_{job_id[:8]}",
-        "--chdir",
-        str(run_dir_path),
-        "--output",
-        out_template,
-        "--error",
-        err_template,
-        *profile_args,
-        "--wrap",
-        wrapped_command,
-    ]
-
-    result = subprocess.run(
-        sbatch_cmd,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"sbatch submission failed with exit code {result.returncode}. stdout={stdout!r} stderr={stderr!r}"
-        )
-
-    scheduler_job_id = _parse_sbatch_job_id(stdout)
-    if scheduler_job_id is None:
-        raise RuntimeError(f"Unable to parse slurm job id from sbatch output: {stdout!r}")
-
-    return {
-        "scheduler_job_id": scheduler_job_id,
-        "worker_log_path": str(run_dir_path / f"slurm-{scheduler_job_id}.out"),
-        "worker_error_log_path": str(run_dir_path / f"slurm-{scheduler_job_id}.err"),
-        "submission_command": sbatch_cmd,
-        "profile_reason": profile_reason,
-    }
-
-
-def _emit_worker_message(event_conn: Any, payload: dict[str, Any]) -> None:
-    try:
-        event_conn.send(payload)
-    except Exception:
-        return
-
-
-def _run_tx_train_job_worker(
-    hydra_overrides: list[str],
-    cancel_flag_path: str,
-    event_conn: Any,
-    worker_log_path: str,
-) -> None:
-    from ..__main__ import load_hydra_config
-    from .._cli._tx._train import run_tx_train
-
-    log_handle = None
-    if worker_log_path:
-        try:
-            Path(worker_log_path).parent.mkdir(parents=True, exist_ok=True)
-            log_handle = open(worker_log_path, "a", encoding="utf-8", buffering=1)
-            os.dup2(log_handle.fileno(), 1)
-            os.dup2(log_handle.fileno(), 2)
-            sys.stdout = log_handle
-            sys.stderr = log_handle
-        except Exception:
-            log_handle = None
-
-    heartbeat_stop = threading.Event()
-
-    def emit(payload: dict[str, Any]) -> None:
-        _emit_worker_message(event_conn, payload)
-
-    def heartbeat_loop() -> None:
-        while not heartbeat_stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
-            emit({"type": "heartbeat"})
-
-    heartbeat_thread = threading.Thread(
-        target=heartbeat_loop,
-        daemon=True,
-        name="state_tx_train_worker_heartbeat",
-    )
-    heartbeat_thread.start()
-
-    def cancellation_requested() -> bool:
-        try:
-            return Path(cancel_flag_path).exists()
-        except Exception:
-            return False
-
-    def ensure_not_cancelled(phase: str) -> None:
-        if cancellation_requested():
-            raise TxTrainCancelledError(f"Training cancelled during {phase}.")
-
-    emit(
-        {
-            "type": "status",
-            "status": "running",
-            "started_at": _utc_now_iso(),
-            "message": "Training job started.",
-        }
-    )
-
-    try:
-        emit(
-            {
-                "type": "event",
-                "event": {
-                    "kind": "progress",
-                    "phase": "config_loading",
-                    "current_step": 0,
-                    "message": "Loading Hydra configuration.",
-                },
-            }
-        )
-        ensure_not_cancelled("configuration loading")
-        cfg = load_hydra_config("tx", hydra_overrides)
-        max_steps = None
-        try:
-            max_steps = int(cfg["training"]["max_steps"])
-        except Exception:
-            max_steps = None
-        emit(
-            {
-                "type": "event",
-                "event": {
-                    "kind": "progress",
-                    "phase": "trainer_initializing",
-                    "current_step": 0,
-                    "max_steps": max_steps,
-                    "message": "Configuration loaded; preparing trainer.",
-                },
-            }
-        )
-        ensure_not_cancelled("trainer initialization")
-        run_tx_train(cfg)
-        emit(
-            {
-                "type": "status",
-                "status": "succeeded",
-                "finished_at": _utc_now_iso(),
-                "message": "[succeeded] Training job completed.",
-            }
-        )
-    except TxTrainCancelledError as exc:
-        emit(
-            {
-                "type": "status",
-                "status": "cancelled",
-                "finished_at": _utc_now_iso(),
-                "error": str(exc),
-                "message": f"[cancelled] {exc}",
-            }
-        )
-    except BaseException as exc:  # pragma: no cover - defensive guard around worker process.
-        emit(
-            {
-                "type": "status",
-                "status": "failed",
-                "finished_at": _utc_now_iso(),
-                "error": f"{type(exc).__name__}: {exc}",
-                "message": f"[failed] {type(exc).__name__}: {exc}",
-            }
-        )
-        emit({"type": "traceback", "traceback": traceback.format_exc().strip()})
-    finally:
-        heartbeat_stop.set()
-        try:
-            event_conn.close()
-        except Exception:
-            pass
-        if log_handle is not None:
-            try:
-                log_handle.flush()
-                log_handle.close()
-            except Exception:
-                pass
-
-
-def _run_inference_job_worker(infer_args: Namespace, cancel_flag_path: str, event_conn: Any, worker_log_path: str) -> None:
-    from .._cli._tx._infer import InferenceCancelledError, run_tx_infer
-
-    log_handle = None
-    if worker_log_path:
-        try:
-            Path(worker_log_path).parent.mkdir(parents=True, exist_ok=True)
-            log_handle = open(worker_log_path, "a", encoding="utf-8", buffering=1)
-            os.dup2(log_handle.fileno(), 1)
-            os.dup2(log_handle.fileno(), 2)
-            sys.stdout = log_handle
-            sys.stderr = log_handle
-        except Exception:
-            log_handle = None
-
-    heartbeat_stop = threading.Event()
-
-    def emit(payload: dict[str, Any]) -> None:
-        _emit_worker_message(event_conn, payload)
-
-    def heartbeat_loop() -> None:
-        while not heartbeat_stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
-            emit({"type": "heartbeat"})
-
-    heartbeat_thread = threading.Thread(
-        target=heartbeat_loop,
-        daemon=True,
-        name="state_tx_worker_heartbeat",
-    )
-    heartbeat_thread.start()
-
-    def cancel_check() -> bool:
-        try:
-            return Path(cancel_flag_path).exists()
-        except Exception:
-            return False
-
-    def progress_callback(event: dict[str, Any]) -> None:
-        emit({"type": "event", "event": dict(event)})
-
-    setattr(infer_args, "cancel_check", cancel_check)
-    setattr(infer_args, "progress_callback", progress_callback)
-    emit(
-        {
-            "type": "status",
-            "status": "running",
-            "started_at": _utc_now_iso(),
-            "message": "Inference job started.",
-        }
-    )
-
-    try:
-        run_tx_infer(infer_args)
-    except InferenceCancelledError as exc:
-        emit(
-            {
-                "type": "status",
-                "status": "cancelled",
-                "finished_at": _utc_now_iso(),
-                "error": str(exc),
-                "message": f"[cancelled] {exc}",
-            }
-        )
-    except BaseException as exc:  # pragma: no cover - defensive guard around worker process.
-        emit(
-            {
-                "type": "status",
-                "status": "failed",
-                "finished_at": _utc_now_iso(),
-                "error": f"{type(exc).__name__}: {exc}",
-                "message": f"[failed] {type(exc).__name__}: {exc}",
-            }
-        )
-        emit({"type": "traceback", "traceback": traceback.format_exc().strip()})
-    else:
-        emit(
-            {
-                "type": "status",
-                "status": "succeeded",
-                "finished_at": _utc_now_iso(),
-                "message": "[succeeded] Inference job completed.",
-            }
-        )
-    finally:
-        heartbeat_stop.set()
-        try:
-            event_conn.close()
-        except Exception:
-            pass
-        if log_handle is not None:
-            try:
-                log_handle.flush()
-                log_handle.close()
-            except Exception:
-                pass
-
-
-def _run_emb_inference_job_worker(
-    resolved: dict[str, Any],
-    cancel_flag_path: str,
-    event_conn: Any,
-    worker_log_path: str,
-) -> None:
-    log_handle = None
-    if worker_log_path:
-        try:
-            Path(worker_log_path).parent.mkdir(parents=True, exist_ok=True)
-            log_handle = open(worker_log_path, "a", encoding="utf-8", buffering=1)
-            os.dup2(log_handle.fileno(), 1)
-            os.dup2(log_handle.fileno(), 2)
-            sys.stdout = log_handle
-            sys.stderr = log_handle
-        except Exception:
-            log_handle = None
-
-    heartbeat_stop = threading.Event()
-
-    def emit(payload: dict[str, Any]) -> None:
-        _emit_worker_message(event_conn, payload)
-
-    def heartbeat_loop() -> None:
-        while not heartbeat_stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
-            emit({"type": "heartbeat"})
-
-    heartbeat_thread = threading.Thread(
-        target=heartbeat_loop,
-        daemon=True,
-        name="state_emb_worker_heartbeat",
-    )
-    heartbeat_thread.start()
-
-    def cancellation_requested() -> bool:
-        try:
-            return Path(cancel_flag_path).exists()
-        except Exception:
-            return False
-
-    def ensure_not_cancelled(phase: str) -> None:
-        if cancellation_requested():
-            raise EmbInferenceCancelledError(f"Embedding inference cancelled during {phase}.")
-
-    emit(
-        {
-            "type": "status",
-            "status": "running",
-            "started_at": _utc_now_iso(),
-            "message": "Embedding inference job started.",
-        }
-    )
-
-    try:
-        output_path_resolved = resolved.get("output_path")
-        if isinstance(output_path_resolved, str):
-            Path(output_path_resolved).parent.mkdir(parents=True, exist_ok=True)
-
-        emit(
-            {
-                "type": "event",
-                "event": {
-                    "kind": "progress",
-                    "phase": "initializing",
-                    "progress": 0,
-                    "total": 100,
-                    "message": "Preparing embedding inference.",
-                },
-            }
-        )
-
-        from ..emb.inference import Inference
-
-        cfg_override = None
-        if isinstance(resolved.get("config_path"), str):
-            from omegaconf import OmegaConf
-
-            cfg_override = OmegaConf.load(resolved["config_path"])
-
-        protein_embeddings_override = None
-        if isinstance(resolved.get("protein_embeddings_path"), str):
-            import torch
-
-            protein_embeddings_override = torch.load(
-                resolved["protein_embeddings_path"],
-                map_location="cpu",
-                weights_only=False,
-            )
-
-        ensure_not_cancelled("initialization")
-
-        inferer = Inference(cfg=cfg_override, protein_embeds=protein_embeddings_override)
-        emit(
-            {
-                "type": "event",
-                "event": {
-                    "kind": "progress",
-                    "phase": "initializing",
-                    "progress": 10,
-                    "total": 100,
-                    "message": "Loading embedding checkpoint.",
-                },
-            }
-        )
-        inferer.load_model(resolved["checkpoint_path"])
-
-        ensure_not_cancelled("checkpoint loading")
-
-        emit(
-            {
-                "type": "event",
-                "event": {
-                    "kind": "progress",
-                    "phase": "model_loaded",
-                    "progress": 30,
-                    "total": 100,
-                    "message": "Running embedding forward pass.",
-                },
-            }
-        )
-        embeddings = inferer.encode_adata(
-            input_adata_path=resolved["input_adata_path"],
-            output_adata_path=resolved["output_adata_path_for_encode"],
-            emb_key=resolved["embedding_key"],
-            batch_size=resolved["batch_size"],
-        )
-
-        ensure_not_cancelled("embedding forward pass")
-
-        if isinstance(output_path_resolved, str) and output_path_resolved.lower().endswith(".npy"):
-            import numpy as np
-
-            emit(
-                {
-                    "type": "event",
-                    "event": {
-                        "kind": "progress",
-                        "phase": "writing_output",
-                        "progress": 90,
-                        "total": 100,
-                        "message": "Writing embeddings to .npy output.",
-                    },
-                }
-            )
-            np.save(output_path_resolved, embeddings)
-
-        emb_shape: list[int] | None = None
-        emb_dtype: str | None = None
-        if hasattr(embeddings, "shape"):
-            try:
-                emb_shape = [int(x) for x in embeddings.shape]
-            except Exception:
-                emb_shape = None
-        if hasattr(embeddings, "dtype"):
-            try:
-                emb_dtype = str(embeddings.dtype)
-            except Exception:
-                emb_dtype = None
-
-        emit(
-            {
-                "type": "event",
-                "event": {
-                    "kind": "progress",
-                    "phase": "completed",
-                    "progress": 100,
-                    "total": 100,
-                    "embeddings_shape": emb_shape,
-                    "embeddings_dtype": emb_dtype,
-                    "message": "Embedding inference completed.",
-                },
-            }
-        )
-        emit(
-            {
-                "type": "status",
-                "status": "succeeded",
-                "finished_at": _utc_now_iso(),
-                "message": "[succeeded] Embedding inference completed.",
-            }
-        )
-    except EmbInferenceCancelledError as exc:
-        emit(
-            {
-                "type": "status",
-                "status": "cancelled",
-                "finished_at": _utc_now_iso(),
-                "error": str(exc),
-                "message": f"[cancelled] {exc}",
-            }
-        )
-    except BaseException as exc:  # pragma: no cover - defensive guard around worker process.
-        emit(
-            {
-                "type": "status",
-                "status": "failed",
-                "finished_at": _utc_now_iso(),
-                "error": f"{type(exc).__name__}: {exc}",
-                "message": f"[failed] {type(exc).__name__}: {exc}",
-            }
-        )
-        emit({"type": "traceback", "traceback": traceback.format_exc().strip()})
-    finally:
-        heartbeat_stop.set()
-        try:
-            event_conn.close()
-        except Exception:
-            pass
-        if log_handle is not None:
-            try:
-                log_handle.flush()
-                log_handle.close()
-            except Exception:
-                pass
-
+# ---------------------------------------------------------------------------
+# MCP tool definitions
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
 def set_tx_model_folder(model_folder: str) -> dict[str, str]:
@@ -2427,15 +1076,87 @@ def plan_tx_train(
     use_wandb: str = "auto",
     backend: str = "auto",
     backend_profile: str | None = None,
+    slurm_partition: str | None = None,
+    slurm_gpus: int | None = None,
+    slurm_cpus_per_task: int | None = None,
+    slurm_mem: str | None = None,
+    slurm_time: str | None = None,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
+    wandb_tags: list[str] | None = None,
+    hidden_dim: int | None = None,
+    cell_set_len: int | None = None,
+    nb_loss: bool | None = None,
+    batch_encoder: bool | None = None,
+    ckpt_every_n_steps: int | None = None,
+    num_workers: int | None = None,
     extra_overrides: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Build and validate a curated TX training plan without launching training.
 
     Returns `status`:
-    - `needs_input`: required fields are missing
-    - `invalid`: values failed validation
+    - `needs_input`: required fields are missing — supply them and call again
+    - `invalid`: values failed validation — check `validation_errors`
     - `ready`: launch-ready plan with resolved Hydra overrides
+
+    **Required fields** (status stays `needs_input` until all are set):
+    - `toml_config_path`: path to the TX split TOML produced by `plan_tx_split_toml`
+    - `output_dir`: parent directory for the run folder
+    - `name`: run name (a subdirectory `output_dir/name` is created)
+
+    **Data / column parameters:**
+    - `embed_key`: obsm key for pre-computed embeddings (e.g. `"X_state"`).
+      Set to `"null"` or omit to train without embeddings.
+    - `output_space`: `"gene"` (expression only, default when no embed_key),
+      `"all"` (expression + embedding, default when embed_key is set),
+      or `"embedding"` (embedding-space only).
+    - `perturbation_column`: obs column for perturbation labels (default auto-detected, fallback `"gene"`)
+    - `cell_type_column`: obs column for cell-type labels (default auto-detected, fallback `"cell_type"`)
+    - `batch_column`: obs column for batch labels (default auto-detected, fallback `"gem_group"`)
+    - `control_perturbation`: label for control/unperturbed cells (default `"non-targeting"`)
+
+    **Model presets** (`model_preset`):
+    - `"state"` (default): hidden_dim=384, cell_set_len=64, 8 transformer layers, 12 heads
+    - `"state_sm"`: hidden_dim=672, cell_set_len=128, 4 transformer layers, 8 heads
+    - `"state_lg"`: hidden_dim=1488, cell_set_len=512, 6 transformer layers, 12 heads
+
+    **Model architecture overrides** (override preset defaults):
+    - `hidden_dim`: transformer hidden dimension (must be > 0)
+    - `cell_set_len`: number of cells per set/context (must be > 0)
+    - `nb_loss`: use negative binomial loss (default false)
+    - `batch_encoder`: enable batch encoder (default false)
+
+    **Training parameters:**
+    - `max_steps`: maximum training steps (default 400000 from Hydra config)
+    - `batch_size`: training batch size (default 16 from Hydra config)
+    - `learning_rate`: learning rate (default 1e-4 from Hydra config)
+    - `val_freq`: validation frequency in steps (default 5000 from Hydra config)
+    - `seed`: random seed (default 42)
+    - `ckpt_every_n_steps`: checkpoint save frequency in steps (must be > 0)
+
+    **Data parameters:**
+    - `num_workers`: dataloader worker count (must be >= 0).
+      Auto-set from `slurm_cpus_per_task` if not provided explicitly.
+
+    **W&B parameters:**
+    - `use_wandb`: `"auto"` (detect credentials), `"true"`, or `"false"`
+    - `wandb_project`: W&B project name (Hydra key `wandb.project`)
+    - `wandb_entity`: W&B entity/team (Hydra key `wandb.entity`)
+    - `wandb_tags`: list of W&B tags (Hydra key `wandb.tags`)
+
+    **Backend / Slurm parameters:**
+    - `backend`: `"auto"` (detect sbatch), `"slurm"`, or `"local"`
+    - `backend_profile`: slurm profile name, partition, or raw sbatch args
+    - `slurm_partition`: slurm partition(s), e.g. `"standard,preemptible"` (maps to `--partition`)
+    - `slurm_gpus`: number of GPUs (maps to `--gres=gpu:N`)
+    - `slurm_cpus_per_task`: CPUs per task (maps to `--cpus-per-task`)
+    - `slurm_mem`: memory request, e.g. `"256G"` (maps to `--mem`)
+    - `slurm_time`: time limit, e.g. `"2-00:00:00"` (maps to `--time`)
+
+    **Advanced:**
+    - `extra_overrides`: raw Hydra overrides appended after all curated ones
+      (can override any curated key; a warning is emitted for conflicts)
     """
     return _build_tx_train_plan(
         toml_config_path=toml_config_path,
@@ -2456,6 +1177,20 @@ def plan_tx_train(
         use_wandb=use_wandb,
         backend=backend,
         backend_profile=backend_profile,
+        slurm_partition=slurm_partition,
+        slurm_gpus=slurm_gpus,
+        slurm_cpus_per_task=slurm_cpus_per_task,
+        slurm_mem=slurm_mem,
+        slurm_time=slurm_time,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        wandb_tags=wandb_tags,
+        hidden_dim=hidden_dim,
+        cell_set_len=cell_set_len,
+        nb_loss=nb_loss,
+        batch_encoder=batch_encoder,
+        ckpt_every_n_steps=ckpt_every_n_steps,
+        num_workers=num_workers,
         extra_overrides=extra_overrides,
     )
 
@@ -2480,6 +1215,20 @@ def run_tx_train(
     use_wandb: str = "auto",
     backend: str = "auto",
     backend_profile: str | None = None,
+    slurm_partition: str | None = None,
+    slurm_gpus: int | None = None,
+    slurm_cpus_per_task: int | None = None,
+    slurm_mem: str | None = None,
+    slurm_time: str | None = None,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
+    wandb_tags: list[str] | None = None,
+    hidden_dim: int | None = None,
+    cell_set_len: int | None = None,
+    nb_loss: bool | None = None,
+    batch_encoder: bool | None = None,
+    ckpt_every_n_steps: int | None = None,
+    num_workers: int | None = None,
     extra_overrides: list[str] | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -2505,6 +1254,20 @@ def run_tx_train(
         use_wandb=use_wandb,
         backend=backend,
         backend_profile=backend_profile,
+        slurm_partition=slurm_partition,
+        slurm_gpus=slurm_gpus,
+        slurm_cpus_per_task=slurm_cpus_per_task,
+        slurm_mem=slurm_mem,
+        slurm_time=slurm_time,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        wandb_tags=wandb_tags,
+        hidden_dim=hidden_dim,
+        cell_set_len=cell_set_len,
+        nb_loss=nb_loss,
+        batch_encoder=batch_encoder,
+        ckpt_every_n_steps=ckpt_every_n_steps,
+        num_workers=num_workers,
         extra_overrides=extra_overrides,
         idempotency_key=idempotency_key,
     )
@@ -2530,6 +1293,20 @@ def start_tx_train(
     use_wandb: str = "auto",
     backend: str = "auto",
     backend_profile: str | None = None,
+    slurm_partition: str | None = None,
+    slurm_gpus: int | None = None,
+    slurm_cpus_per_task: int | None = None,
+    slurm_mem: str | None = None,
+    slurm_time: str | None = None,
+    wandb_project: str | None = None,
+    wandb_entity: str | None = None,
+    wandb_tags: list[str] | None = None,
+    hidden_dim: int | None = None,
+    cell_set_len: int | None = None,
+    nb_loss: bool | None = None,
+    batch_encoder: bool | None = None,
+    ckpt_every_n_steps: int | None = None,
+    num_workers: int | None = None,
     extra_overrides: list[str] | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -2561,6 +1338,20 @@ def start_tx_train(
         use_wandb=use_wandb,
         backend=backend,
         backend_profile=backend_profile,
+        slurm_partition=slurm_partition,
+        slurm_gpus=slurm_gpus,
+        slurm_cpus_per_task=slurm_cpus_per_task,
+        slurm_mem=slurm_mem,
+        slurm_time=slurm_time,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        wandb_tags=wandb_tags,
+        hidden_dim=hidden_dim,
+        cell_set_len=cell_set_len,
+        nb_loss=nb_loss,
+        batch_encoder=batch_encoder,
+        ckpt_every_n_steps=ckpt_every_n_steps,
+        num_workers=num_workers,
         extra_overrides=extra_overrides,
     )
 
@@ -2641,12 +1432,18 @@ def start_tx_train(
             idempotency_by_key[cleaned_idempotency_key] = job_id
 
     if backend_mode == "slurm":
+        resolved_slurm = resolved.get("resolved_slurm") or {}
         try:
             submission = _submit_tx_train_slurm_job(
                 job_id=job_id,
                 run_dir=run_dir,
                 hydra_overrides=resolved_overrides,
                 backend_profile=profile_value,
+                slurm_partition=resolved_slurm.get("partition"),
+                slurm_gpus=resolved_slurm.get("gpus"),
+                slurm_cpus_per_task=resolved_slurm.get("cpus_per_task"),
+                slurm_mem=resolved_slurm.get("mem"),
+                slurm_time=resolved_slurm.get("time"),
             )
         except Exception as exc:
             with _TRAIN_JOBS_LOCK:
@@ -2998,6 +1795,13 @@ def run_emb_inference(
     embedding_key: str = "X_state",
     protein_embeddings_path: str | None = None,
     batch_size: int | None = None,
+    backend: str = "auto",
+    backend_profile: str | None = None,
+    slurm_partition: str | None = None,
+    slurm_gpus: int | None = None,
+    slurm_cpus_per_task: int | None = None,
+    slurm_mem: str | None = None,
+    slurm_time: str | None = None,
 ) -> dict[str, Any]:
     """
     Start STATE embedding inference in the background and return a `job_id` immediately.
@@ -3015,6 +1819,13 @@ def run_emb_inference(
         embedding_key=embedding_key,
         protein_embeddings_path=protein_embeddings_path,
         batch_size=batch_size,
+        backend=backend,
+        backend_profile=backend_profile,
+        slurm_partition=slurm_partition,
+        slurm_gpus=slurm_gpus,
+        slurm_cpus_per_task=slurm_cpus_per_task,
+        slurm_mem=slurm_mem,
+        slurm_time=slurm_time,
     )
 
 @mcp.tool()
@@ -3027,6 +1838,13 @@ def start_emb_inference(
     embedding_key: str = "X_state",
     protein_embeddings_path: str | None = None,
     batch_size: int | None = None,
+    backend: str = "auto",
+    backend_profile: str | None = None,
+    slurm_partition: str | None = None,
+    slurm_gpus: int | None = None,
+    slurm_cpus_per_task: int | None = None,
+    slurm_mem: str | None = None,
+    slurm_time: str | None = None,
 ) -> dict[str, Any]:
     """
     Start embedding inference in the background and return a `job_id` immediately.
@@ -3048,6 +1866,8 @@ def start_emb_inference(
     )
     session_key = _get_current_session_key()
 
+    backend_mode, backend_reason = _resolve_backend_mode(backend)
+
     job_id = uuid4().hex
     job = InferenceJob(
         job_id=job_id,
@@ -3067,8 +1887,69 @@ def start_emb_inference(
             "output_adata_path_for_encode": resolved["output_adata_path_for_encode"],
         },
         adata_size_bytes=resolved.get("input_adata_size_bytes"),
+        backend=backend_mode,
+        backend_profile=backend_profile,
     )
     _append_job_log(job, "[queued] Embedding inference job queued.")
+
+    with _JOBS_LOCK:
+        jobs_by_id = _get_session_jobs_locked(session_key)
+        jobs_by_id[job_id] = job
+
+    if backend_mode == "slurm":
+        command = _build_emb_transform_cli_args(resolved)
+        try:
+            submission = _submit_slurm_job(
+                job_id=job_id,
+                job_name_prefix="state_emb_infer",
+                run_dir=None,
+                command=command,
+                backend_profile=backend_profile,
+                slurm_partition=slurm_partition,
+                slurm_gpus=slurm_gpus,
+                slurm_cpus_per_task=slurm_cpus_per_task,
+                slurm_mem=slurm_mem,
+                slurm_time=slurm_time,
+                default_gpus=1,
+            )
+        except Exception as exc:
+            with _JOBS_LOCK:
+                current = _get_session_jobs_locked(session_key).get(job_id)
+                if current is not None:
+                    current.status = "failed"
+                    current.error = f"Failed to submit slurm job: {type(exc).__name__}: {exc}"
+                    current.finished_at = _utc_now_iso()
+                    _append_job_log(current, f"[failed] {current.error}")
+            raise RuntimeError(f"Unable to submit emb inference slurm job: {type(exc).__name__}: {exc}") from exc
+
+        with _JOBS_LOCK:
+            current = _get_session_jobs_locked(session_key).get(job_id)
+            if current is not None:
+                current.scheduler_job_id = str(submission["scheduler_job_id"])
+                current.worker_log_path = str(submission["worker_log_path"])
+                current.worker_error_log_path = str(submission["worker_error_log_path"])
+                current.progress = {
+                    "phase": "submitted",
+                    "message": "Submitted to slurm.",
+                    "scheduler_job_id": current.scheduler_job_id,
+                    "slurm_profile_reason": submission.get("profile_reason"),
+                }
+                _append_job_log(current, f"[submitted] Slurm job id={current.scheduler_job_id}.")
+                _sync_job_state_locked(current)
+                poll_interval = _recommend_poll_interval_seconds(current)
+            else:
+                poll_interval = 5.0
+
+        return {
+            "status": "started",
+            "job_id": job_id,
+            "backend": "slurm",
+            "scheduler_job_id": submission["scheduler_job_id"],
+            "worker_log_path": submission["worker_log_path"],
+            "worker_error_log_path": submission["worker_error_log_path"],
+            **resolved,
+            "recommended_initial_poll_interval_seconds": poll_interval,
+        }
 
     mp_ctx = _get_worker_mp_context()
     parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
@@ -3086,10 +1967,6 @@ def start_emb_inference(
     job.cancel_flag_path = cancel_flag_path
     job.worker_log_path = worker_log_path
     job.process = process
-
-    with _JOBS_LOCK:
-        jobs_by_id = _get_session_jobs_locked(session_key)
-        jobs_by_id[job_id] = job
 
     try:
         process.start()
@@ -3169,6 +2046,10 @@ def get_emb_inference_status(job_id: str) -> dict[str, Any]:
             "worker_pid": job.worker_pid,
             "worker_exit_code": job.worker_exit_code,
             "worker_log_path": job.worker_log_path,
+            "worker_error_log_path": job.worker_error_log_path,
+            "backend": job.backend,
+            "backend_profile": job.backend_profile,
+            "scheduler_job_id": job.scheduler_job_id,
             "recommended_poll_interval_seconds": recommended_poll,
             "recommended_log_poll_interval_seconds": recommended_log_poll,
         }
@@ -3236,41 +2117,80 @@ def cancel_emb_inference(job_id: str, force: bool = False) -> dict[str, Any]:
         if job.status in {"queued", "running"}:
             job.status = "cancelling"
 
-        if isinstance(job.cancel_flag_path, str) and job.cancel_flag_path:
-            try:
-                Path(job.cancel_flag_path).touch(exist_ok=True)
-            except Exception as exc:
+        terminate_sent = False
+        scancel_sent = False
+        scancel_exit_code: int | None = None
+        scancel_message: str | None = None
+
+        if job.backend == "slurm":
+            if isinstance(job.scheduler_job_id, str) and job.scheduler_job_id.strip():
+                if shutil.which("scancel") is None:
+                    scancel_message = "`scancel` not found in PATH."
+                    _append_job_log(job, f"[warning] {scancel_message}")
+                else:
+                    try:
+                        result = subprocess.run(
+                            ["scancel", job.scheduler_job_id],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        scancel_exit_code = int(result.returncode)
+                        out = (result.stdout or "").strip()
+                        err = (result.stderr or "").strip()
+                        if result.returncode == 0:
+                            scancel_sent = True
+                            scancel_message = "scancel request submitted."
+                            _append_job_log(job, f"[cancelling] Sent scancel for {job.scheduler_job_id}.")
+                        else:
+                            scancel_message = f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            _append_job_log(job, f"[warning] {scancel_message}")
+                    except Exception as exc:
+                        scancel_message = f"Failed to invoke scancel: {type(exc).__name__}: {exc}"
+                        _append_job_log(job, f"[warning] {scancel_message}")
+            else:
+                scancel_message = "No scheduler job id recorded; cannot send scancel."
+                _append_job_log(job, f"[warning] {scancel_message}")
+        else:
+            if isinstance(job.cancel_flag_path, str) and job.cancel_flag_path:
+                try:
+                    Path(job.cancel_flag_path).touch(exist_ok=True)
+                except Exception as exc:
+                    _append_job_log(
+                        job,
+                        f"[warning] Failed to set cancellation flag at {job.cancel_flag_path}: {type(exc).__name__}: {exc}",
+                    )
+
+            if force and _process_alive(job.process):
+                try:
+                    job.process.terminate()
+                    terminate_sent = True
+                    job.terminate_sent_at_monotonic = now_mono
+                    _append_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
+                except Exception as exc:
+                    _append_job_log(job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}")
+            elif first_request:
                 _append_job_log(
                     job,
-                    f"[warning] Failed to set cancellation flag at {job.cancel_flag_path}: {type(exc).__name__}: {exc}",
+                    f"[cancelling] Cancellation requested. Grace period is {_CANCEL_GRACE_SECONDS:.0f}s before force termination.",
                 )
-
-        terminate_sent = False
-        if force and _process_alive(job.process):
-            try:
-                job.process.terminate()
-                terminate_sent = True
-                job.terminate_sent_at_monotonic = now_mono
-                _append_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
-            except Exception as exc:
-                _append_job_log(job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}")
-        elif first_request:
-            _append_job_log(
-                job,
-                f"[cancelling] Cancellation requested. Grace period is {_CANCEL_GRACE_SECONDS:.0f}s before force termination.",
-            )
-        else:
-            _append_job_log(job, "[cancelling] Cancellation requested.")
+            else:
+                _append_job_log(job, "[cancelling] Cancellation requested.")
 
         _sync_job_state_locked(job)
         poll_interval = _recommend_poll_interval_seconds(job)
         return {
             "job_id": job_id,
             "status": job.status,
+            "backend": job.backend,
+            "scheduler_job_id": job.scheduler_job_id,
             "cancel_requested": job.cancel_requested,
             "cancel_requested_at": job.cancel_requested_at,
             "force": force,
             "terminate_sent": terminate_sent,
+            "scancel_sent": scancel_sent,
+            "scancel_exit_code": scancel_exit_code,
+            "scancel_message": scancel_message,
             "recommended_poll_interval_seconds": poll_interval,
         }
 
@@ -3297,6 +2217,13 @@ def start_tx_inference(
     batched: bool = True,
     set_batch_size: int | None = None,
     quiet: bool = True,
+    backend: str = "auto",
+    backend_profile: str | None = None,
+    slurm_partition: str | None = None,
+    slurm_gpus: int | None = None,
+    slurm_cpus_per_task: int | None = None,
+    slurm_mem: str | None = None,
+    slurm_time: str | None = None,
 ) -> dict[str, Any]:
     """
     Start tx inference in the background and return a `job_id` immediately.
@@ -3334,6 +2261,8 @@ def start_tx_inference(
         quiet=quiet,
     )
 
+    backend_mode, backend_reason = _resolve_backend_mode(backend)
+
     job_id = uuid4().hex
     job = InferenceJob(
         job_id=job_id,
@@ -3346,8 +2275,69 @@ def start_tx_inference(
         inference_kind="tx",
         resolved_args=resolved["resolved_args"],
         adata_size_bytes=resolved.get("adata_size_bytes"),
+        backend=backend_mode,
+        backend_profile=backend_profile,
     )
     _append_job_log(job, "[queued] Inference job queued.")
+
+    with _JOBS_LOCK:
+        jobs_by_id = _get_session_jobs_locked(session_key)
+        jobs_by_id[job_id] = job
+
+    if backend_mode == "slurm":
+        command = _build_tx_infer_cli_args(infer_args)
+        try:
+            submission = _submit_slurm_job(
+                job_id=job_id,
+                job_name_prefix="state_tx_infer",
+                run_dir=None,
+                command=command,
+                backend_profile=backend_profile,
+                slurm_partition=slurm_partition,
+                slurm_gpus=slurm_gpus,
+                slurm_cpus_per_task=slurm_cpus_per_task,
+                slurm_mem=slurm_mem,
+                slurm_time=slurm_time,
+                default_gpus=1,
+            )
+        except Exception as exc:
+            with _JOBS_LOCK:
+                current = _get_session_jobs_locked(session_key).get(job_id)
+                if current is not None:
+                    current.status = "failed"
+                    current.error = f"Failed to submit slurm job: {type(exc).__name__}: {exc}"
+                    current.finished_at = _utc_now_iso()
+                    _append_job_log(current, f"[failed] {current.error}")
+            raise RuntimeError(f"Unable to submit tx inference slurm job: {type(exc).__name__}: {exc}") from exc
+
+        with _JOBS_LOCK:
+            current = _get_session_jobs_locked(session_key).get(job_id)
+            if current is not None:
+                current.scheduler_job_id = str(submission["scheduler_job_id"])
+                current.worker_log_path = str(submission["worker_log_path"])
+                current.worker_error_log_path = str(submission["worker_error_log_path"])
+                current.progress = {
+                    "phase": "submitted",
+                    "message": "Submitted to slurm.",
+                    "scheduler_job_id": current.scheduler_job_id,
+                    "slurm_profile_reason": submission.get("profile_reason"),
+                }
+                _append_job_log(current, f"[submitted] Slurm job id={current.scheduler_job_id}.")
+                _sync_job_state_locked(current)
+                poll_interval = _recommend_poll_interval_seconds(current)
+            else:
+                poll_interval = 5.0
+
+        return {
+            "status": "started",
+            "job_id": job_id,
+            "backend": "slurm",
+            "scheduler_job_id": submission["scheduler_job_id"],
+            "worker_log_path": submission["worker_log_path"],
+            "worker_error_log_path": submission["worker_error_log_path"],
+            **resolved,
+            "recommended_initial_poll_interval_seconds": poll_interval,
+        }
 
     mp_ctx = _get_worker_mp_context()
     parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
@@ -3365,10 +2355,6 @@ def start_tx_inference(
     job.cancel_flag_path = cancel_flag_path
     job.worker_log_path = worker_log_path
     job.process = process
-
-    with _JOBS_LOCK:
-        jobs_by_id = _get_session_jobs_locked(session_key)
-        jobs_by_id[job_id] = job
 
     try:
         process.start()
@@ -3448,6 +2434,10 @@ def get_tx_inference_status(job_id: str) -> dict[str, Any]:
             "worker_pid": job.worker_pid,
             "worker_exit_code": job.worker_exit_code,
             "worker_log_path": job.worker_log_path,
+            "worker_error_log_path": job.worker_error_log_path,
+            "backend": job.backend,
+            "backend_profile": job.backend_profile,
+            "scheduler_job_id": job.scheduler_job_id,
             "recommended_poll_interval_seconds": recommended_poll,
             "recommended_log_poll_interval_seconds": recommended_log_poll,
         }
@@ -3515,31 +2505,65 @@ def cancel_tx_inference(job_id: str, force: bool = False) -> dict[str, Any]:
         if job.status in {"queued", "running"}:
             job.status = "cancelling"
 
-        if isinstance(job.cancel_flag_path, str) and job.cancel_flag_path:
-            try:
-                Path(job.cancel_flag_path).touch(exist_ok=True)
-            except Exception as exc:
+        terminate_sent = False
+        scancel_sent = False
+        scancel_exit_code: int | None = None
+        scancel_message: str | None = None
+
+        if job.backend == "slurm":
+            if isinstance(job.scheduler_job_id, str) and job.scheduler_job_id.strip():
+                if shutil.which("scancel") is None:
+                    scancel_message = "`scancel` not found in PATH."
+                    _append_job_log(job, f"[warning] {scancel_message}")
+                else:
+                    try:
+                        result = subprocess.run(
+                            ["scancel", job.scheduler_job_id],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        scancel_exit_code = int(result.returncode)
+                        out = (result.stdout or "").strip()
+                        err = (result.stderr or "").strip()
+                        if result.returncode == 0:
+                            scancel_sent = True
+                            scancel_message = "scancel request submitted."
+                            _append_job_log(job, f"[cancelling] Sent scancel for {job.scheduler_job_id}.")
+                        else:
+                            scancel_message = f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            _append_job_log(job, f"[warning] {scancel_message}")
+                    except Exception as exc:
+                        scancel_message = f"Failed to invoke scancel: {type(exc).__name__}: {exc}"
+                        _append_job_log(job, f"[warning] {scancel_message}")
+            else:
+                scancel_message = "No scheduler job id recorded; cannot send scancel."
+                _append_job_log(job, f"[warning] {scancel_message}")
+        else:
+            if isinstance(job.cancel_flag_path, str) and job.cancel_flag_path:
+                try:
+                    Path(job.cancel_flag_path).touch(exist_ok=True)
+                except Exception as exc:
+                    _append_job_log(
+                        job,
+                        f"[warning] Failed to set cancellation flag at {job.cancel_flag_path}: {type(exc).__name__}: {exc}",
+                    )
+
+            if force and _process_alive(job.process):
+                try:
+                    job.process.terminate()
+                    terminate_sent = True
+                    job.terminate_sent_at_monotonic = now_mono
+                    _append_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
+                except Exception as exc:
+                    _append_job_log(job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}")
+            elif first_request:
                 _append_job_log(
                     job,
-                    f"[warning] Failed to set cancellation flag at {job.cancel_flag_path}: {type(exc).__name__}: {exc}",
+                    f"[cancelling] Cancellation requested. Grace period is {_CANCEL_GRACE_SECONDS:.0f}s before force termination.",
                 )
-
-        terminate_sent = False
-        if force and _process_alive(job.process):
-            try:
-                job.process.terminate()
-                terminate_sent = True
-                job.terminate_sent_at_monotonic = now_mono
-                _append_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
-            except Exception as exc:
-                _append_job_log(job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}")
-        elif first_request:
-            _append_job_log(
-                job,
-                f"[cancelling] Cancellation requested. Grace period is {_CANCEL_GRACE_SECONDS:.0f}s before force termination.",
-            )
-        else:
-            _append_job_log(job, "[cancelling] Cancellation requested.")
+            else:
+                _append_job_log(job, "[cancelling] Cancellation requested.")
 
         _sync_job_state_locked(job)
         poll_interval = _recommend_poll_interval_seconds(job)
@@ -3547,10 +2571,15 @@ def cancel_tx_inference(job_id: str, force: bool = False) -> dict[str, Any]:
         return {
             "job_id": job_id,
             "status": job.status,
+            "backend": job.backend,
+            "scheduler_job_id": job.scheduler_job_id,
             "cancel_requested": job.cancel_requested,
             "cancel_requested_at": job.cancel_requested_at,
             "force": force,
             "terminate_sent": terminate_sent,
+            "scancel_sent": scancel_sent,
+            "scancel_exit_code": scancel_exit_code,
+            "scancel_message": scancel_message,
             "recommended_poll_interval_seconds": poll_interval,
         }
 
