@@ -1,5 +1,6 @@
 import os
 import logging
+import sys
 import torch
 import anndata
 import h5py as h5
@@ -240,7 +241,12 @@ class Inference:
 
         all_embeddings = []
         all_ds_embeddings = []
-        for embeddings, ds_embeddings in tqdm(self.encode(dataloader), total=len(dataloader), desc="Encoding"):
+        for embeddings, ds_embeddings in tqdm(
+            self.encode(dataloader),
+            total=len(dataloader),
+            desc="Encoding",
+            file=sys.stderr,
+        ):
             all_embeddings.append(embeddings)
             if ds_embeddings is not None:
                 all_ds_embeddings.append(ds_embeddings)
@@ -286,7 +292,7 @@ class Inference:
         from scipy.sparse import csr_matrix, issparse
 
         if issparse(adata.X) and not isinstance(adata.X, csr_matrix):
-            print(f"Converting {type(adata.X).__name__} to csr_matrix format")
+            log.info("Converting %s to csr_matrix format", type(adata.X).__name__)
             adata.X = csr_matrix(adata.X)
         return adata
 
@@ -354,7 +360,11 @@ class Inference:
 
         gene_embeds = self.get_gene_embedding(genes)
         with torch.autocast(device_type=device_type, dtype=precision):
-            for i in tqdm(range(0, cell_embs.size(0), batch_size), total=int(cell_embs.size(0) // batch_size)):
+            for i in tqdm(
+                range(0, cell_embs.size(0), batch_size),
+                total=int(cell_embs.size(0) // batch_size),
+                file=sys.stderr,
+            ):
                 cell_embeds_batch = cell_embs[i : i + batch_size]
                 task_counts = torch.full(
                     (cell_embeds_batch.shape[0],), read_depth, device=self.model.device, dtype=precision

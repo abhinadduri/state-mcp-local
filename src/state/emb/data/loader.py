@@ -1,10 +1,12 @@
-import h5py
-import logging
-import torch
-import torch.utils.data as data
-import torch.nn.functional as F
 import functools
+import logging
+import os
+
+import h5py
 import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.utils.data as data
 
 from typing import Dict, Optional
 
@@ -22,7 +24,7 @@ RAW_COUNT_HEURISTIC_THRESHOLD = 35
 # THIS SHOULD ONLY BE USED FOR INFERENCE
 def create_dataloader(
     cfg,
-    workers=1,
+    workers=None,
     data_dir=None,
     datasets=None,
     shape_dict=None,
@@ -46,6 +48,10 @@ def create_dataloader(
 
     if data_dir:
         utils.get_dataset_cfg(cfg).data_dir = data_dir
+
+    if workers is None:
+        workers = int(os.getenv("STATE_EMB_NUM_WORKERS", "1"))
+    workers = max(int(workers), 0)
 
     dataset = FilteredGenesCounts(
         cfg,
@@ -74,7 +80,7 @@ def create_dataloader(
         shuffle=shuffle,
         collate_fn=sentence_collator,
         num_workers=workers,
-        persistent_workers=True,
+        persistent_workers=workers > 0,
     )
     return dataloader
 
