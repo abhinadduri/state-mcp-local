@@ -51,6 +51,11 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         action="store_true",
         help="If set, skip writing AnnData (.h5ad) outputs and only run metrics/evaluation.",
     )
+    parser.add_argument(
+        "--skip-de",
+        action="store_true",
+        help="If set, skip DE computation in cell-eval and only compute AnnData-based metrics.",
+    )
 
     parser.add_argument(
         "--shared-only",
@@ -101,6 +106,11 @@ def run_tx_predict(args: ap.ArgumentParser):
 
     if args.predict_only and args.skip_adatas:
         logger.warning("Both --predict-only and --skip-adatas were set; no prediction artifacts will be written.")
+    if args.profile == "anndata" and not args.skip_de:
+        logger.warning(
+            "--profile anndata does not disable DE computation by itself. "
+            "Add --skip-de to skip DE and reduce memory/runtime."
+        )
 
     def run_test_time_finetune(model, dataloader, ft_epochs, control_pert, device):
         """
@@ -539,12 +549,11 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         for idx, entry in enumerate(group_entries):
             count = int(entry["count"])
-            denom = float(count)
-            pred_bulk[idx, :] = (entry["pred_sum"] / denom).astype(np.float32, copy=False)
-            real_bulk[idx, :] = (entry["real_sum"] / denom).astype(np.float32, copy=False)
+            pred_bulk[idx, :] = entry["pred_sum"].astype(np.float32, copy=False)
+            real_bulk[idx, :] = entry["real_sum"].astype(np.float32, copy=False)
             if use_count_outputs:
-                pred_x[idx, :] = (entry["counts_pred_sum"] / denom).astype(np.float32, copy=False)
-                real_x[idx, :] = (entry["x_hvg_sum"] / denom).astype(np.float32, copy=False)
+                pred_x[idx, :] = entry["counts_pred_sum"].astype(np.float32, copy=False)
+                real_x[idx, :] = entry["x_hvg_sum"].astype(np.float32, copy=False)
 
             obs_dict[data_module.pert_col].append(entry["pert_name"])
             obs_dict[data_module.cell_type_key].append(entry["celltype_name"])
@@ -568,9 +577,7 @@ def run_tx_predict(args: ap.ArgumentParser):
         if nb_loss_enabled:
             logger.info("nb_loss=True in run config; skipping pseudobulk clipping of adata_pred/adata_real X values.")
         else:
-            clip_anndata_values(adata_pred, max_value=14.0)
-            clip_anndata_values(adata_real, max_value=14.0)
-            logger.info("Clipped pseudobulk adata_pred and adata_real X values to [0.0, 14.0].")
+            logger.info("Skipping pseudobulk clipping to preserve summed values in adata_pred/adata_real X.")
 
         if args.shared_only:
             try:
@@ -630,6 +637,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                     prefix=ct,
                     pdex_kwargs=pdex_kwargs,
                     batch_size=2048,
+                    skip_de=args.skip_de,
                 )
                 evaluator.compute(
                     profile=args.profile,
@@ -868,6 +876,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 prefix=ct,
                 pdex_kwargs=pdex_kwargs,
                 batch_size=2048,
+                skip_de=args.skip_de,
             )
 
             evaluator.compute(
