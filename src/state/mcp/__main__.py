@@ -378,6 +378,44 @@ def _hydra_format_value(value: Any) -> str:
     return f'"{escaped}"'
 
 
+# ---------------------------------------------------------------------------
+# Model preset registry
+
+_PRESET_ALIASES: dict[str, str] = {
+    "cmean": "context_mean",
+    "pmean": "perturb_mean",
+}
+
+_KNOWN_PRESETS: set[str] = {
+    "state", "state_sm", "state_lg",
+    "context_mean", "perturb_mean",
+    "embedsum", "globalsimplesum", "pseudobulk", "decoder_only", "pertsets",
+}
+
+# Key model kwargs defaults per preset (from configs/model/*.yaml)
+_PRESET_MODEL_DEFAULTS: dict[str, dict[str, Any]] = {
+    "state":        {"hidden_dim": 384,  "cell_set_len": 64,  "batch_encoder": False, "nb_loss": False},
+    "state_sm":     {"hidden_dim": 672,  "cell_set_len": 128, "batch_encoder": False, "nb_loss": False},
+    "state_lg":     {"hidden_dim": 1488, "cell_set_len": 512, "batch_encoder": False, "nb_loss": False},
+    "context_mean": {"hidden_dim": 512,  "cell_set_len": 512, "batch_encoder": False, "nb_loss": False},
+    "perturb_mean": {"hidden_dim": 512,  "cell_set_len": 512, "batch_encoder": False, "nb_loss": False},
+}
+
+# Hydra training/data defaults (from configs/training/default.yaml and data/perturbation.yaml)
+_DEFAULT_TRAINING_PARAMS: dict[str, Any] = {
+    "max_steps": 100000,
+    "batch_size": 16,
+    "learning_rate": 1e-4,
+    "val_freq": 2000,
+    "ckpt_every_n_steps": 2000,
+}
+
+_DEFAULT_DATA_PARAMS: dict[str, Any] = {
+    "use_consecutive_loading": False,
+    "num_workers": 12,
+}
+
+
 def _infer_tx_training_contract(embed_key: str | None, output_space: str) -> dict[str, Any]:
     if output_space == "embedding":
         return {
@@ -434,6 +472,7 @@ def _build_tx_train_plan(
     batch_encoder: bool | None,
     ckpt_every_n_steps: int | None,
     num_workers: int | None,
+    use_consecutive_loading: bool | None,
     extra_overrides: list[str] | None,
 ) -> dict[str, Any]:
     missing_fields: list[str] = []
@@ -466,8 +505,15 @@ def _build_tx_train_plan(
         validation_errors.append("`seed` must be >= 0.")
 
     model_preset_clean = str(model_preset or "").strip()
+    model_preset_clean = _PRESET_ALIASES.get(model_preset_clean, model_preset_clean)
     if not model_preset_clean:
         validation_errors.append("`model_preset` must be a non-empty model config name.")
+    elif model_preset_clean not in _KNOWN_PRESETS:
+        validation_warnings.append(
+            f"Model preset {model_preset_clean!r} is not a recognised preset "
+            f"(known: {', '.join(sorted(_KNOWN_PRESETS))}). "
+            "Hydra will raise an error at launch if the corresponding config file does not exist."
+        )
 
     if slurm_gpus is not None and slurm_gpus <= 0:
         validation_errors.append("`slurm_gpus` must be > 0 when provided.")
@@ -683,6 +729,8 @@ def _build_tx_train_plan(
         # Data overrides
         if resolved_num_workers is not None:
             _add_override("data.kwargs.num_workers", resolved_num_workers)
+        if use_consecutive_loading is not None:
+            _add_override("data.kwargs.use_consecutive_loading", str(use_consecutive_loading).lower())
 
     for extra in cleaned_extra_overrides:
         extra_key = _normalized_override_key(extra)
@@ -699,6 +747,38 @@ def _build_tx_train_plan(
         status = "needs_input"
     else:
         status = "ready"
+
+    preset_defaults = _PRESET_MODEL_DEFAULTS.get(model_preset_clean, {})
+
+    submission_hints: list[str] = []
+    if max_steps is None:
+        submission_hints.append(
+            f"max_steps not set — Hydra default is {_DEFAULT_TRAINING_PARAMS['max_steps']}. "
+            "Review before production runs."
+        )
+    if batch_size is None:
+        submission_hints.append(
+            f"batch_size not set — Hydra default is {_DEFAULT_TRAINING_PARAMS['batch_size']}. "
+            "For large datasets consider increasing (e.g. 64–128)."
+        )
+    if learning_rate is None:
+        submission_hints.append(
+            f"learning_rate not set — Hydra default is {_DEFAULT_TRAINING_PARAMS['learning_rate']}."
+        )
+    if val_freq is None:
+        submission_hints.append(
+            f"val_freq not set — Hydra default is {_DEFAULT_TRAINING_PARAMS['val_freq']} steps."
+        )
+    if use_consecutive_loading is None:
+        submission_hints.append(
+            "use_consecutive_loading not set — defaults to False (random per-epoch loading). "
+            "Set True when training on large concatenated h5ad files for more efficient sequential I/O."
+        )
+    if batch_encoder is None and preset_defaults.get("batch_encoder") is False:
+        submission_hints.append(
+            f"batch_encoder not set — '{model_preset_clean}' preset defaults to False. "
+            "Set True to condition the model on batch labels."
+        )
 
     return {
         "status": status,
@@ -758,8 +838,11 @@ def _build_tx_train_plan(
             },
             "resolved_data": {
                 "num_workers": resolved_num_workers,
+                "use_consecutive_loading": use_consecutive_loading,
             },
         },
+        "preset_defaults": preset_defaults,
+        "submission_hints": submission_hints,
         "toml_inspection": toml_inspection,
     }
 
@@ -1090,6 +1173,7 @@ def plan_tx_train(
     batch_encoder: bool | None = None,
     ckpt_every_n_steps: int | None = None,
     num_workers: int | None = None,
+    use_consecutive_loading: bool | None = None,
     extra_overrides: list[str] | None = None,
 ) -> dict[str, Any]:
     """
@@ -1099,6 +1183,12 @@ def plan_tx_train(
     - `needs_input`: required fields are missing — supply them and call again
     - `invalid`: values failed validation — check `validation_errors`
     - `ready`: launch-ready plan with resolved Hydra overrides
+
+    The response also includes:
+    - `preset_defaults`: key model kwargs from the chosen preset YAML (hidden_dim,
+      cell_set_len, batch_encoder, nb_loss) — review before submitting.
+    - `submission_hints`: list of plain-language nudges for parameters that were
+      left at Hydra defaults and are commonly worth reviewing before a production run.
 
     **Required fields** (status stays `needs_input` until all are set):
     - `toml_config_path`: path to the TX split TOML produced by `plan_tx_split_toml`
@@ -1115,34 +1205,40 @@ def plan_tx_train(
     - `cell_type_column`: obs column for cell-type labels (default auto-detected, fallback `"cell_type"`)
     - `batch_column`: obs column for batch labels (default auto-detected, fallback `"gem_group"`)
     - `control_perturbation`: label for control/unperturbed cells (default `"non-targeting"`)
+    - `use_consecutive_loading`: if True, load h5ad files sequentially rather than randomly
+      across epochs — more efficient I/O for large concatenated files (default False).
 
     **Model presets** (`model_preset`):
     - `"state"` (default): hidden_dim=384, cell_set_len=64, 8 transformer layers, 12 heads
     - `"state_sm"`: hidden_dim=672, cell_set_len=128, 4 transformer layers, 8 heads
     - `"state_lg"`: hidden_dim=1488, cell_set_len=512, 6 transformer layers, 12 heads
+    - `"context_mean"` (alias `"cmean"`): hidden_dim=512, cell_set_len=512, GPT-2 backbone
+    - `"perturb_mean"` (alias `"pmean"`): hidden_dim=512, cell_set_len=512, GPT-2 backbone
+    Preset defaults are returned in `preset_defaults` so you can confirm them before launch.
 
     **Model architecture overrides** (override preset defaults):
     - `hidden_dim`: transformer hidden dimension (must be > 0)
     - `cell_set_len`: number of cells per set/context (must be > 0)
     - `nb_loss`: use negative binomial loss (default false)
-    - `batch_encoder`: enable batch encoder (default false)
+    - `batch_encoder`: enable batch encoder to condition on batch labels (default false)
 
     **Training parameters:**
-    - `max_steps`: maximum training steps (default 400000 from Hydra config)
-    - `batch_size`: training batch size (default 16 from Hydra config)
-    - `learning_rate`: learning rate (default 1e-4 from Hydra config)
-    - `val_freq`: validation frequency in steps (default 5000 from Hydra config)
+    - `max_steps`: maximum training steps (Hydra default: 100000)
+    - `batch_size`: training batch size (Hydra default: 16; consider 64–128 for large datasets)
+    - `learning_rate`: learning rate (Hydra default: 1e-4)
+    - `val_freq`: validation frequency in steps (Hydra default: 2000)
     - `seed`: random seed (default 42)
     - `ckpt_every_n_steps`: checkpoint save frequency in steps (must be > 0)
 
     **Data parameters:**
-    - `num_workers`: dataloader worker count (must be >= 0).
+    - `num_workers`: dataloader worker count (Hydra default: 12; must be >= 0).
       Auto-set from `slurm_cpus_per_task` if not provided explicitly.
+    - `use_consecutive_loading`: see Data / column parameters above.
 
-    **W&B parameters:**
+    **W&B parameters** (use these dedicated params — do NOT set via `extra_overrides`):
     - `use_wandb`: `"auto"` (detect credentials), `"true"`, or `"false"`
     - `wandb_project`: W&B project name (Hydra key `wandb.project`)
-    - `wandb_entity`: W&B entity/team (Hydra key `wandb.entity`)
+    - `wandb_entity`: W&B entity/team name (Hydra key `wandb.entity`)
     - `wandb_tags`: list of W&B tags (Hydra key `wandb.tags`)
 
     **Backend / Slurm parameters:**
@@ -1155,8 +1251,9 @@ def plan_tx_train(
     - `slurm_time`: time limit, e.g. `"2-00:00:00"` (maps to `--time`)
 
     **Advanced:**
-    - `extra_overrides`: raw Hydra overrides appended after all curated ones
-      (can override any curated key; a warning is emitted for conflicts)
+    - `extra_overrides`: raw Hydra overrides appended after all curated ones.
+      Use only for parameters that have no dedicated first-class argument above.
+      A warning is emitted if an extra override duplicates a curated key.
     """
     return _build_tx_train_plan(
         toml_config_path=toml_config_path,
@@ -1191,6 +1288,7 @@ def plan_tx_train(
         batch_encoder=batch_encoder,
         ckpt_every_n_steps=ckpt_every_n_steps,
         num_workers=num_workers,
+        use_consecutive_loading=use_consecutive_loading,
         extra_overrides=extra_overrides,
     )
 
@@ -1229,6 +1327,7 @@ def run_tx_train(
     batch_encoder: bool | None = None,
     ckpt_every_n_steps: int | None = None,
     num_workers: int | None = None,
+    use_consecutive_loading: bool | None = None,
     extra_overrides: list[str] | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -1268,6 +1367,7 @@ def run_tx_train(
         batch_encoder=batch_encoder,
         ckpt_every_n_steps=ckpt_every_n_steps,
         num_workers=num_workers,
+        use_consecutive_loading=use_consecutive_loading,
         extra_overrides=extra_overrides,
         idempotency_key=idempotency_key,
     )
@@ -1307,6 +1407,7 @@ def start_tx_train(
     batch_encoder: bool | None = None,
     ckpt_every_n_steps: int | None = None,
     num_workers: int | None = None,
+    use_consecutive_loading: bool | None = None,
     extra_overrides: list[str] | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
@@ -1315,9 +1416,10 @@ def start_tx_train(
 
     Recommended workflow:
     1) call `plan_tx_train` until status is `ready`
-    2) call `start_tx_train`
-    3) poll via `get_tx_train_status` and `get_tx_train_logs`
-    4) optionally cancel via `cancel_tx_train`
+    2) review `submission_hints` and `preset_defaults` in the plan response
+    3) call `start_tx_train`
+    4) poll via `get_tx_train_status` and `get_tx_train_logs`
+    5) optionally cancel via `cancel_tx_train`
     """
     plan = _build_tx_train_plan(
         toml_config_path=toml_config_path,
@@ -1352,6 +1454,7 @@ def start_tx_train(
         batch_encoder=batch_encoder,
         ckpt_every_n_steps=ckpt_every_n_steps,
         num_workers=num_workers,
+        use_consecutive_loading=use_consecutive_loading,
         extra_overrides=extra_overrides,
     )
 
