@@ -101,7 +101,10 @@ def _submit_slurm_job(
         resource_args.extend(["--time", slurm_time])
 
     src_root = str(Path(__file__).resolve().parents[2])
+    # venv may live at project_root/.venv (one level above src/) or at src/.venv
     venv_python = Path(src_root) / ".venv" / "bin" / "python"
+    if not venv_python.is_file():
+        venv_python = Path(__file__).resolve().parents[3] / ".venv" / "bin" / "python"
     if venv_python.is_file():
         python_exe = str(venv_python.resolve())
     else:
