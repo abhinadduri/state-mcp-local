@@ -3031,8 +3031,17 @@ def start_preprocess_train(
     8. Compute knockdown efficiency (before log1p)
     9. Apply log1p transformation
     10. Compute log fold change (after log1p)
-    11. Optional HVG selection (num_hvgs)
+    11. Optional HVG selection (num_hvgs) — stores HVG expression in obsm['X_hvg']
     12. Write output file
+
+    **sort_by**: list of obs columns to sort cells by. Sorting produces contiguous
+    groups required by `use_consecutive_loading=True` in TX training. Typical
+    value: `["context", "perturbation"]` (or the raw column names, e.g.
+    `["cell_type", "perturbation"]`).
+
+    **num_hvgs**: when set, runs `sc.pp.highly_variable_genes` and stores the
+    HVG expression sub-matrix in `obsm['X_hvg']`. Useful for
+    `output_space='gene'` (legacy: `output_space='hvg'`) training.
 
     Poll status with `get_preprocess_train_status`, fetch logs with `get_preprocess_train_logs`,
     and cancel with `cancel_preprocess_train`.

@@ -43,7 +43,14 @@ def add_arguments_preprocess_train(parser: ap.ArgumentParser):
     parser.add_argument("--batch-col", type=str, default=None, help="obs column to combine with context into obs['batch_col']")
 
     # Ordering
-    parser.add_argument("--sort-by", type=str, nargs="*", default=[], help="Sort cells by these obs columns")
+    parser.add_argument(
+        "--sort-by",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Sort cells by these obs columns (e.g., --sort-by context perturbation). "
+        "Sorting produces contiguous groups required by use_consecutive_loading=True in TX training.",
+    )
 
     # Gene alignment
     parser.add_argument("--gene-set", type=str, default=None, help="Path to .npy file with ordered gene names")
