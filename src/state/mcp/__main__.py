@@ -26,24 +26,30 @@ from .mcp_utils import (
 
 from ._jobs import (
     InferenceJob,
+    PreprocessJob,
     TrainJob,
     _CANCEL_GRACE_SECONDS,
     _FALLBACK_SESSION_KEY,
     _JOBS,
     _JOBS_LOCK,
+    _PREPROCESS_JOBS_LOCK,
     _SESSION_SERVER_STATE_LOCK,
     _TERMINAL_JOB_STATUSES,
     _TRAIN_JOBS_LOCK,
     _append_job_log,
+    _append_preprocess_job_log,
     _append_train_job_log,
     _get_job_locked,
+    _get_preprocess_job_locked,
     _get_session_jobs_locked,
+    _get_session_preprocess_jobs_locked,
     _get_session_server_state_locked,
     _get_session_train_idempotency_locked,
     _get_session_train_jobs_locked,
     _get_train_job_locked,
     _get_worker_mp_context,
     _touch_job,
+    _touch_preprocess_job,
     _touch_train_job,
     _utc_now_iso,
 )
@@ -59,6 +65,7 @@ from ._slurm import (
 from ._workers import (
     _run_emb_inference_job_worker,
     _run_inference_job_worker,
+    _run_preprocess_job_worker,
     _run_tx_train_job_worker,
 )
 
@@ -71,10 +78,13 @@ from ._gpu import (
 from ._sync import (
     _process_alive,
     _recommend_poll_interval_seconds,
+    _recommend_preprocess_poll_interval_seconds,
     _recommend_train_poll_interval_seconds,
     _release_job_runtime_resources,
+    _release_preprocess_job_runtime_resources,
     _release_train_job_runtime_resources,
     _sync_job_state_locked,
+    _sync_preprocess_job_state_locked,
     _sync_train_job_state_locked,
 )
 
@@ -2894,6 +2904,374 @@ def cancel_tx_inference(job_id: str, force: bool = False) -> dict[str, Any]:
             "scancel_sent": scancel_sent,
             "scancel_exit_code": scancel_exit_code,
             "scancel_message": scancel_message,
+            "recommended_poll_interval_seconds": poll_interval,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing tools
+# ---------------------------------------------------------------------------
+
+def _resolve_preprocess_request(
+    *,
+    input_paths: list[str] | None,
+    input_pattern: str | None,
+    exclude_patterns: list[str] | None,
+    output_dir: str,
+    target_sum: float | None,
+    already_log1p: bool,
+    perturbation_col: str,
+    control_perturbation: str,
+    context_col: str | None,
+    batch_col: str | None,
+    sort_by: list[str] | None,
+    gene_set: str | None,
+    add_pert_efficiency: bool,
+    efficiency_key: str,
+    target_fc_key: str,
+    eps: float,
+    downsample_frac: float,
+    num_hvgs: int | None,
+    seed: int,
+    overwrite: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Validate inputs and return a serializable config dict."""
+    resolved_output_dir = str(Path(output_dir).expanduser().resolve())
+    resolved_input_paths: list[str] = []
+    if input_paths:
+        for p in input_paths:
+            rp = str(Path(p).expanduser().resolve())
+            if not Path(rp).is_file():
+                raise FileNotFoundError(f"Input file not found: {rp}")
+            resolved_input_paths.append(rp)
+
+    if not resolved_input_paths and not input_pattern:
+        raise ValueError("Either `input_paths` or `input_pattern` must be provided.")
+
+    resolved_gene_set: str | None = None
+    if gene_set is not None:
+        resolved_gene_set = str(Path(gene_set).expanduser().resolve())
+        if not Path(resolved_gene_set).is_file():
+            raise FileNotFoundError(f"Gene set file not found: {resolved_gene_set}")
+
+    if downsample_frac <= 0 or downsample_frac > 1.0:
+        raise ValueError("`downsample_frac` must be in (0, 1].")
+    if num_hvgs is not None and num_hvgs <= 0:
+        raise ValueError("`num_hvgs` must be > 0 when provided.")
+    if target_sum is not None and target_sum <= 0:
+        raise ValueError("`target_sum` must be > 0 when provided.")
+
+    return {
+        "input_paths": resolved_input_paths,
+        "input_pattern": input_pattern,
+        "exclude_patterns": exclude_patterns or [],
+        "output_dir": resolved_output_dir,
+        "target_sum": target_sum,
+        "already_log1p": already_log1p,
+        "perturbation_col": perturbation_col,
+        "control_perturbation": control_perturbation,
+        "context_col": context_col,
+        "batch_col": batch_col,
+        "sort_by": sort_by or [],
+        "gene_set": resolved_gene_set,
+        "add_pert_efficiency": add_pert_efficiency,
+        "efficiency_key": efficiency_key,
+        "target_fc_key": target_fc_key,
+        "eps": eps,
+        "downsample_frac": downsample_frac,
+        "num_hvgs": num_hvgs,
+        "seed": seed,
+        "overwrite": overwrite,
+        "dry_run": dry_run,
+    }
+
+
+@mcp.tool()
+def start_preprocess_train(
+    output_dir: str,
+    input_paths: list[str] | None = None,
+    input_pattern: str | None = None,
+    exclude_patterns: list[str] | None = None,
+    target_sum: float | None = None,
+    already_log1p: bool = False,
+    perturbation_col: str = "target_gene",
+    control_perturbation: str = "non-targeting",
+    context_col: str | None = None,
+    batch_col: str | None = None,
+    sort_by: list[str] | None = None,
+    gene_set: str | None = None,
+    add_pert_efficiency: bool = True,
+    efficiency_key: str = "KnockDownEfficiency",
+    target_fc_key: str = "KnockDownGeneFC",
+    eps: float = 1e-8,
+    downsample_frac: float = 1.0,
+    num_hvgs: int | None = None,
+    seed: int = 42,
+    overwrite: bool = False,
+    dry_run: bool = False,
+    backend: str = "local",
+    backend_profile: str | None = None,
+    slurm_partition: str | None = None,
+    slurm_cpus_per_task: int | None = None,
+    slurm_mem: str | None = None,
+    slurm_time: str | None = None,
+) -> dict[str, Any]:
+    """
+    Start TX training data preprocessing in the background and return a `job_id` immediately.
+
+    Full pert-transform pipeline per file:
+    1. Optional gene alignment to gene_set (.npy)
+    2. Standardize perturbation column names (renamed to 'perturbation', control to 'control')
+    3. Apply context/batch column mapping
+    4. Sort cells by specified obs columns (for consecutive-loading compatibility)
+    5. Optional expm1 (undo log1p if already_log1p=True)
+    6. Optional binomial downsampling
+    7. Normalize total counts (sc.pp.normalize_total)
+    8. Compute knockdown efficiency (before log1p)
+    9. Apply log1p transformation
+    10. Compute log fold change (after log1p)
+    11. Optional HVG selection (num_hvgs)
+    12. Write output file
+
+    Poll status with `get_preprocess_train_status`, fetch logs with `get_preprocess_train_logs`,
+    and cancel with `cancel_preprocess_train`.
+    """
+    config_dict = _resolve_preprocess_request(
+        input_paths=input_paths,
+        input_pattern=input_pattern,
+        exclude_patterns=exclude_patterns,
+        output_dir=output_dir,
+        target_sum=target_sum,
+        already_log1p=already_log1p,
+        perturbation_col=perturbation_col,
+        control_perturbation=control_perturbation,
+        context_col=context_col,
+        batch_col=batch_col,
+        sort_by=sort_by,
+        gene_set=gene_set,
+        add_pert_efficiency=add_pert_efficiency,
+        efficiency_key=efficiency_key,
+        target_fc_key=target_fc_key,
+        eps=eps,
+        downsample_frac=downsample_frac,
+        num_hvgs=num_hvgs,
+        seed=seed,
+        overwrite=overwrite,
+        dry_run=dry_run,
+    )
+
+    session_key = _get_current_session_key()
+    backend_mode, backend_reason = _resolve_backend_mode(backend)
+
+    job_id = uuid4().hex
+    job = PreprocessJob(
+        job_id=job_id,
+        status="queued",
+        created_at=_utc_now_iso(),
+        output_dir=config_dict["output_dir"],
+        resolved_config=config_dict,
+        backend=backend_mode,
+        backend_profile=backend_profile,
+    )
+    _append_preprocess_job_log(job, "[queued] Preprocess job queued.")
+
+    with _PREPROCESS_JOBS_LOCK:
+        preprocess_jobs = _get_session_preprocess_jobs_locked(session_key)
+        preprocess_jobs[job_id] = job
+
+    # Local backend (no GPU needed for preprocessing)
+    mp_ctx = _get_worker_mp_context()
+    parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
+    cancel_flag_path = str((Path("/tmp") / f"state_preprocess_cancel_{job_id}.flag").resolve())
+    worker_log_path = str((Path("/tmp") / f"state_preprocess_worker_{job_id}.log").resolve())
+    Path(cancel_flag_path).unlink(missing_ok=True)
+    process = mp_ctx.Process(
+        target=_run_preprocess_job_worker,
+        args=(config_dict, cancel_flag_path, child_conn, worker_log_path),
+        daemon=False,
+        name=f"state_preprocess_{job_id[:8]}",
+    )
+
+    job.event_conn = parent_conn
+    job.cancel_flag_path = cancel_flag_path
+    job.worker_log_path = worker_log_path
+    job.process = process
+
+    try:
+        process.start()
+        try:
+            child_conn.close()
+        except Exception:
+            pass
+    except Exception as exc:
+        with _PREPROCESS_JOBS_LOCK:
+            current = _get_session_preprocess_jobs_locked(session_key).get(job_id)
+            if current is not None:
+                current.status = "failed"
+                current.error = f"Failed to launch worker process: {type(exc).__name__}: {exc}"
+                current.finished_at = _utc_now_iso()
+                _append_preprocess_job_log(current, f"[failed] {current.error}")
+                _release_preprocess_job_runtime_resources(current)
+        try:
+            child_conn.close()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Unable to start preprocess worker process: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    with _PREPROCESS_JOBS_LOCK:
+        current = _get_session_preprocess_jobs_locked(session_key).get(job_id)
+        if current is not None:
+            current.worker_pid = process.pid
+            _sync_preprocess_job_state_locked(current)
+            poll_interval = _recommend_preprocess_poll_interval_seconds(current)
+        else:
+            poll_interval = 5.0
+
+    return {
+        "status": "started",
+        "job_id": job_id,
+        "backend": backend_mode,
+        "output_dir": config_dict["output_dir"],
+        "resolved_config": config_dict,
+        "worker_pid": process.pid,
+        "worker_log_path": worker_log_path,
+        "recommended_initial_poll_interval_seconds": poll_interval,
+    }
+
+
+@mcp.tool()
+def get_preprocess_train_status(job_id: str) -> dict[str, Any]:
+    """
+    Return status, progress, and adaptive polling hints for a background preprocess job.
+    """
+    session_key = _get_current_session_key()
+    with _PREPROCESS_JOBS_LOCK:
+        jobs_by_id = _get_session_preprocess_jobs_locked(session_key)
+        job = _get_preprocess_job_locked(job_id, jobs_by_id)
+        _sync_preprocess_job_state_locked(job)
+        progress = dict(job.progress)
+        seconds_since_update = max(0.0, time.monotonic() - float(job.last_update_monotonic))
+        recommended_poll = _recommend_preprocess_poll_interval_seconds(job)
+        recommended_log_poll = _recommend_preprocess_poll_interval_seconds(job, for_logs=True)
+        return {
+            "job_id": job.job_id,
+            "status": job.status,
+            "backend": job.backend,
+            "backend_profile": job.backend_profile,
+            "scheduler_job_id": job.scheduler_job_id,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "last_update_at": job.last_update_at,
+            "seconds_since_last_update": round(seconds_since_update, 0),
+            "cancel_requested": job.cancel_requested,
+            "cancel_requested_at": job.cancel_requested_at,
+            "error": job.error,
+            "output_dir": job.output_dir,
+            "resolved_config": job.resolved_config,
+            "progress": progress,
+            "last_event": job.last_event,
+            "log_line_count": len(job.logs),
+            "worker_pid": job.worker_pid,
+            "worker_exit_code": job.worker_exit_code,
+            "worker_log_path": job.worker_log_path,
+            "recommended_poll_interval_seconds": recommended_poll,
+            "recommended_log_poll_interval_seconds": recommended_log_poll,
+        }
+
+
+@mcp.tool()
+def get_preprocess_train_logs(job_id: str, from_line: int = 0, max_lines: int = 200) -> dict[str, Any]:
+    """
+    Return buffered logs for a background preprocess job plus a polling hint.
+    """
+    session_key = _get_current_session_key()
+    with _PREPROCESS_JOBS_LOCK:
+        jobs_by_id = _get_session_preprocess_jobs_locked(session_key)
+        job = _get_preprocess_job_locked(job_id, jobs_by_id)
+        _sync_preprocess_job_state_locked(job)
+
+        total_lines = len(job.logs)
+        start = max(0, min(from_line, total_lines))
+        end = min(start + max_lines, total_lines)
+        lines = job.logs[start:end]
+        recommended_poll = _recommend_preprocess_poll_interval_seconds(job, for_logs=True)
+
+        return {
+            "job_id": job_id,
+            "from_line": start,
+            "next_line": end,
+            "total_lines": total_lines,
+            "recommended_poll_interval_seconds": recommended_poll,
+            "lines": lines,
+        }
+
+
+@mcp.tool()
+def cancel_preprocess_train(job_id: str, force: bool = False) -> dict[str, Any]:
+    """
+    Request cancellation for a background preprocess job.
+
+    A graceful cancellation signal is sent first. If `force=True`, the worker
+    process is also sent SIGTERM immediately.
+    """
+    session_key = _get_current_session_key()
+    terminate_sent = False
+
+    with _PREPROCESS_JOBS_LOCK:
+        jobs_by_id = _get_session_preprocess_jobs_locked(session_key)
+        job = _get_preprocess_job_locked(job_id, jobs_by_id)
+        _sync_preprocess_job_state_locked(job)
+
+        if job.status in _TERMINAL_JOB_STATUSES:
+            return {
+                "job_id": job_id,
+                "status": job.status,
+                "cancel_requested": job.cancel_requested,
+                "message": f"Job already in terminal state: {job.status}.",
+            }
+
+        if not job.cancel_requested:
+            job.cancel_requested = True
+            job.cancel_requested_at = _utc_now_iso()
+            job.cancel_grace_deadline_monotonic = time.monotonic() + _CANCEL_GRACE_SECONDS
+
+            cancel_flag_path = job.cancel_flag_path
+            if isinstance(cancel_flag_path, str) and cancel_flag_path:
+                try:
+                    Path(cancel_flag_path).touch()
+                except Exception:
+                    pass
+
+            if job.status == "running":
+                job.status = "cancelling"
+            _append_preprocess_job_log(job, "[cancelling] Cancellation requested.")
+
+        if force and _process_alive(job.process):
+            try:
+                job.process.terminate()  # type: ignore[union-attr]
+                job.terminate_sent_at_monotonic = time.monotonic()
+                terminate_sent = True
+                _append_preprocess_job_log(job, "[cancelling] Force-cancel: sent SIGTERM.")
+            except Exception as exc:
+                _append_preprocess_job_log(
+                    job,
+                    f"[warning] Failed to terminate worker: {type(exc).__name__}: {exc}",
+                )
+
+        _sync_preprocess_job_state_locked(job)
+        poll_interval = _recommend_preprocess_poll_interval_seconds(job)
+
+        return {
+            "job_id": job_id,
+            "status": job.status,
+            "cancel_requested": job.cancel_requested,
+            "cancel_requested_at": job.cancel_requested_at,
+            "force": force,
+            "terminate_sent": terminate_sent,
             "recommended_poll_interval_seconds": poll_interval,
         }
 

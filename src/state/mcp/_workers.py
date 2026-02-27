@@ -10,6 +10,7 @@ from typing import Any
 
 from ._jobs import (
     EmbInferenceCancelledError,
+    PreprocessCancelledError,
     TxTrainCancelledError,
     _HEARTBEAT_INTERVAL_SECONDS,
     _utc_now_iso,
@@ -459,6 +460,128 @@ def _run_emb_inference_job_worker(
             }
         )
     except BaseException as exc:  # pragma: no cover - defensive guard around worker process.
+        emit(
+            {
+                "type": "status",
+                "status": "failed",
+                "finished_at": _utc_now_iso(),
+                "error": f"{type(exc).__name__}: {exc}",
+                "message": f"[failed] {type(exc).__name__}: {exc}",
+            }
+        )
+        emit({"type": "traceback", "traceback": traceback.format_exc().strip()})
+    finally:
+        heartbeat_stop.set()
+        try:
+            event_conn.close()
+        except Exception:
+            pass
+        if log_handle is not None:
+            try:
+                log_handle.flush()
+                log_handle.close()
+            except Exception:
+                pass
+
+
+def _run_preprocess_job_worker(
+    config_dict: dict[str, Any],
+    cancel_flag_path: str,
+    event_conn: Any,
+    worker_log_path: str,
+) -> None:
+    """Worker function for background preprocess job (no GPU needed)."""
+    log_handle = None
+    if worker_log_path:
+        try:
+            Path(worker_log_path).parent.mkdir(parents=True, exist_ok=True)
+            log_handle = open(worker_log_path, "a", encoding="utf-8", buffering=1)
+            os.dup2(log_handle.fileno(), 1)
+            os.dup2(log_handle.fileno(), 2)
+            sys.stdout = log_handle
+            sys.stderr = log_handle
+        except Exception:
+            log_handle = None
+
+    heartbeat_stop = threading.Event()
+
+    def emit(payload: dict[str, Any]) -> None:
+        _emit_worker_message(event_conn, payload)
+
+    def heartbeat_loop() -> None:
+        while not heartbeat_stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
+            emit({"type": "heartbeat"})
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        daemon=True,
+        name="state_preprocess_heartbeat",
+    )
+    heartbeat_thread.start()
+
+    def cancellation_requested() -> bool:
+        try:
+            return Path(cancel_flag_path).exists()
+        except Exception:
+            return False
+
+    def progress_callback(event: dict[str, Any]) -> None:
+        emit({"type": "event", "event": dict(event)})
+
+    emit(
+        {
+            "type": "status",
+            "status": "running",
+            "started_at": _utc_now_iso(),
+            "message": "Preprocess job started.",
+        }
+    )
+
+    try:
+        from ..tx.preprocess import PreprocessTrainConfig, normalize_transform_files
+        from ..tx.preprocess.core import PreprocessCancelledError as CoreCancelledError
+
+        config = PreprocessTrainConfig(**config_dict)
+        result = normalize_transform_files(
+            config,
+            progress_callback=progress_callback,
+            cancel_check=cancellation_requested,
+        )
+
+        emit(
+            {
+                "type": "event",
+                "event": {
+                    "kind": "progress",
+                    "phase": "completed",
+                    "files_done": result.files_processed,
+                    "files_total": result.files_processed + result.files_skipped,
+                    "message": (
+                        f"Preprocessing complete: {result.files_processed} files processed, "
+                        f"{result.files_skipped} skipped, {result.total_cells:,} total cells."
+                    ),
+                },
+            }
+        )
+        emit(
+            {
+                "type": "status",
+                "status": "succeeded",
+                "finished_at": _utc_now_iso(),
+                "message": "[succeeded] Preprocessing completed.",
+            }
+        )
+    except CoreCancelledError as exc:
+        emit(
+            {
+                "type": "status",
+                "status": "cancelled",
+                "finished_at": _utc_now_iso(),
+                "error": str(exc),
+                "message": f"[cancelled] {exc}",
+            }
+        )
+    except BaseException as exc:
         emit(
             {
                 "type": "status",

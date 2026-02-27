@@ -9,14 +9,17 @@ from typing import Any
 
 from ._jobs import (
     InferenceJob,
+    PreprocessJob,
     TrainJob,
     _CANCEL_GRACE_SECONDS,
     _MAX_EVENT_DRAIN,
     _TERMINAL_JOB_STATUSES,
     _TERMINATE_GRACE_SECONDS,
     _append_job_log,
+    _append_preprocess_job_log,
     _append_train_job_log,
     _touch_job,
+    _touch_preprocess_job,
     _touch_train_job,
     _utc_now_iso,
 )
@@ -758,3 +761,264 @@ def _sync_train_job_state_locked(job: TrainJob) -> None:
         job.finished_at = _utc_now_iso()
 
     _release_train_job_runtime_resources(job)
+
+
+# ---------------------------------------------------------------------------
+# Preprocess job helpers
+# ---------------------------------------------------------------------------
+
+def _ingest_preprocess_worker_log_lines(job: PreprocessJob) -> None:
+    log_path = job.worker_log_path
+    if not isinstance(log_path, str) or not log_path.strip():
+        return
+    path_obj = Path(log_path)
+    if not path_obj.is_file():
+        return
+
+    try:
+        with path_obj.open("rb") as f:
+            f.seek(job.worker_log_read_offset)
+            chunk = f.read()
+            job.worker_log_read_offset = f.tell()
+    except Exception:
+        return
+
+    if not chunk:
+        return
+    try:
+        text = chunk.decode("utf-8", errors="replace")
+    except Exception:
+        return
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        _append_preprocess_job_log(job, f"[worker] {line}")
+
+
+def _record_preprocess_job_event(job: PreprocessJob, event: dict[str, Any]) -> None:
+    _touch_preprocess_job(job)
+    job.last_event = dict(event)
+    progress: dict[str, Any] = {
+        "kind": event.get("kind"),
+        "phase": event.get("phase"),
+        "files_done": event.get("files_done"),
+        "files_total": event.get("files_total"),
+        "current_file": event.get("current_file"),
+        "message": event.get("message"),
+    }
+    files_done = event.get("files_done")
+    files_total = event.get("files_total")
+    if isinstance(files_done, int) and isinstance(files_total, int) and files_total > 0:
+        progress["percent"] = round((files_done / files_total) * 100.0, 3)
+    job.progress = progress
+
+    message = event.get("message")
+    if isinstance(message, str) and message.strip():
+        kind = str(event.get("kind") or "event")
+        _append_preprocess_job_log(job, f"[{kind}] {message}")
+
+
+def _apply_preprocess_worker_message(job: PreprocessJob, message: dict[str, Any]) -> None:
+    if not isinstance(message, dict):
+        return
+
+    msg_type = message.get("type")
+    if msg_type == "event":
+        event = message.get("event")
+        if isinstance(event, dict):
+            _record_preprocess_job_event(job, event)
+        return
+
+    if msg_type == "heartbeat":
+        _touch_preprocess_job(job)
+        current_progress = dict(job.progress)
+        current_progress["worker_heartbeat_at"] = job.last_update_at
+        job.progress = current_progress
+        return
+
+    if msg_type == "status":
+        _touch_preprocess_job(job)
+        status_value = message.get("status")
+        if isinstance(status_value, str) and status_value:
+            if not (status_value == "running" and job.cancel_requested):
+                job.status = status_value
+        started_at = message.get("started_at")
+        if isinstance(started_at, str) and started_at:
+            job.started_at = started_at
+        finished_at = message.get("finished_at")
+        if isinstance(finished_at, str) and finished_at:
+            job.finished_at = finished_at
+        error = message.get("error")
+        if isinstance(error, str) and error.strip():
+            job.error = error
+        note = message.get("message")
+        if isinstance(note, str) and note.strip():
+            _append_preprocess_job_log(job, note)
+        return
+
+    if msg_type == "traceback":
+        trace = message.get("traceback")
+        if isinstance(trace, str) and trace.strip():
+            _append_preprocess_job_log(job, trace.strip())
+        return
+
+
+def _drain_preprocess_job_events_locked(job: PreprocessJob) -> None:
+    event_conn = job.event_conn
+    if event_conn is None:
+        return
+
+    drained = 0
+    while drained < _MAX_EVENT_DRAIN:
+        try:
+            if not event_conn.poll(0):
+                break
+            message = event_conn.recv()
+        except (EOFError, OSError, ValueError):
+            break
+        drained += 1
+        _apply_preprocess_worker_message(job, message)
+
+    if drained >= _MAX_EVENT_DRAIN:
+        _append_preprocess_job_log(job, f"[warning] Drained {_MAX_EVENT_DRAIN} worker events; additional events remain queued.")
+
+
+def _release_preprocess_job_runtime_resources(job: PreprocessJob) -> None:
+    process = job.process
+    if process is not None:
+        try:
+            if process.exitcode is not None:
+                job.worker_exit_code = int(process.exitcode)
+        except Exception:
+            pass
+        try:
+            process.join(timeout=0)
+        except Exception:
+            pass
+    event_conn = job.event_conn
+    if event_conn is not None:
+        try:
+            event_conn.close()
+        except Exception:
+            pass
+    cancel_flag_path = job.cancel_flag_path
+    if isinstance(cancel_flag_path, str) and cancel_flag_path:
+        try:
+            Path(cancel_flag_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+    job.process = None
+    job.event_conn = None
+    job.cancel_flag_path = None
+
+
+def _recommend_preprocess_poll_interval_seconds(job: PreprocessJob, *, for_logs: bool = False) -> float | None:
+    if job.status in _TERMINAL_JOB_STATUSES:
+        return None
+    if job.status == "queued":
+        interval = 3.0
+    elif job.status == "cancelling":
+        interval = 4.0
+    else:
+        interval = 5.0
+
+    seconds_since_update = max(0.0, time.monotonic() - float(job.last_update_monotonic))
+    if job.status == "running" and seconds_since_update >= 120.0:
+        interval = max(interval, 15.0)
+
+    if for_logs:
+        interval = max(interval * 1.5, 6.0)
+
+    return round(interval, 1)
+
+
+def _sync_preprocess_job_state_locked(job: PreprocessJob) -> None:
+    _ingest_preprocess_worker_log_lines(job)
+
+    if job.backend == "slurm":
+        if isinstance(job.scheduler_job_id, str) and job.scheduler_job_id.strip():
+            state = _query_slurm_state(job.scheduler_job_id)
+            if isinstance(state, str) and state:
+                mapped = _map_slurm_state_to_job_status(state)
+                current_progress = dict(job.progress)
+                current_progress["scheduler_state"] = state
+                job.progress = current_progress
+                _touch_preprocess_job(job)
+
+                if mapped == "running" and job.started_at is None:
+                    job.started_at = _utc_now_iso()
+
+                if mapped in _TERMINAL_JOB_STATUSES:
+                    if job.status not in _TERMINAL_JOB_STATUSES:
+                        job.status = mapped
+                    if mapped == "failed" and not job.error:
+                        job.error = f"Slurm job ended in state {state}."
+                    if mapped == "cancelled" and not job.error:
+                        job.error = f"Slurm job cancelled (state={state})."
+                    if job.finished_at is None:
+                        job.finished_at = _utc_now_iso()
+                elif job.status != "cancelling":
+                    job.status = mapped
+        return
+
+    _drain_preprocess_job_events_locked(job)
+
+    process = job.process
+    if process is None:
+        return
+
+    if job.worker_pid is None and process.pid is not None:
+        job.worker_pid = int(process.pid)
+
+    now = time.monotonic()
+    if job.cancel_requested and _process_alive(process):
+        deadline = job.cancel_grace_deadline_monotonic
+        if deadline is not None and now >= deadline and job.terminate_sent_at_monotonic is None:
+            try:
+                process.terminate()
+                job.terminate_sent_at_monotonic = now
+                _append_preprocess_job_log(job, "[cancelling] Cancellation grace elapsed; sent SIGTERM to worker process.")
+            except Exception as exc:
+                _append_preprocess_job_log(job, f"[warning] Failed to terminate worker process cleanly: {type(exc).__name__}: {exc}")
+        elif (
+            job.terminate_sent_at_monotonic is not None
+            and now >= (job.terminate_sent_at_monotonic + _TERMINATE_GRACE_SECONDS)
+            and _process_alive(process)
+        ):
+            try:
+                process.kill()
+                job.terminate_sent_at_monotonic = now
+                _append_preprocess_job_log(job, "[cancelling] Worker did not exit after SIGTERM; sent SIGKILL.")
+            except Exception as exc:
+                _append_preprocess_job_log(job, f"[warning] Failed to force-kill worker process: {type(exc).__name__}: {exc}")
+
+    if _process_alive(process):
+        return
+
+    try:
+        exit_code = process.exitcode
+    except Exception:
+        exit_code = None
+    if isinstance(exit_code, int):
+        job.worker_exit_code = exit_code
+
+    if job.status not in _TERMINAL_JOB_STATUSES:
+        if job.cancel_requested:
+            job.status = "cancelled"
+            if not job.error:
+                job.error = "Preprocessing cancelled by request."
+            _append_preprocess_job_log(job, "[cancelled] Preprocessing cancelled.")
+        elif exit_code == 0:
+            job.status = "succeeded"
+            _append_preprocess_job_log(job, "[succeeded] Preprocessing completed.")
+        else:
+            job.status = "failed"
+            if not job.error:
+                job.error = f"Worker process exited unexpectedly with code {exit_code}."
+            _append_preprocess_job_log(job, f"[failed] {job.error}")
+
+    if job.finished_at is None:
+        job.finished_at = _utc_now_iso()
+
+    _release_preprocess_job_runtime_resources(job)

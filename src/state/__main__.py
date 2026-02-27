@@ -125,7 +125,7 @@ def main():
                     run_tx_infer(args)
                 case "preprocess_train":
                     # Run preprocessing using argparse
-                    run_tx_preprocess_train(args.adata, args.output, args.num_hvgs)
+                    run_tx_preprocess_train(args)
 
 
 if __name__ == "__main__":
