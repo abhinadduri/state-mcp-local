@@ -62,6 +62,12 @@ from ._workers import (
     _run_tx_train_job_worker,
 )
 
+from ._gpu import (
+    find_free_devices,
+    is_nvidia_smi_available,
+    query_gpu_devices,
+)
+
 from ._sync import (
     _process_alive,
     _recommend_poll_interval_seconds,
@@ -164,6 +170,25 @@ def _normalize_wandb_mode(use_wandb: str) -> str:
     if mode not in {"auto", "true", "false"}:
         raise ValueError("`use_wandb` must be one of: 'auto', 'true', 'false'.")
     return mode
+
+
+def _resolve_cuda_devices_for_local(
+    cuda_devices: str | None,
+    backend_mode: str,
+) -> tuple[str | None, bool]:
+    """Resolve CUDA_VISIBLE_DEVICES for a local backend job.
+
+    Returns ``(resolved_cuda_devices, auto_assigned)``.
+    """
+    if backend_mode != "local":
+        return None, False
+    if cuda_devices is not None:
+        return str(cuda_devices).strip(), False
+    if is_nvidia_smi_available():
+        free = find_free_devices(1)
+        if free:
+            return str(free[0]), True
+    return None, False
 
 
 def _resolve_tx_inference_request(
@@ -819,6 +844,18 @@ def _build_tx_train_plan(
                 f"{', '.join(wandb_detail_hints)} not set. Consider specifying these "
                 "for better experiment organization and tracking."
             )
+    if backend_mode == "local" and is_nvidia_smi_available():
+        free = find_free_devices(1)
+        if free:
+            submission_hints.append(
+                f"Local GPU detected. Least-loaded device is currently GPU {free[0]}. "
+                "A free GPU will be auto-assigned via cuda_devices if not set explicitly."
+            )
+        else:
+            submission_hints.append(
+                "Local GPUs detected but none are currently free (all above utilization/memory "
+                "thresholds). Consider waiting or explicitly setting cuda_devices."
+            )
 
     return {
         "status": status,
@@ -932,6 +969,27 @@ def clear_tx_model_folder() -> dict[str, str]:
         state = _get_session_server_state_locked(session_key)
         state["tx_model_folder"] = None
     return {"status": "cleared"}
+
+
+@mcp.tool()
+def query_gpus() -> dict[str, Any]:
+    """
+    Query local NVIDIA GPU devices and return per-device status information.
+
+    Returns device index, name, memory (total/used/free in MB), GPU utilization
+    percentage, temperature, and PIDs of processes running on each device.
+
+    Useful for checking GPU availability before launching local training or
+    inference jobs with the `cuda_devices` parameter. Returns an empty device
+    list if nvidia-smi is not available.
+    """
+    available = is_nvidia_smi_available()
+    devices = query_gpu_devices() if available else []
+    return {
+        "nvidia_smi_available": available,
+        "device_count": len(devices),
+        "devices": devices,
+    }
 
 
 @mcp.tool()
@@ -1373,6 +1431,7 @@ def run_tx_train(
     use_consecutive_loading: bool | None = None,
     extra_overrides: list[str] | None = None,
     idempotency_key: str | None = None,
+    cuda_devices: str | None = None,
 ) -> dict[str, Any]:
     """
     Start TX training asynchronously. Legacy alias for `start_tx_train`.
@@ -1413,6 +1472,7 @@ def run_tx_train(
         use_consecutive_loading=use_consecutive_loading,
         extra_overrides=extra_overrides,
         idempotency_key=idempotency_key,
+        cuda_devices=cuda_devices,
     )
 
 
@@ -1453,6 +1513,7 @@ def start_tx_train(
     use_consecutive_loading: bool | None = None,
     extra_overrides: list[str] | None = None,
     idempotency_key: str | None = None,
+    cuda_devices: str | None = None,
 ) -> dict[str, Any]:
     """
     Start TX training in the background and return a `job_id` immediately.
@@ -1631,6 +1692,8 @@ def start_tx_train(
             "recommended_initial_poll_interval_seconds": poll_interval,
         }
 
+    resolved_cuda_devices, cuda_auto_assigned = _resolve_cuda_devices_for_local(cuda_devices, backend_mode)
+
     mp_ctx = _get_worker_mp_context()
     parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
     cancel_flag_path = str((Path("/tmp") / f"state_tx_train_cancel_{job_id}.flag").resolve())
@@ -1641,7 +1704,7 @@ def start_tx_train(
     Path(cancel_flag_path).unlink(missing_ok=True)
     process = mp_ctx.Process(
         target=_run_tx_train_job_worker,
-        args=(resolved_overrides, cancel_flag_path, child_conn, worker_log_path),
+        args=(resolved_overrides, cancel_flag_path, child_conn, worker_log_path, resolved_cuda_devices),
         daemon=True,
         name=f"state_tx_train_{job_id[:8]}",
     )
@@ -1692,6 +1755,8 @@ def start_tx_train(
         "resolved": resolved,
         "worker_pid": process.pid,
         "worker_log_path": worker_log_path,
+        "cuda_devices": resolved_cuda_devices,
+        "cuda_auto_assigned": cuda_auto_assigned,
         "recommended_initial_poll_interval_seconds": poll_interval,
     }
 
@@ -1948,6 +2013,7 @@ def run_emb_inference(
     slurm_cpus_per_task: int | None = None,
     slurm_mem: str | None = None,
     slurm_time: str | None = None,
+    cuda_devices: str | None = None,
 ) -> dict[str, Any]:
     """
     Start STATE embedding inference in the background and return a `job_id` immediately.
@@ -1972,6 +2038,7 @@ def run_emb_inference(
         slurm_cpus_per_task=slurm_cpus_per_task,
         slurm_mem=slurm_mem,
         slurm_time=slurm_time,
+        cuda_devices=cuda_devices,
     )
 
 @mcp.tool()
@@ -1991,6 +2058,7 @@ def start_emb_inference(
     slurm_cpus_per_task: int | None = None,
     slurm_mem: str | None = None,
     slurm_time: str | None = None,
+    cuda_devices: str | None = None,
 ) -> dict[str, Any]:
     """
     Start embedding inference in the background and return a `job_id` immediately.
@@ -2097,6 +2165,8 @@ def start_emb_inference(
             "recommended_initial_poll_interval_seconds": poll_interval,
         }
 
+    resolved_cuda_devices, cuda_auto_assigned = _resolve_cuda_devices_for_local(cuda_devices, backend_mode)
+
     mp_ctx = _get_worker_mp_context()
     parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
     cancel_flag_path = str((Path("/tmp") / f"state_emb_cancel_{job_id}.flag").resolve())
@@ -2104,7 +2174,7 @@ def start_emb_inference(
     Path(cancel_flag_path).unlink(missing_ok=True)
     process = mp_ctx.Process(
         target=_run_emb_inference_job_worker,
-        args=(resolved, cancel_flag_path, child_conn, worker_log_path),
+        args=(resolved, cancel_flag_path, child_conn, worker_log_path, resolved_cuda_devices),
         daemon=True,
         name=f"state_emb_infer_{job_id[:8]}",
     )
@@ -2150,6 +2220,8 @@ def start_emb_inference(
         **resolved,
         "worker_pid": process.pid,
         "worker_log_path": worker_log_path,
+        "cuda_devices": resolved_cuda_devices,
+        "cuda_auto_assigned": cuda_auto_assigned,
         "recommended_initial_poll_interval_seconds": poll_interval,
     }
 
@@ -2370,6 +2442,7 @@ def start_tx_inference(
     slurm_cpus_per_task: int | None = None,
     slurm_mem: str | None = None,
     slurm_time: str | None = None,
+    cuda_devices: str | None = None,
 ) -> dict[str, Any]:
     """
     Start tx inference in the background and return a `job_id` immediately.
@@ -2485,6 +2558,8 @@ def start_tx_inference(
             "recommended_initial_poll_interval_seconds": poll_interval,
         }
 
+    resolved_cuda_devices, cuda_auto_assigned = _resolve_cuda_devices_for_local(cuda_devices, backend_mode)
+
     mp_ctx = _get_worker_mp_context()
     parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
     cancel_flag_path = str((Path("/tmp") / f"state_tx_cancel_{job_id}.flag").resolve())
@@ -2492,7 +2567,7 @@ def start_tx_inference(
     Path(cancel_flag_path).unlink(missing_ok=True)
     process = mp_ctx.Process(
         target=_run_inference_job_worker,
-        args=(infer_args, cancel_flag_path, child_conn, worker_log_path),
+        args=(infer_args, cancel_flag_path, child_conn, worker_log_path, resolved_cuda_devices),
         daemon=True,
         name=f"state_tx_infer_{job_id[:8]}",
     )
@@ -2538,6 +2613,8 @@ def start_tx_inference(
         **resolved,
         "worker_pid": process.pid,
         "worker_log_path": worker_log_path,
+        "cuda_devices": resolved_cuda_devices,
+        "cuda_auto_assigned": cuda_auto_assigned,
         "recommended_initial_poll_interval_seconds": poll_interval,
     }
 

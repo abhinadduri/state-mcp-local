@@ -28,7 +28,11 @@ def _run_tx_train_job_worker(
     cancel_flag_path: str,
     event_conn: Any,
     worker_log_path: str,
+    cuda_devices: str | None = None,
 ) -> None:
+    if cuda_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+
     from ..__main__ import load_hydra_config
     from .._cli._tx._train import run_tx_train
 
@@ -155,7 +159,10 @@ def _run_tx_train_job_worker(
                 pass
 
 
-def _run_inference_job_worker(infer_args: Namespace, cancel_flag_path: str, event_conn: Any, worker_log_path: str) -> None:
+def _run_inference_job_worker(infer_args: Namespace, cancel_flag_path: str, event_conn: Any, worker_log_path: str, cuda_devices: str | None = None) -> None:
+    if cuda_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+
     from .._cli._tx._infer import InferenceCancelledError, run_tx_infer
 
     log_handle = None
@@ -257,7 +264,11 @@ def _run_emb_inference_job_worker(
     cancel_flag_path: str,
     event_conn: Any,
     worker_log_path: str,
+    cuda_devices: str | None = None,
 ) -> None:
+    if cuda_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+
     log_handle = None
     if worker_log_path:
         try:
