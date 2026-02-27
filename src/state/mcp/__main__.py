@@ -877,10 +877,18 @@ def _build_tx_train_plan(
             f"val_freq not set — Hydra default is {_DEFAULT_TRAINING_PARAMS['val_freq']} steps."
         )
     if use_consecutive_loading is None:
-        submission_hints.append(
-            "use_consecutive_loading not set — defaults to False (random per-epoch loading). "
-            "Set True when training on large concatenated h5ad files for more efficient sequential I/O."
-        )
+        if resolved_output_space == "all":
+            submission_hints.append(
+                "use_consecutive_loading not set — defaults to False. "
+                "RECOMMENDED for output_space='all' (full transcriptome): set True "
+                "for significantly faster I/O. Requires data to be sorted by condition "
+                "(training will fail early with a clear error if not)."
+            )
+        else:
+            submission_hints.append(
+                "use_consecutive_loading not set — defaults to False (random per-epoch loading). "
+                "Set True when training on large concatenated h5ad files for more efficient sequential I/O."
+            )
     if batch_encoder is None and preset_defaults.get("batch_encoder") is False:
         submission_hints.append(
             f"batch_encoder not set — '{model_preset_clean}' preset defaults to False. "
@@ -1788,7 +1796,7 @@ def start_tx_train(
     process = mp_ctx.Process(
         target=_run_tx_train_job_worker,
         args=(resolved_overrides, cancel_flag_path, child_conn, worker_log_path, resolved_cuda_devices),
-        daemon=True,
+        daemon=False,
         name=f"state_tx_train_{job_id[:8]}",
     )
 
@@ -2258,7 +2266,7 @@ def start_emb_inference(
     process = mp_ctx.Process(
         target=_run_emb_inference_job_worker,
         args=(resolved, cancel_flag_path, child_conn, worker_log_path, resolved_cuda_devices),
-        daemon=True,
+        daemon=False,
         name=f"state_emb_infer_{job_id[:8]}",
     )
 
@@ -2651,7 +2659,7 @@ def start_tx_inference(
     process = mp_ctx.Process(
         target=_run_inference_job_worker,
         args=(infer_args, cancel_flag_path, child_conn, worker_log_path, resolved_cuda_devices),
-        daemon=True,
+        daemon=False,
         name=f"state_tx_infer_{job_id[:8]}",
     )
 
