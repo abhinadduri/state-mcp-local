@@ -779,6 +779,46 @@ def _build_tx_train_plan(
             f"batch_encoder not set — '{model_preset_clean}' preset defaults to False. "
             "Set True to condition the model on batch labels."
         )
+    if backend_mode == "slurm":
+        if slurm_gpus is None:
+            submission_hints.append(
+                "slurm_gpus not set — a default of 1 GPU is applied at submission. "
+                "Set explicitly to request more GPUs for larger models."
+            )
+        if slurm_partition is None:
+            submission_hints.append(
+                "slurm_partition not set — the job will use the cluster's default partition. "
+                "Set to target a specific partition (e.g. 'gpu', 'preemptible')."
+            )
+        if slurm_time is None:
+            submission_hints.append(
+                "slurm_time not set — the job will use the partition's default time limit. "
+                "Set to a specific limit (e.g. '2-00:00:00' for 2 days) for long training runs."
+            )
+        if slurm_mem is None:
+            submission_hints.append(
+                "slurm_mem not set — the job will use the partition's default memory allocation. "
+                "Set explicitly (e.g. '256G') for large datasets."
+            )
+        if slurm_cpus_per_task is None:
+            submission_hints.append(
+                "slurm_cpus_per_task not set — also controls num_workers for data loading "
+                "when num_workers is not set explicitly."
+            )
+    if wandb_enabled:
+        wandb_detail_hints: list[str] = []
+        if wandb_project is None:
+            wandb_detail_hints.append("wandb_project")
+        if wandb_entity is None:
+            wandb_detail_hints.append("wandb_entity")
+        if not wandb_tags:
+            wandb_detail_hints.append("wandb_tags")
+        if wandb_detail_hints:
+            submission_hints.append(
+                f"W&B logging is enabled ({wandb_reason.rstrip('.')}), but "
+                f"{', '.join(wandb_detail_hints)} not set. Consider specifying these "
+                "for better experiment organization and tracking."
+            )
 
     return {
         "status": status,
@@ -810,6 +850,7 @@ def _build_tx_train_plan(
             "resolved_slurm": {
                 "partition": slurm_partition,
                 "gpus": slurm_gpus,
+                "gpus_effective": slurm_gpus if slurm_gpus is not None else (1 if backend_mode == "slurm" else None),
                 "cpus_per_task": slurm_cpus_per_task,
                 "mem": slurm_mem,
                 "time": slurm_time,
@@ -1189,6 +1230,8 @@ def plan_tx_train(
       cell_set_len, batch_encoder, nb_loss) — review before submitting.
     - `submission_hints`: list of plain-language nudges for parameters that were
       left at Hydra defaults and are commonly worth reviewing before a production run.
+      Includes GPU allocation reminders for Slurm backends and W&B organization
+      details (project, entity, tags) when W&B credentials are detected.
 
     **Required fields** (status stays `needs_input` until all are set):
     - `toml_config_path`: path to the TX split TOML produced by `plan_tx_split_toml`

@@ -306,6 +306,10 @@ def _run_emb_inference_job_worker(
     )
 
     try:
+        # Daemon processes cannot spawn children, so force the DataLoader
+        # to run in the main process (num_workers=0) when running locally.
+        os.environ["STATE_EMB_NUM_WORKERS"] = "0"
+
         output_path_resolved = resolved.get("output_path")
         if isinstance(output_path_resolved, str):
             Path(output_path_resolved).parent.mkdir(parents=True, exist_ok=True)

@@ -80,7 +80,9 @@ def _submit_slurm_job(
         raise RuntimeError("`sbatch` was not found in PATH.")
 
     if run_dir is None or not str(run_dir).strip():
-        run_dir_path = (Path("/tmp") / f"{job_name_prefix}_{job_id}").resolve()
+        # Use ~/.state/mcp/runs/ instead of /tmp/ so logs are on a shared
+        # filesystem and accessible from the login node after Slurm jobs finish.
+        run_dir_path = (Path.home() / ".state" / "mcp" / "runs" / f"{job_name_prefix}_{job_id}").resolve()
     else:
         run_dir_path = Path(run_dir).expanduser().resolve()
     run_dir_path.mkdir(parents=True, exist_ok=True)
@@ -106,7 +108,10 @@ def _submit_slurm_job(
     if not venv_python.is_file():
         venv_python = Path(__file__).resolve().parents[3] / ".venv" / "bin" / "python"
     if venv_python.is_file():
-        python_exe = str(venv_python.resolve())
+        # Use absolute path but do NOT .resolve() — resolving follows symlinks
+        # to the raw CPython binary, which bypasses the venv's pyvenv.cfg and
+        # site-packages.  The venv launcher symlink must be preserved.
+        python_exe = str(venv_python.absolute())
     else:
         python_exe = str(Path(sys.executable).resolve())
     full_cmd = [python_exe, *command]
@@ -169,6 +174,7 @@ def _submit_tx_train_slurm_job(
     slurm_cpus_per_task: int | None = None,
     slurm_mem: str | None = None,
     slurm_time: str | None = None,
+    default_gpus: int | None = 1,
 ) -> dict[str, Any]:
     command = ["-m", "state", "tx", "train", *hydra_overrides]
     return _submit_slurm_job(
@@ -183,6 +189,7 @@ def _submit_tx_train_slurm_job(
         slurm_cpus_per_task=slurm_cpus_per_task,
         slurm_mem=slurm_mem,
         slurm_time=slurm_time,
+        default_gpus=default_gpus,
     )
 
 
