@@ -396,7 +396,7 @@ def run_tx_predict(args: ap.ArgumentParser):
         )
 
     if args.pseudobulk:
-        logger.info("Pseudobulk enabled; aggregating running means by (context, perturbation).")
+        logger.info("Pseudobulk enabled; aggregating by (context, perturbation).")
 
         if args.eval_train_data:
             results_dir = os.path.join(args.output_dir, "eval_train_" + os.path.basename(args.checkpoint))
@@ -412,6 +412,19 @@ def run_tx_predict(args: ap.ArgumentParser):
                 pseudo_x_dim = gene_dim
             else:
                 raise ValueError(f"Unsupported output_space for pseudobulk: {output_space}")
+
+        # If outputs are log1p-scaled expression, aggregate in count space and convert
+        # back to log1p only for eval matrices.
+        aggregate_main_in_count_space = bool((not use_count_outputs) and metrics_is_log1p and output_space != "embedding")
+        aggregate_gene_in_count_space = bool(use_count_outputs and metrics_is_log1p)
+        if aggregate_main_in_count_space or aggregate_gene_in_count_space:
+            logger.info(
+                "Pseudobulk scale handling: detected log1p outputs; accumulating sums in count space via expm1."
+            )
+        else:
+            logger.info(
+                "Pseudobulk scale handling: using direct summation (no expm1 conversion before aggregation)."
+            )
 
         pb_groups: dict[tuple[str, str], dict] = {}
         context_mode = None
@@ -459,11 +472,30 @@ def run_tx_predict(args: ap.ArgumentParser):
                 batch_pred_np = batch_preds["preds"].cpu().numpy().astype(np.float32)
                 batch_real_np = batch_preds["pert_cell_emb"].cpu().numpy().astype(np.float32)
 
+                if aggregate_main_in_count_space:
+                    batch_pred_pb_np = np.expm1(batch_pred_np.astype(np.float64, copy=False))
+                    batch_real_pb_np = np.expm1(batch_real_np.astype(np.float64, copy=False))
+                    np.clip(batch_pred_pb_np, a_min=0.0, a_max=None, out=batch_pred_pb_np)
+                    np.clip(batch_real_pb_np, a_min=0.0, a_max=None, out=batch_real_pb_np)
+                else:
+                    batch_pred_pb_np = batch_pred_np
+                    batch_real_pb_np = batch_real_np
+
                 batch_real_gene_np = None
                 batch_gene_pred_np = None
+                batch_real_gene_pb_np = None
+                batch_gene_pred_pb_np = None
                 if use_count_outputs:
                     batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().numpy().astype(np.float32)
                     batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().numpy().astype(np.float32)
+                    if aggregate_gene_in_count_space:
+                        batch_real_gene_pb_np = np.expm1(batch_real_gene_np.astype(np.float64, copy=False))
+                        batch_gene_pred_pb_np = np.expm1(batch_gene_pred_np.astype(np.float64, copy=False))
+                        np.clip(batch_real_gene_pb_np, a_min=0.0, a_max=None, out=batch_real_gene_pb_np)
+                        np.clip(batch_gene_pred_pb_np, a_min=0.0, a_max=None, out=batch_gene_pred_pb_np)
+                    else:
+                        batch_real_gene_pb_np = batch_real_gene_np
+                        batch_gene_pred_pb_np = batch_gene_pred_np
 
                 group_to_indices: dict[tuple[str, str], list[int]] = {}
                 for idx in range(batch_size):
@@ -497,11 +529,11 @@ def run_tx_predict(args: ap.ArgumentParser):
                         )
 
                     entry["count"] += int(idx_arr.size)
-                    entry["pred_sum"] += batch_pred_np[idx_arr].sum(axis=0, dtype=np.float64)
-                    entry["real_sum"] += batch_real_np[idx_arr].sum(axis=0, dtype=np.float64)
+                    entry["pred_sum"] += batch_pred_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
+                    entry["real_sum"] += batch_real_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
                     if use_count_outputs:
-                        entry["x_hvg_sum"] += batch_real_gene_np[idx_arr].sum(axis=0, dtype=np.float64)
-                        entry["counts_pred_sum"] += batch_gene_pred_np[idx_arr].sum(axis=0, dtype=np.float64)
+                        entry["x_hvg_sum"] += batch_real_gene_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
+                        entry["counts_pred_sum"] += batch_gene_pred_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
 
         if len(pb_groups) == 0:
             logger.warning("No pseudobulk groups were generated. Exiting.")
@@ -517,10 +549,17 @@ def run_tx_predict(args: ap.ArgumentParser):
         group_entries.sort(key=lambda x: (str(x["celltype_name"]), str(x["context"]), str(x["pert_name"])))
         n_groups = len(group_entries)
 
-        pred_bulk = np.empty((n_groups, output_dim), dtype=np.float32)
-        real_bulk = np.empty((n_groups, output_dim), dtype=np.float32)
-        pred_x = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
-        real_x = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
+        # Keep both views:
+        # - sum matrices for persisted pseudobulk outputs
+        # - eval matrices for cell-eval (log1p(sum) when inputs are log1p, mean otherwise)
+        pred_bulk_sum = np.empty((n_groups, output_dim), dtype=np.float32)
+        real_bulk_sum = np.empty((n_groups, output_dim), dtype=np.float32)
+        pred_bulk_eval = np.empty((n_groups, output_dim), dtype=np.float32)
+        real_bulk_eval = np.empty((n_groups, output_dim), dtype=np.float32)
+        pred_x_sum = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
+        real_x_sum = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
+        pred_x_eval = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
+        real_x_eval = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
 
         reserved_obs_keys = {
             str(data_module.pert_col),
@@ -549,11 +588,24 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         for idx, entry in enumerate(group_entries):
             count = int(entry["count"])
-            pred_bulk[idx, :] = entry["pred_sum"].astype(np.float32, copy=False)
-            real_bulk[idx, :] = entry["real_sum"].astype(np.float32, copy=False)
+            denom = float(count)
+            pred_bulk_sum[idx, :] = entry["pred_sum"].astype(np.float32, copy=False)
+            real_bulk_sum[idx, :] = entry["real_sum"].astype(np.float32, copy=False)
+            if aggregate_main_in_count_space:
+                pred_bulk_eval[idx, :] = np.log1p(entry["pred_sum"]).astype(np.float32, copy=False)
+                real_bulk_eval[idx, :] = np.log1p(entry["real_sum"]).astype(np.float32, copy=False)
+            else:
+                pred_bulk_eval[idx, :] = (entry["pred_sum"] / denom).astype(np.float32, copy=False)
+                real_bulk_eval[idx, :] = (entry["real_sum"] / denom).astype(np.float32, copy=False)
             if use_count_outputs:
-                pred_x[idx, :] = entry["counts_pred_sum"].astype(np.float32, copy=False)
-                real_x[idx, :] = entry["x_hvg_sum"].astype(np.float32, copy=False)
+                pred_x_sum[idx, :] = entry["counts_pred_sum"].astype(np.float32, copy=False)
+                real_x_sum[idx, :] = entry["x_hvg_sum"].astype(np.float32, copy=False)
+                if aggregate_gene_in_count_space:
+                    pred_x_eval[idx, :] = np.log1p(entry["counts_pred_sum"]).astype(np.float32, copy=False)
+                    real_x_eval[idx, :] = np.log1p(entry["x_hvg_sum"]).astype(np.float32, copy=False)
+                else:
+                    pred_x_eval[idx, :] = (entry["counts_pred_sum"] / denom).astype(np.float32, copy=False)
+                    real_x_eval[idx, :] = (entry["x_hvg_sum"] / denom).astype(np.float32, copy=False)
 
             obs_dict[data_module.pert_col].append(entry["pert_name"])
             obs_dict[data_module.cell_type_key].append(entry["celltype_name"])
@@ -565,19 +617,49 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         obs = pd.DataFrame(obs_dict)
         if use_count_outputs:
-            adata_pred = anndata.AnnData(X=pred_x, obs=obs)
-            adata_real = anndata.AnnData(X=real_x, obs=obs)
+            # Persisted outputs: summed pseudobulks.
+            adata_pred = anndata.AnnData(X=pred_x_sum, obs=obs)
+            adata_real = anndata.AnnData(X=real_x_sum, obs=obs)
             if data_module.embed_key is not None:
-                adata_pred.obsm[data_module.embed_key] = pred_bulk
-                adata_real.obsm[data_module.embed_key] = real_bulk
+                adata_pred.obsm[data_module.embed_key] = pred_bulk_sum
+                adata_real.obsm[data_module.embed_key] = real_bulk_sum
+
+            # Metric inputs: log1p(sum) pseudobulks for log1p outputs, mean otherwise.
+            adata_pred_eval = anndata.AnnData(X=pred_x_eval, obs=obs.copy())
+            adata_real_eval = anndata.AnnData(X=real_x_eval, obs=obs.copy())
+            if data_module.embed_key is not None:
+                adata_pred_eval.obsm[data_module.embed_key] = pred_bulk_eval
+                adata_real_eval.obsm[data_module.embed_key] = real_bulk_eval
         else:
-            adata_pred = anndata.AnnData(X=pred_bulk, obs=obs)
-            adata_real = anndata.AnnData(X=real_bulk, obs=obs)
+            # Persisted outputs: summed pseudobulks.
+            adata_pred = anndata.AnnData(X=pred_bulk_sum, obs=obs)
+            adata_real = anndata.AnnData(X=real_bulk_sum, obs=obs)
+            # Metric inputs: log1p(sum) pseudobulks for log1p outputs, mean otherwise.
+            adata_pred_eval = anndata.AnnData(X=pred_bulk_eval, obs=obs.copy())
+            adata_real_eval = anndata.AnnData(X=real_bulk_eval, obs=obs.copy())
+
+        persist_mode = "sum(expm1(log1p(x)))" if (aggregate_main_in_count_space or aggregate_gene_in_count_space) else "sum(x)"
+        eval_mode = "log1p(sum(expm1(log1p(x))))" if (aggregate_main_in_count_space or aggregate_gene_in_count_space) else "mean(x)"
+        pseudobulk_meta = {
+            "persisted_aggregation": persist_mode,
+            "eval_aggregation": eval_mode,
+            "n_cells_obs_column": pseudobulk_n_cells_key,
+        }
+        adata_pred.uns["pseudobulk_aggregation"] = dict(pseudobulk_meta)
+        adata_real.uns["pseudobulk_aggregation"] = dict(pseudobulk_meta)
+        adata_pred_eval.uns["pseudobulk_aggregation"] = dict(pseudobulk_meta)
+        adata_real_eval.uns["pseudobulk_aggregation"] = dict(pseudobulk_meta)
 
         if nb_loss_enabled:
-            logger.info("nb_loss=True in run config; skipping pseudobulk clipping of adata_pred/adata_real X values.")
+            logger.info(
+                "nb_loss=True in run config; keeping summed pseudobulk outputs unchanged and skipping metric clipping."
+            )
         else:
-            logger.info("Skipping pseudobulk clipping to preserve summed values in adata_pred/adata_real X.")
+            clip_anndata_values(adata_pred_eval, max_value=14.0)
+            clip_anndata_values(adata_real_eval, max_value=14.0)
+            logger.info(
+                "Prepared summed pseudobulk outputs; clipped eval pseudobulks to [0.0, 14.0] for cell-eval metrics."
+            )
 
         if args.shared_only:
             try:
@@ -589,14 +671,16 @@ def run_tx_predict(args: ap.ArgumentParser):
                         "Filtering pseudobulk rows to %d shared perturbations present in train ∩ test.",
                         len(shared_perts),
                     )
-                    mask = adata_pred.obs[data_module.pert_col].isin(shared_perts)
-                    before_n = adata_pred.n_obs
+                    mask = adata_pred_eval.obs[data_module.pert_col].isin(shared_perts)
+                    before_n = adata_pred_eval.n_obs
                     adata_pred = adata_pred[mask].copy()
                     adata_real = adata_real[mask].copy()
+                    adata_pred_eval = adata_pred_eval[mask].copy()
+                    adata_real_eval = adata_real_eval[mask].copy()
                     logger.info(
                         "Filtered pseudobulk rows: %d -> %d (kept only seen perturbations)",
                         before_n,
-                        adata_pred.n_obs,
+                        adata_pred_eval.n_obs,
                     )
             except Exception as e:
                 logger.warning(
@@ -617,8 +701,8 @@ def run_tx_predict(args: ap.ArgumentParser):
         if not args.predict_only:
             logger.info("Computing metrics using cell-eval...")
             control_pert = data_module.get_control_pert()
-            ct_split_real = split_anndata_on_celltype(adata=adata_real, celltype_col=data_module.cell_type_key)
-            ct_split_pred = split_anndata_on_celltype(adata=adata_pred, celltype_col=data_module.cell_type_key)
+            ct_split_real = split_anndata_on_celltype(adata=adata_real_eval, celltype_col=data_module.cell_type_key)
+            ct_split_pred = split_anndata_on_celltype(adata=adata_pred_eval, celltype_col=data_module.cell_type_key)
 
             assert len(ct_split_real) == len(ct_split_pred), (
                 f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
