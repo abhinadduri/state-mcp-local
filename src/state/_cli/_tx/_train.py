@@ -68,7 +68,10 @@ def run_tx_train(cfg: DictConfig):
         except:
             sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
 
+    _OUTPUT_SPACE_ALIASES = {"hvg": "gene", "transcriptome": "all"}
     output_space = cfg["data"]["kwargs"].get("output_space", "gene")
+    output_space = _OUTPUT_SPACE_ALIASES.get(output_space.strip().lower(), output_space)
+    cfg["data"]["kwargs"]["output_space"] = output_space
     assert output_space in {"embedding", "gene", "all"}, (
         f"data.kwargs.output_space must be one of 'embedding', 'gene', or 'all'; got {output_space!r}"
     )

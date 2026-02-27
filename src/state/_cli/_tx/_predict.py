@@ -243,7 +243,9 @@ def run_tx_predict(args: ap.ArgumentParser):
         data_module._setup_global_maps()
     data_module.setup(stage="test")
     nb_loss_enabled = bool(cfg.get("model", {}).get("kwargs", {}).get("nb_loss", False))
+    _OUTPUT_SPACE_ALIASES = {"hvg": "gene", "transcriptome": "all"}
     output_space = cfg.get("data", {}).get("kwargs", {}).get("output_space", "gene")
+    output_space = _OUTPUT_SPACE_ALIASES.get(output_space.strip().lower(), output_space)
     if nb_loss_enabled and output_space == "embedding":
         raise ValueError(
             "model.kwargs.nb_loss=True is incompatible with data.kwargs.output_space='embedding'. "

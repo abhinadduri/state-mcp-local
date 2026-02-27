@@ -411,6 +411,8 @@ _PRESET_ALIASES: dict[str, str] = {
     "pmean": "perturb_mean",
 }
 
+_OUTPUT_SPACE_ALIASES: dict[str, str] = {"hvg": "gene", "transcriptome": "all"}
+
 _KNOWN_PRESETS: set[str] = {
     "state", "state_sm", "state_lg",
     "context_mean", "perturb_mean",
@@ -661,11 +663,13 @@ def _build_tx_train_plan(
         resolved_embed_key = None
 
     resolved_output_space = output_space.strip().lower() if isinstance(output_space, str) and output_space.strip() else None
+    if resolved_output_space is not None:
+        resolved_output_space = _OUTPUT_SPACE_ALIASES.get(resolved_output_space, resolved_output_space)
     if resolved_output_space is None:
         resolved_output_space = "gene" if resolved_embed_key in {None, "X_hvg"} else "all"
     if resolved_output_space not in {"gene", "all", "embedding"}:
         validation_errors.append(
-            f"`output_space` must be one of 'gene', 'all', or 'embedding'; got {resolved_output_space!r}."
+            f"`output_space` must be one of 'gene', 'all', 'embedding' (aliases: 'hvg' -> 'gene', 'transcriptome' -> 'all'); got {resolved_output_space!r}."
         )
         resolved_output_space = "gene"
 
@@ -679,6 +683,84 @@ def _build_tx_train_plan(
             resolved_control_pert = "[('DMSO_TF', 0.0, 'uM')]"
         else:
             resolved_control_pert = "non-targeting"
+
+    # --- Column validation against sample schema ---
+    if sample_schema is not None:
+        obs_column_names: set[str] = set()
+        obsm_keys: set[str] = set()
+        for _col_info in sample_schema.get("obs_columns", []):
+            if isinstance(_col_info, dict) and isinstance(_col_info.get("name"), str):
+                obs_column_names.add(_col_info["name"])
+        for _obsm_info in sample_schema.get("obsm", []):
+            if isinstance(_obsm_info, dict) and isinstance(_obsm_info.get("key"), str):
+                obsm_keys.add(_obsm_info["key"])
+
+        suggestions["available_obs_columns"] = sorted(obs_column_names)
+        suggestions["available_obsm_keys"] = sorted(obsm_keys)
+
+        _pert_user = isinstance(perturbation_column, str) and bool(perturbation_column.strip())
+        _ct_user = isinstance(cell_type_column, str) and bool(cell_type_column.strip())
+        _batch_user = isinstance(batch_column, str) and bool(batch_column.strip())
+        _ctrl_user = isinstance(control_perturbation, str) and bool(control_perturbation.strip())
+
+        for _param, _val, _user in [
+            ("perturbation_column", resolved_perturbation_column, _pert_user),
+            ("cell_type_column", resolved_cell_type_column, _ct_user),
+            ("batch_column", resolved_batch_column, _batch_user),
+        ]:
+            if _val not in obs_column_names:
+                _avail = ", ".join(sorted(obs_column_names)[:20])
+                if _user:
+                    validation_warnings.append(
+                        f"`{_param}` = {_val!r} not found in sample data obs columns. "
+                        f"Available: [{_avail}]"
+                    )
+                else:
+                    missing_fields.append(_param)
+                    suggestions[f"{_param}_reason"] = (
+                        f"Auto-default {_val!r} not found in sample data. "
+                        f"Available obs columns: [{_avail}]"
+                    )
+
+        if resolved_embed_key is not None and resolved_embed_key not in obsm_keys:
+            _avail_obsm = ", ".join(sorted(obsm_keys)[:20])
+            validation_warnings.append(
+                f"`embed_key` = {resolved_embed_key!r} not found in sample data obsm keys. "
+                f"Available: [{_avail_obsm}]"
+            )
+
+        # Validate control_perturbation against perturbation column values
+        if resolved_perturbation_column in obs_column_names:
+            _pert_top_values: set[str] = set()
+            for _col_info in sample_schema.get("obs_columns", []):
+                if isinstance(_col_info, dict) and _col_info.get("name") == resolved_perturbation_column:
+                    for _tv in _col_info.get("top_values", []):
+                        if isinstance(_tv, dict) and isinstance(_tv.get("value"), str):
+                            _pert_top_values.add(_tv["value"])
+                    break
+            _ctrl_candidates = sample_schema.get("control_label_candidates", [])
+            _known_ctrl = {
+                c["value"] for c in _ctrl_candidates
+                if isinstance(c, dict) and isinstance(c.get("value"), str)
+            }
+            if resolved_control_pert not in _pert_top_values and resolved_control_pert not in _known_ctrl:
+                _suggestion_vals = [
+                    c.get("value") for c in _ctrl_candidates[:5]
+                    if isinstance(c, dict)
+                ]
+                if _ctrl_user:
+                    validation_warnings.append(
+                        f"`control_perturbation` = {resolved_control_pert!r} not found among "
+                        f"top perturbation values or known control labels. "
+                        f"Candidates: {_suggestion_vals}"
+                    )
+                else:
+                    missing_fields.append("control_perturbation")
+                    suggestions["control_perturbation_reason"] = (
+                        f"Auto-default {resolved_control_pert!r} not found among "
+                        f"top perturbation values or known control labels. "
+                        f"Candidates: {_suggestion_vals}"
+                    )
 
     wandb_enabled: bool
     wandb_reason: str
@@ -1299,9 +1381,10 @@ def plan_tx_train(
     **Data / column parameters:**
     - `embed_key`: obsm key for pre-computed embeddings (e.g. `"X_state"`).
       Set to `"null"` or omit to train without embeddings.
-    - `output_space`: `"gene"` (expression only, default when no embed_key),
-      `"all"` (expression + embedding, default when embed_key is set),
+    - `output_space`: `"gene"` (HVG expression only, default when no embed_key),
+      `"all"` (full transcriptome / all genes, default when embed_key is set),
       or `"embedding"` (embedding-space only).
+      Aliases: `"hvg"` -> `"gene"`, `"transcriptome"` -> `"all"`.
     - `perturbation_column`: obs column for perturbation labels (default auto-detected, fallback `"gene"`)
     - `cell_type_column`: obs column for cell-type labels (default auto-detected, fallback `"cell_type"`)
     - `batch_column`: obs column for batch labels (default auto-detected, fallback `"gem_group"`)

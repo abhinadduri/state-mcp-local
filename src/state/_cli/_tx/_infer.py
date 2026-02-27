@@ -590,7 +590,9 @@ def run_tx_infer(args: argparse.Namespace):
     if set_batch_size <= 0:
         raise ValueError(f"--set-batch-size must be a positive integer, got {set_batch_size}")
     uses_batch_encoder = getattr(model, "batch_encoder", None) is not None
+    _OUTPUT_SPACE_ALIASES = {"hvg": "gene", "transcriptome": "all"}
     output_space = getattr(model, "output_space", cfg.get("data", {}).get("kwargs", {}).get("output_space", "gene"))
+    output_space = _OUTPUT_SPACE_ALIASES.get(output_space.strip().lower(), output_space)
     nb_loss_enabled = bool(getattr(model, "nb_loss", cfg.get("model", {}).get("kwargs", {}).get("nb_loss", False)))
     if nb_loss_enabled and output_space == "embedding":
         raise ValueError(
