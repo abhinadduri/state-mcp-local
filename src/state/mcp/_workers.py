@@ -10,6 +10,7 @@ from typing import Any
 
 from ._jobs import (
     EmbInferenceCancelledError,
+    PredictCancelledError,
     PreprocessCancelledError,
     TxTrainCancelledError,
     _HEARTBEAT_INTERVAL_SECONDS,
@@ -592,6 +593,112 @@ def _run_preprocess_job_worker(
             }
         )
         emit({"type": "traceback", "traceback": traceback.format_exc().strip()})
+    finally:
+        heartbeat_stop.set()
+        try:
+            event_conn.close()
+        except Exception:
+            pass
+        if log_handle is not None:
+            try:
+                log_handle.flush()
+                log_handle.close()
+            except Exception:
+                pass
+
+
+def _run_predict_job_worker(
+    predict_args: Namespace,
+    cancel_flag_path: str,
+    event_conn: Any,
+    worker_log_path: str,
+    cuda_devices: str | None = None,
+) -> None:
+    if cuda_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
+
+    from .._cli._tx._predict import run_tx_predict
+
+    log_handle = None
+    if worker_log_path:
+        try:
+            Path(worker_log_path).parent.mkdir(parents=True, exist_ok=True)
+            log_handle = open(worker_log_path, "a", encoding="utf-8", buffering=1)
+            os.dup2(log_handle.fileno(), 1)
+            os.dup2(log_handle.fileno(), 2)
+            sys.stdout = log_handle
+            sys.stderr = log_handle
+        except Exception:
+            log_handle = None
+
+    heartbeat_stop = threading.Event()
+
+    def emit(payload: dict[str, Any]) -> None:
+        _emit_worker_message(event_conn, payload)
+
+    def heartbeat_loop() -> None:
+        while not heartbeat_stop.wait(_HEARTBEAT_INTERVAL_SECONDS):
+            emit({"type": "heartbeat"})
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        daemon=True,
+        name="state_tx_predict_worker_heartbeat",
+    )
+    heartbeat_thread.start()
+
+    def cancel_check() -> bool:
+        try:
+            return Path(cancel_flag_path).exists()
+        except Exception:
+            return False
+
+    def progress_callback(event: dict[str, Any]) -> None:
+        emit({"type": "event", "event": dict(event)})
+
+    setattr(predict_args, "cancel_check", cancel_check)
+    setattr(predict_args, "progress_callback", progress_callback)
+    emit(
+        {
+            "type": "status",
+            "status": "running",
+            "started_at": _utc_now_iso(),
+            "message": "Predict job started.",
+        }
+    )
+
+    try:
+        run_tx_predict(predict_args)
+    except PredictCancelledError as exc:
+        emit(
+            {
+                "type": "status",
+                "status": "cancelled",
+                "finished_at": _utc_now_iso(),
+                "error": str(exc),
+                "message": f"[cancelled] {exc}",
+            }
+        )
+    except BaseException as exc:  # pragma: no cover - defensive guard around worker process.
+        emit(
+            {
+                "type": "status",
+                "status": "failed",
+                "finished_at": _utc_now_iso(),
+                "error": f"{type(exc).__name__}: {exc}",
+                "message": f"[failed] {type(exc).__name__}: {exc}",
+            }
+        )
+        emit({"type": "traceback", "traceback": traceback.format_exc().strip()})
+    else:
+        emit(
+            {
+                "type": "status",
+                "status": "succeeded",
+                "finished_at": _utc_now_iso(),
+                "message": "[succeeded] Predict job completed.",
+            }
+        )
     finally:
         heartbeat_stop.set()
         try:

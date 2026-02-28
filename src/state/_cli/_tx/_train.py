@@ -410,6 +410,7 @@ def run_tx_train(cfg: DictConfig):
             model,
             datamodule=data_module,
             ckpt_path=checkpoint_path,
+            weights_only=False,
         )
         logger.info("trainer.fit() completed")
 

@@ -128,6 +128,10 @@ class PreprocessCancelledError(RuntimeError):
     pass
 
 
+class PredictCancelledError(RuntimeError):
+    pass
+
+
 # ---------------------------------------------------------------------------
 # State containers + locks
 # ---------------------------------------------------------------------------

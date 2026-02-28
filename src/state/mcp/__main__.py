@@ -57,6 +57,7 @@ from ._jobs import (
 from ._slurm import (
     _build_emb_transform_cli_args,
     _build_tx_infer_cli_args,
+    _build_tx_predict_cli_args,
     _resolve_backend_mode,
     _submit_slurm_job,
     _submit_tx_train_slurm_job,
@@ -65,6 +66,7 @@ from ._slurm import (
 from ._workers import (
     _run_emb_inference_job_worker,
     _run_inference_job_worker,
+    _run_predict_job_worker,
     _run_preprocess_job_worker,
     _run_tx_train_job_worker,
 )
@@ -2812,6 +2814,623 @@ def cancel_tx_inference(job_id: str, force: bool = False) -> dict[str, Any]:
     with _JOBS_LOCK:
         jobs_by_id = _get_session_jobs_locked(session_key)
         job = _get_job_locked(job_id, jobs_by_id, expected_kind="tx")
+        _sync_job_state_locked(job)
+        if job.status in _TERMINAL_JOB_STATUSES:
+            return {
+                "job_id": job_id,
+                "status": job.status,
+                "cancel_requested": job.cancel_requested,
+                "message": "Job is already in a terminal state.",
+            }
+
+        now_iso = _utc_now_iso()
+        now_mono = time.monotonic()
+        first_request = not job.cancel_requested
+
+        job.cancel_requested = True
+        if first_request:
+            job.cancel_requested_at = now_iso
+            job.cancel_grace_deadline_monotonic = now_mono + _CANCEL_GRACE_SECONDS
+        if job.status in {"queued", "running"}:
+            job.status = "cancelling"
+
+        terminate_sent = False
+        scancel_sent = False
+        scancel_exit_code: int | None = None
+        scancel_message: str | None = None
+
+        if job.backend == "slurm":
+            if isinstance(job.scheduler_job_id, str) and job.scheduler_job_id.strip():
+                if shutil.which("scancel") is None:
+                    scancel_message = "`scancel` not found in PATH."
+                    _append_job_log(job, f"[warning] {scancel_message}")
+                else:
+                    try:
+                        result = subprocess.run(
+                            ["scancel", job.scheduler_job_id],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                        )
+                        scancel_exit_code = int(result.returncode)
+                        out = (result.stdout or "").strip()
+                        err = (result.stderr or "").strip()
+                        if result.returncode == 0:
+                            scancel_sent = True
+                            scancel_message = "scancel request submitted."
+                            _append_job_log(job, f"[cancelling] Sent scancel for {job.scheduler_job_id}.")
+                        else:
+                            scancel_message = f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            _append_job_log(job, f"[warning] {scancel_message}")
+                    except Exception as exc:
+                        scancel_message = f"Failed to invoke scancel: {type(exc).__name__}: {exc}"
+                        _append_job_log(job, f"[warning] {scancel_message}")
+            else:
+                scancel_message = "No scheduler job id recorded; cannot send scancel."
+                _append_job_log(job, f"[warning] {scancel_message}")
+        else:
+            if isinstance(job.cancel_flag_path, str) and job.cancel_flag_path:
+                try:
+                    Path(job.cancel_flag_path).touch(exist_ok=True)
+                except Exception as exc:
+                    _append_job_log(
+                        job,
+                        f"[warning] Failed to set cancellation flag at {job.cancel_flag_path}: {type(exc).__name__}: {exc}",
+                    )
+
+            if force and _process_alive(job.process):
+                try:
+                    job.process.terminate()
+                    terminate_sent = True
+                    job.terminate_sent_at_monotonic = now_mono
+                    _append_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
+                except Exception as exc:
+                    _append_job_log(job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}")
+            elif first_request:
+                _append_job_log(
+                    job,
+                    f"[cancelling] Cancellation requested. Grace period is {_CANCEL_GRACE_SECONDS:.0f}s before force termination.",
+                )
+            else:
+                _append_job_log(job, "[cancelling] Cancellation requested.")
+
+        _sync_job_state_locked(job)
+        poll_interval = _recommend_poll_interval_seconds(job)
+
+        return {
+            "job_id": job_id,
+            "status": job.status,
+            "backend": job.backend,
+            "scheduler_job_id": job.scheduler_job_id,
+            "cancel_requested": job.cancel_requested,
+            "cancel_requested_at": job.cancel_requested_at,
+            "force": force,
+            "terminate_sent": terminate_sent,
+            "scancel_sent": scancel_sent,
+            "scancel_exit_code": scancel_exit_code,
+            "scancel_message": scancel_message,
+            "recommended_poll_interval_seconds": poll_interval,
+        }
+
+
+# ---------------------------------------------------------------------------
+# TX Predict tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def plan_tx_predict(
+    output_dir: str,
+    toml_config_path: str | None = None,
+    checkpoint: str = "last.ckpt",
+    profile: str = "full",
+    predict_only: bool = False,
+    skip_de: bool = False,
+    pseudobulk: bool = False,
+    shared_only: bool = False,
+    eval_train_data: bool = False,
+) -> dict[str, Any]:
+    """
+    Inspect a TX training run folder and estimate the evaluation workload
+    before launching predict.  Returns run summary, test cell estimates,
+    output dimensions, size estimates, submission hints, and available
+    checkpoints.  No GPU needed.
+    """
+    import pickle
+
+    import yaml
+
+    output_dir_resolved = str(Path(output_dir).expanduser().resolve())
+    if not Path(output_dir_resolved).is_dir():
+        raise FileNotFoundError(f"Output directory not found: {output_dir_resolved}")
+
+    # ---- load config.yaml ------------------------------------------------
+    config_path = Path(output_dir_resolved) / "config.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"config.yaml not found in {output_dir_resolved}")
+    with config_path.open("r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
+    data_cfg = config.get("data", {})
+    model_cfg = config.get("model", {})
+    run_name = config.get("name") or Path(output_dir_resolved).name
+
+    output_space = data_cfg.get("output_space", "gene")
+    embed_key = data_cfg.get("embed_key")
+    cell_type_column = data_cfg.get("celltype_col") or data_cfg.get("cell_type_column")
+    perturbation_column = data_cfg.get("pert_col") or data_cfg.get("perturbation_column")
+    control_perturbation = data_cfg.get("control_pert") or data_cfg.get("control_perturbation")
+
+    # ---- var_dims.pkl -----------------------------------------------------
+    var_dims_path = Path(output_dir_resolved) / "var_dims.pkl"
+    var_dims: dict[str, Any] = {}
+    if var_dims_path.is_file():
+        try:
+            with var_dims_path.open("rb") as f:
+                var_dims = pickle.load(f)
+        except Exception:
+            var_dims = {}
+
+    gene_dim = var_dims.get("gene_dim") or var_dims.get("num_genes")
+    hvg_dim = var_dims.get("hvg_dim") or var_dims.get("num_hvgs")
+    emb_dim = var_dims.get("emb_dim") or var_dims.get("embedding_dim")
+    output_dim = gene_dim  # default
+    if output_space == "all":
+        output_dim = gene_dim
+    elif output_space in ("gene", "hvg"):
+        output_dim = hvg_dim or gene_dim
+    elif output_space == "embedding":
+        output_dim = emb_dim
+
+    # ---- resolve checkpoint -----------------------------------------------
+    ckpt_dir = Path(output_dir_resolved) / "checkpoints"
+    available_checkpoints: list[str] = []
+    if ckpt_dir.is_dir():
+        available_checkpoints = sorted(
+            p.name for p in ckpt_dir.iterdir() if p.is_file() and p.suffix == ".ckpt"
+        )
+
+    resolved_checkpoint = checkpoint
+    ckpt_path = ckpt_dir / checkpoint
+    if not ckpt_path.is_file():
+        # Try as absolute path
+        ckpt_path = Path(checkpoint).expanduser().resolve()
+    ckpt_size_bytes: int | None = None
+    ckpt_exists = ckpt_path.is_file()
+    if ckpt_exists:
+        ckpt_size_bytes = int(ckpt_path.stat().st_size)
+        resolved_checkpoint = str(ckpt_path)
+
+    # ---- estimate test cells from TOML ------------------------------------
+    toml_path = toml_config_path
+    if toml_path is None:
+        toml_path = data_cfg.get("toml") or data_cfg.get("toml_config_path")
+    if toml_path is not None:
+        toml_path = str(Path(toml_path).expanduser().resolve())
+
+    test_cell_estimate: int | None = None
+    toml_info: dict[str, Any] = {}
+    if toml_path is not None and Path(toml_path).is_file():
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib  # type: ignore[no-redef]
+        try:
+            with open(toml_path, "rb") as f:
+                toml_data = tomllib.load(f)
+            # Count test cells from split sections
+            total_test_cells = 0
+            split_key = "train" if eval_train_data else "test"
+            for section_name, section in toml_data.items():
+                if not isinstance(section, dict):
+                    continue
+                split_cell_counts = section.get("split_cell_counts", {})
+                if isinstance(split_cell_counts, dict):
+                    count = split_cell_counts.get(split_key) or split_cell_counts.get(f"{split_key}_cells")
+                    if isinstance(count, (int, float)):
+                        total_test_cells += int(count)
+            if total_test_cells > 0:
+                test_cell_estimate = total_test_cells
+            toml_info["path"] = toml_path
+            toml_info["found"] = True
+        except Exception as exc:
+            toml_info["path"] = toml_path
+            toml_info["found"] = True
+            toml_info["parse_error"] = f"{type(exc).__name__}: {exc}"
+    elif toml_path is not None:
+        toml_info["path"] = toml_path
+        toml_info["found"] = False
+
+    # ---- size estimates ---------------------------------------------------
+    estimated_output_size_gb: float | None = None
+    if test_cell_estimate is not None and output_dim is not None:
+        # Two AnnData objects (pred + real), float32
+        bytes_per_cell = int(output_dim) * 4 * 2
+        estimated_output_size_gb = round(
+            (test_cell_estimate * bytes_per_cell) / (1024**3), 3
+        )
+
+    # ---- submission hints -------------------------------------------------
+    submission_hints: list[str] = []
+    if test_cell_estimate is not None:
+        if test_cell_estimate >= 5_000_000:
+            submission_hints.append(
+                f"~{test_cell_estimate:,} test cells detected. Recommend `pseudobulk=True` "
+                f"and `skip_de=True` to avoid OOM."
+            )
+        elif test_cell_estimate >= 1_000_000:
+            submission_hints.append(
+                f"~{test_cell_estimate:,} test cells detected. Consider `pseudobulk=True` "
+                f"for faster evaluation."
+            )
+        elif test_cell_estimate >= 100_000:
+            submission_hints.append(
+                f"~{test_cell_estimate:,} test cells. All profiles should work; "
+                f"`skip_de=True` will speed up evaluation."
+            )
+        else:
+            submission_hints.append(
+                f"~{test_cell_estimate:,} test cells. All profiles should work fine."
+            )
+
+    if not ckpt_exists:
+        submission_hints.append(
+            f"Checkpoint '{checkpoint}' not found in {ckpt_dir}. "
+            f"Available: {available_checkpoints or '(none)'}."
+        )
+
+    if profile not in ("full", "minimal", "de", "anndata"):
+        submission_hints.append(f"Unknown profile '{profile}'; valid choices: full, minimal, de, anndata.")
+
+    return {
+        "status": "ready" if ckpt_exists else "needs_input",
+        "run_summary": {
+            "name": run_name,
+            "output_space": output_space,
+            "embed_key": embed_key,
+            "cell_type_column": cell_type_column,
+            "perturbation_column": perturbation_column,
+            "control_perturbation": control_perturbation,
+            "checkpoint": resolved_checkpoint,
+            "checkpoint_exists": ckpt_exists,
+            "checkpoint_size_bytes": ckpt_size_bytes,
+        },
+        "test_output_dims": {
+            "gene_dim": gene_dim,
+            "hvg_dim": hvg_dim,
+            "emb_dim": emb_dim,
+            "output_dim": output_dim,
+        },
+        "test_cell_estimate": test_cell_estimate,
+        "estimated_output_size_gb": estimated_output_size_gb,
+        "toml_info": toml_info,
+        "available_checkpoints": available_checkpoints,
+        "parameters": {
+            "output_dir": output_dir_resolved,
+            "checkpoint": checkpoint,
+            "profile": profile,
+            "predict_only": predict_only,
+            "skip_de": skip_de,
+            "pseudobulk": pseudobulk,
+            "shared_only": shared_only,
+            "eval_train_data": eval_train_data,
+        },
+        "submission_hints": submission_hints,
+    }
+
+
+@mcp.tool()
+def start_tx_predict(
+    output_dir: str,
+    toml_config_path: str | None = None,
+    checkpoint: str = "last.ckpt",
+    profile: str = "full",
+    predict_only: bool = False,
+    skip_de: bool = False,
+    pseudobulk: bool = False,
+    shared_only: bool = False,
+    eval_train_data: bool = False,
+    backend: str = "auto",
+    backend_profile: str | None = None,
+    slurm_partition: str | None = None,
+    slurm_gpus: int | None = None,
+    slurm_cpus_per_task: int | None = None,
+    slurm_mem: str | None = None,
+    slurm_time: str | None = None,
+    cuda_devices: str | None = None,
+) -> dict[str, Any]:
+    """
+    Start TX predict (evaluation) in the background and return a `job_id` immediately.
+
+    Loads a trained model, generates predictions on held-out test data,
+    constructs paired pred/real AnnData objects, and computes evaluation
+    metrics via cell-eval.
+
+    Poll status with `get_tx_predict_status`, fetch logs with
+    `get_tx_predict_logs`, and cancel with `cancel_tx_predict`.
+    """
+    output_dir_resolved = str(Path(output_dir).expanduser().resolve())
+    if not Path(output_dir_resolved).is_dir():
+        raise FileNotFoundError(f"Output directory not found: {output_dir_resolved}")
+
+    config_path = Path(output_dir_resolved) / "config.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"config.yaml not found in {output_dir_resolved}")
+
+    if profile not in ("full", "minimal", "de", "anndata"):
+        raise ValueError(f"Invalid profile '{profile}'. Must be one of: full, minimal, de, anndata.")
+
+    # Resolve checkpoint
+    ckpt_dir = Path(output_dir_resolved) / "checkpoints"
+    ckpt_path = ckpt_dir / checkpoint
+    if not ckpt_path.is_file():
+        ckpt_path = Path(checkpoint).expanduser().resolve()
+    if not ckpt_path.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint '{checkpoint}' not found. Checked: {ckpt_dir / checkpoint}, {Path(checkpoint).expanduser().resolve()}"
+        )
+    resolved_checkpoint = str(ckpt_path.name) if (ckpt_dir / checkpoint).is_file() else str(ckpt_path)
+
+    # Resolve TOML override
+    resolved_toml: str | None = None
+    if toml_config_path is not None:
+        resolved_toml = str(Path(toml_config_path).expanduser().resolve())
+        if not Path(resolved_toml).is_file():
+            raise FileNotFoundError(f"TOML config not found: {resolved_toml}")
+
+    # Build argparse Namespace matching run_tx_predict expectations
+    predict_args = Namespace(
+        output_dir=output_dir_resolved,
+        toml=resolved_toml,
+        checkpoint=resolved_checkpoint,
+        test_time_finetune=0,
+        profile=profile,
+        predict_only=predict_only,
+        skip_adatas=False,
+        skip_de=skip_de,
+        shared_only=shared_only,
+        eval_train_data=eval_train_data,
+        pseudobulk=pseudobulk,
+    )
+
+    resolved_info = {
+        "output_dir": output_dir_resolved,
+        "checkpoint": resolved_checkpoint,
+        "toml_config_path": resolved_toml,
+        "profile": profile,
+        "predict_only": predict_only,
+        "skip_de": skip_de,
+        "pseudobulk": pseudobulk,
+        "shared_only": shared_only,
+        "eval_train_data": eval_train_data,
+    }
+
+    session_key = _get_current_session_key()
+    backend_mode, backend_reason = _resolve_backend_mode(backend)
+
+    job_id = uuid4().hex
+    job = InferenceJob(
+        job_id=job_id,
+        status="queued",
+        created_at=_utc_now_iso(),
+        model_folder=output_dir_resolved,
+        adata_path="",
+        output_path=output_dir_resolved,
+        checkpoint_path=resolved_checkpoint,
+        inference_kind="predict",
+        resolved_args=resolved_info,
+        backend=backend_mode,
+        backend_profile=backend_profile,
+    )
+    _append_job_log(job, "[queued] Predict job queued.")
+
+    with _JOBS_LOCK:
+        jobs_by_id = _get_session_jobs_locked(session_key)
+        jobs_by_id[job_id] = job
+
+    if backend_mode == "slurm":
+        command = _build_tx_predict_cli_args(predict_args)
+        try:
+            submission = _submit_slurm_job(
+                job_id=job_id,
+                job_name_prefix="state_tx_predict",
+                run_dir=None,
+                command=command,
+                backend_profile=backend_profile,
+                slurm_partition=slurm_partition,
+                slurm_gpus=slurm_gpus,
+                slurm_cpus_per_task=slurm_cpus_per_task,
+                slurm_mem=slurm_mem,
+                slurm_time=slurm_time,
+                default_gpus=1,
+            )
+        except Exception as exc:
+            with _JOBS_LOCK:
+                current = _get_session_jobs_locked(session_key).get(job_id)
+                if current is not None:
+                    current.status = "failed"
+                    current.error = f"Failed to submit slurm job: {type(exc).__name__}: {exc}"
+                    current.finished_at = _utc_now_iso()
+                    _append_job_log(current, f"[failed] {current.error}")
+            raise RuntimeError(f"Unable to submit tx predict slurm job: {type(exc).__name__}: {exc}") from exc
+
+        with _JOBS_LOCK:
+            current = _get_session_jobs_locked(session_key).get(job_id)
+            if current is not None:
+                current.scheduler_job_id = str(submission["scheduler_job_id"])
+                current.worker_log_path = str(submission["worker_log_path"])
+                current.worker_error_log_path = str(submission["worker_error_log_path"])
+                current.progress = {
+                    "phase": "submitted",
+                    "message": "Submitted to slurm.",
+                    "scheduler_job_id": current.scheduler_job_id,
+                    "slurm_profile_reason": submission.get("profile_reason"),
+                }
+                _append_job_log(current, f"[submitted] Slurm job id={current.scheduler_job_id}.")
+                _sync_job_state_locked(current)
+                poll_interval = _recommend_poll_interval_seconds(current)
+            else:
+                poll_interval = 5.0
+
+        return {
+            "status": "started",
+            "job_id": job_id,
+            "backend": "slurm",
+            "scheduler_job_id": submission["scheduler_job_id"],
+            "worker_log_path": submission["worker_log_path"],
+            "worker_error_log_path": submission["worker_error_log_path"],
+            **resolved_info,
+            "recommended_initial_poll_interval_seconds": poll_interval,
+        }
+
+    resolved_cuda_devices, cuda_auto_assigned = _resolve_cuda_devices_for_local(cuda_devices, backend_mode)
+
+    mp_ctx = _get_worker_mp_context()
+    parent_conn, child_conn = mp_ctx.Pipe(duplex=False)
+    cancel_flag_path = str((Path("/tmp") / f"state_tx_predict_cancel_{job_id}.flag").resolve())
+    worker_log_path = str((Path("/tmp") / f"state_tx_predict_worker_{job_id}.log").resolve())
+    Path(cancel_flag_path).unlink(missing_ok=True)
+    process = mp_ctx.Process(
+        target=_run_predict_job_worker,
+        args=(predict_args, cancel_flag_path, child_conn, worker_log_path, resolved_cuda_devices),
+        daemon=False,
+        name=f"state_tx_predict_{job_id[:8]}",
+    )
+
+    job.event_conn = parent_conn
+    job.cancel_flag_path = cancel_flag_path
+    job.worker_log_path = worker_log_path
+    job.process = process
+
+    try:
+        process.start()
+        try:
+            child_conn.close()
+        except Exception:
+            pass
+    except Exception as exc:
+        with _JOBS_LOCK:
+            current = _get_session_jobs_locked(session_key).get(job_id)
+            if current is not None:
+                current.status = "failed"
+                current.error = f"Failed to launch worker process: {type(exc).__name__}: {exc}"
+                current.finished_at = _utc_now_iso()
+                _append_job_log(current, f"[failed] {current.error}")
+                _release_job_runtime_resources(current)
+        try:
+            child_conn.close()
+        except Exception:
+            pass
+        raise RuntimeError(f"Unable to start tx predict worker process: {type(exc).__name__}: {exc}") from exc
+
+    with _JOBS_LOCK:
+        current = _get_session_jobs_locked(session_key).get(job_id)
+        if current is not None:
+            current.worker_pid = process.pid
+            _sync_job_state_locked(current)
+            poll_interval = _recommend_poll_interval_seconds(current)
+        else:
+            poll_interval = 5.0
+
+    return {
+        "status": "started",
+        "job_id": job_id,
+        **resolved_info,
+        "worker_pid": process.pid,
+        "worker_log_path": worker_log_path,
+        "cuda_devices": resolved_cuda_devices,
+        "cuda_auto_assigned": cuda_auto_assigned,
+        "recommended_initial_poll_interval_seconds": poll_interval,
+    }
+
+
+@mcp.tool()
+def get_tx_predict_status(job_id: str) -> dict[str, Any]:
+    """
+    Return status, progress, and adaptive polling hints for a background tx predict job.
+    """
+    session_key = _get_current_session_key()
+    with _JOBS_LOCK:
+        jobs_by_id = _get_session_jobs_locked(session_key)
+        job = _get_job_locked(job_id, jobs_by_id, expected_kind="predict")
+        _sync_job_state_locked(job)
+        progress = dict(job.progress)
+        seconds_since_update = max(0.0, time.monotonic() - float(job.last_update_monotonic))
+        recommended_poll = _recommend_poll_interval_seconds(job)
+        recommended_log_poll = _recommend_poll_interval_seconds(job, for_logs=True)
+        return {
+            "job_id": job.job_id,
+            "inference_kind": job.inference_kind,
+            "status": job.status,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "last_update_at": job.last_update_at,
+            "seconds_since_last_update": round(seconds_since_update, 3),
+            "cancel_requested": job.cancel_requested,
+            "cancel_requested_at": job.cancel_requested_at,
+            "error": job.error,
+            "model_folder": job.model_folder,
+            "output_path": job.output_path,
+            "checkpoint_path": job.checkpoint_path,
+            "resolved_args": dict(job.resolved_args),
+            "progress": progress,
+            "last_event": dict(job.last_event) if isinstance(job.last_event, dict) else None,
+            "log_line_count": len(job.logs),
+            "worker_pid": job.worker_pid,
+            "worker_exit_code": job.worker_exit_code,
+            "worker_log_path": job.worker_log_path,
+            "worker_error_log_path": job.worker_error_log_path,
+            "backend": job.backend,
+            "backend_profile": job.backend_profile,
+            "scheduler_job_id": job.scheduler_job_id,
+            "recommended_poll_interval_seconds": recommended_poll,
+            "recommended_log_poll_interval_seconds": recommended_log_poll,
+        }
+
+
+@mcp.tool()
+def get_tx_predict_logs(job_id: str, from_line: int = 0, max_lines: int = 200) -> dict[str, Any]:
+    """
+    Return buffered logs for a background tx predict job plus a polling hint.
+    """
+    if from_line < 0:
+        raise ValueError("`from_line` must be >= 0.")
+    if max_lines <= 0:
+        raise ValueError("`max_lines` must be > 0.")
+
+    session_key = _get_current_session_key()
+    with _JOBS_LOCK:
+        jobs_by_id = _get_session_jobs_locked(session_key)
+        job = _get_job_locked(job_id, jobs_by_id, expected_kind="predict")
+        _sync_job_state_locked(job)
+        start = min(from_line, len(job.logs))
+        end = min(start + max_lines, len(job.logs))
+        lines = job.logs[start:end]
+        recommended_poll = _recommend_poll_interval_seconds(job, for_logs=True)
+
+    return {
+        "job_id": job_id,
+        "from_line": start,
+        "next_line": end,
+        "total_lines": len(job.logs),
+        "recommended_poll_interval_seconds": recommended_poll,
+        "lines": lines,
+    }
+
+
+@mcp.tool()
+def cancel_tx_predict(job_id: str, force: bool = False) -> dict[str, Any]:
+    """
+    Request cancellation for a background tx predict job.
+
+    A graceful cancellation flag is set first. If `force=True`, the worker
+    process is also sent SIGTERM immediately.
+    """
+    session_key = _get_current_session_key()
+    with _JOBS_LOCK:
+        jobs_by_id = _get_session_jobs_locked(session_key)
+        job = _get_job_locked(job_id, jobs_by_id, expected_kind="predict")
         _sync_job_state_locked(job)
         if job.status in _TERMINAL_JOB_STATUSES:
             return {

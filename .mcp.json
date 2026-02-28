@@ -5,9 +5,8 @@
       "url": "http://127.0.0.1:8777/mcp"
     },
     "biocontext_kb": {
-      "command": "uvx",
-      "args": ["biocontext_kb@latest"],
-      "env": { "UV_PYTHON": "3.12" }
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp/"
     }
   }
 }

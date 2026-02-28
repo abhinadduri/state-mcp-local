@@ -303,6 +303,30 @@ def _build_tx_infer_cli_args(infer_args: Namespace) -> list[str]:
     return args
 
 
+def _build_tx_predict_cli_args(predict_args: Namespace) -> list[str]:
+    args: list[str] = ["-m", "state", "tx", "predict"]
+    args.extend(["--output-dir", str(predict_args.output_dir)])
+    args.extend(["--checkpoint", str(predict_args.checkpoint)])
+    args.extend(["--profile", str(predict_args.profile)])
+    if predict_args.toml is not None:
+        args.extend(["--toml", str(predict_args.toml)])
+    if getattr(predict_args, "test_time_finetune", 0) > 0:
+        args.extend(["--test-time-finetune", str(predict_args.test_time_finetune)])
+    if getattr(predict_args, "predict_only", False):
+        args.append("--predict-only")
+    if getattr(predict_args, "skip_adatas", False):
+        args.append("--skip-adatas")
+    if getattr(predict_args, "skip_de", False):
+        args.append("--skip-de")
+    if getattr(predict_args, "shared_only", False):
+        args.append("--shared-only")
+    if getattr(predict_args, "eval_train_data", False):
+        args.append("--eval-train-data")
+    if getattr(predict_args, "pseudobulk", False):
+        args.append("--pseudobulk")
+    return args
+
+
 def _build_emb_transform_cli_args(resolved: dict[str, Any]) -> list[str]:
     args: list[str] = ["-m", "state", "emb", "transform"]
     args.extend(["--input", str(resolved["input_adata_path"])])
