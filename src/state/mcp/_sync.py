@@ -30,6 +30,7 @@ from ._slurm import _map_slurm_state_to_job_status, _query_slurm_state
 # Log ingestion
 # ---------------------------------------------------------------------------
 
+
 def _ingest_train_worker_log_lines(job: TrainJob) -> None:
     log_path = job.worker_log_path
     if not isinstance(log_path, str) or not log_path.strip():
@@ -91,6 +92,7 @@ def _ingest_inference_worker_log_lines(job: InferenceJob) -> None:
 # ---------------------------------------------------------------------------
 # Training metrics
 # ---------------------------------------------------------------------------
+
 
 def _extract_override_value(overrides: list[str], key: str) -> str | None:
     needle = key.strip()
@@ -178,6 +180,7 @@ def _extract_train_metrics_progress(job: TrainJob) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 # Event recording
 # ---------------------------------------------------------------------------
+
 
 def _event_progress_percent(event: dict[str, Any]) -> float | None:
     progress_value = event.get("progress")
@@ -271,6 +274,7 @@ def _record_train_job_event(job: TrainJob, event: dict[str, Any]) -> None:
 # Process management
 # ---------------------------------------------------------------------------
 
+
 def _process_alive(process: mp.Process | None) -> bool:
     if process is None:
         return False
@@ -351,6 +355,7 @@ def _release_train_job_runtime_resources(job: TrainJob) -> None:
 # ---------------------------------------------------------------------------
 # Worker message handling
 # ---------------------------------------------------------------------------
+
 
 def _apply_worker_message(job: InferenceJob, message: dict[str, Any]) -> None:
     if not isinstance(message, dict):
@@ -446,6 +451,7 @@ def _apply_train_worker_message(job: TrainJob, message: dict[str, Any]) -> None:
 # Event draining
 # ---------------------------------------------------------------------------
 
+
 def _drain_job_events_locked(job: InferenceJob) -> None:
     event_conn = job.event_conn
     if event_conn is None:
@@ -483,12 +489,15 @@ def _drain_train_job_events_locked(job: TrainJob) -> None:
         _apply_train_worker_message(job, message)
 
     if drained >= _MAX_EVENT_DRAIN:
-        _append_train_job_log(job, f"[warning] Drained {_MAX_EVENT_DRAIN} worker events; additional events remain queued.")
+        _append_train_job_log(
+            job, f"[warning] Drained {_MAX_EVENT_DRAIN} worker events; additional events remain queued."
+        )
 
 
 # ---------------------------------------------------------------------------
 # Poll intervals
 # ---------------------------------------------------------------------------
+
 
 def _recommend_poll_interval_seconds(job: InferenceJob, *, for_logs: bool = False) -> float | None:
     if job.status in _TERMINAL_JOB_STATUSES:
@@ -555,6 +564,7 @@ def _recommend_train_poll_interval_seconds(job: TrainJob, *, for_logs: bool = Fa
 # State sync
 # ---------------------------------------------------------------------------
 
+
 def _sync_job_state_locked(job: InferenceJob) -> None:
     if job.backend == "slurm":
         _ingest_inference_worker_log_lines(job)
@@ -601,7 +611,9 @@ def _sync_job_state_locked(job: InferenceJob) -> None:
                 job.terminate_sent_at_monotonic = now
                 _append_job_log(job, "[cancelling] Cancellation grace elapsed; sent SIGTERM to worker process.")
             except Exception as exc:
-                _append_job_log(job, f"[warning] Failed to terminate worker process cleanly: {type(exc).__name__}: {exc}")
+                _append_job_log(
+                    job, f"[warning] Failed to terminate worker process cleanly: {type(exc).__name__}: {exc}"
+                )
         elif (
             job.terminate_sent_at_monotonic is not None
             and now >= (job.terminate_sent_at_monotonic + _TERMINATE_GRACE_SECONDS)
@@ -767,6 +779,7 @@ def _sync_train_job_state_locked(job: TrainJob) -> None:
 # Preprocess job helpers
 # ---------------------------------------------------------------------------
 
+
 def _ingest_preprocess_worker_log_lines(job: PreprocessJob) -> None:
     log_path = job.worker_log_path
     if not isinstance(log_path, str) or not log_path.strip():
@@ -881,7 +894,9 @@ def _drain_preprocess_job_events_locked(job: PreprocessJob) -> None:
         _apply_preprocess_worker_message(job, message)
 
     if drained >= _MAX_EVENT_DRAIN:
-        _append_preprocess_job_log(job, f"[warning] Drained {_MAX_EVENT_DRAIN} worker events; additional events remain queued.")
+        _append_preprocess_job_log(
+            job, f"[warning] Drained {_MAX_EVENT_DRAIN} worker events; additional events remain queued."
+        )
 
 
 def _release_preprocess_job_runtime_resources(job: PreprocessJob) -> None:
@@ -978,9 +993,13 @@ def _sync_preprocess_job_state_locked(job: PreprocessJob) -> None:
             try:
                 process.terminate()
                 job.terminate_sent_at_monotonic = now
-                _append_preprocess_job_log(job, "[cancelling] Cancellation grace elapsed; sent SIGTERM to worker process.")
+                _append_preprocess_job_log(
+                    job, "[cancelling] Cancellation grace elapsed; sent SIGTERM to worker process."
+                )
             except Exception as exc:
-                _append_preprocess_job_log(job, f"[warning] Failed to terminate worker process cleanly: {type(exc).__name__}: {exc}")
+                _append_preprocess_job_log(
+                    job, f"[warning] Failed to terminate worker process cleanly: {type(exc).__name__}: {exc}"
+                )
         elif (
             job.terminate_sent_at_monotonic is not None
             and now >= (job.terminate_sent_at_monotonic + _TERMINATE_GRACE_SECONDS)
@@ -991,7 +1010,9 @@ def _sync_preprocess_job_state_locked(job: PreprocessJob) -> None:
                 job.terminate_sent_at_monotonic = now
                 _append_preprocess_job_log(job, "[cancelling] Worker did not exit after SIGTERM; sent SIGKILL.")
             except Exception as exc:
-                _append_preprocess_job_log(job, f"[warning] Failed to force-kill worker process: {type(exc).__name__}: {exc}")
+                _append_preprocess_job_log(
+                    job, f"[warning] Failed to force-kill worker process: {type(exc).__name__}: {exc}"
+                )
 
     if _process_alive(process):
         return

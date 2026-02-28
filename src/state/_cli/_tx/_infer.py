@@ -127,8 +127,7 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         type=int,
         default=None,
         help=(
-            "Number of fixed-length cell sets to process per forward pass. "
-            "Defaults to training.batch_size from config."
+            "Number of fixed-length cell sets to process per forward pass. Defaults to training.batch_size from config."
         ),
     )
 
@@ -285,13 +284,9 @@ def run_tx_infer(args: argparse.Namespace):
             device: Target torch device.
         """
         if ctrl_basal_np.ndim != 3:
-            raise ValueError(
-                f"Expected ctrl_basal_np shape [B, S, E], got shape {ctrl_basal_np.shape}"
-            )
+            raise ValueError(f"Expected ctrl_basal_np shape [B, S, E], got shape {ctrl_basal_np.shape}")
         if pert_onehots_np.ndim != 3:
-            raise ValueError(
-                f"Expected pert_onehots_np shape [B, S, P], got shape {pert_onehots_np.shape}"
-            )
+            raise ValueError(f"Expected pert_onehots_np shape [B, S, P], got shape {pert_onehots_np.shape}")
         if ctrl_basal_np.shape[:2] != pert_onehots_np.shape[:2]:
             raise ValueError(
                 "ctrl_basal_np and pert_onehots_np must have matching [B, S] dimensions; "
@@ -302,9 +297,7 @@ def run_tx_infer(args: argparse.Namespace):
         if seq_len != cell_set_len:
             raise ValueError(f"Expected sequence length {cell_set_len}, got {seq_len}")
         if len(pert_names_by_set) != bsz:
-            raise ValueError(
-                f"Expected {bsz} perturbation names, got {len(pert_names_by_set)}"
-            )
+            raise ValueError(f"Expected {bsz} perturbation names, got {len(pert_names_by_set)}")
 
         X_batch = torch.tensor(
             ctrl_basal_np.reshape(bsz * seq_len, emb_dim),
@@ -581,9 +574,7 @@ def run_tx_infer(args: argparse.Namespace):
     if cell_set_len <= 0:
         raise ValueError(f"Resolved cell_set_len must be a positive integer, got {cell_set_len}")
     if not args.batched:
-        warnings.warn(
-            "--no-batched is deprecated. tx infer now always uses batched padded inference (padded=True)."
-        )
+        warnings.warn("--no-batched is deprecated. tx infer now always uses batched padded inference (padded=True).")
     set_batch_size = args.set_batch_size
     if set_batch_size is None:
         set_batch_size = int(cfg.get("training", {}).get("batch_size", 1))
@@ -973,8 +964,7 @@ def run_tx_infer(args: argparse.Namespace):
         if sim_counts is not None:
             if sim_counts.shape[1] != target_dim:
                 raise ValueError(
-                    "Predicted counts dimension mismatch: "
-                    f"expected {sim_counts.shape[1]} but got {target_dim}"
+                    f"Predicted counts dimension mismatch: expected {sim_counts.shape[1]} but got {target_dim}"
                 )
             return
 
@@ -1024,8 +1014,7 @@ def run_tx_infer(args: argparse.Namespace):
                 side_key = f"{writes_to[1]}_pred"
                 if not args.quiet:
                     warn(
-                        "Dimension mismatch for obsm[%r] (got %d vs %d). "
-                        "Writing to adata.obsm[%r] instead.",
+                        "Dimension mismatch for obsm[%r] (got %d vs %d). Writing to adata.obsm[%r] instead.",
                         writes_to[1],
                         pred_rows.shape[1],
                         sim_obsm.shape[1],
@@ -1153,9 +1142,7 @@ def run_tx_infer(args: argparse.Namespace):
                         else:
                             vec_np = np.asarray(vec, dtype=np.float32)
                         if vec_np.ndim != 1:
-                            raise ValueError(
-                                f"Expected 1D perturbation vector for '{p}', got shape {vec_np.shape}"
-                            )
+                            raise ValueError(f"Expected 1D perturbation vector for '{p}', got shape {vec_np.shape}")
                         pert_stack = np.tile(vec_np.reshape(1, 1, -1), (bsz, cell_set_len, 1))
 
                         if uses_batch_encoder and batch_indices_all is not None:
@@ -1181,9 +1168,7 @@ def run_tx_infer(args: argparse.Namespace):
                             and ("pert_cell_counts_preds" in batch_out)
                             and (batch_out["pert_cell_counts_preds"] is not None)
                         ):
-                            preds_flat = (
-                                batch_out["pert_cell_counts_preds"].detach().cpu().numpy().astype(np.float32)
-                            )
+                            preds_flat = batch_out["pert_cell_counts_preds"].detach().cpu().numpy().astype(np.float32)
                         else:
                             preds_flat = batch_out["preds"].detach().cpu().numpy().astype(np.float32)
                         preds = preds_flat.reshape(bsz, cell_set_len, -1)

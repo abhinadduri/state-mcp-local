@@ -417,25 +417,23 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         # If outputs are log1p-scaled expression, aggregate in count space and convert
         # back to log1p only for eval matrices.
-        aggregate_main_in_count_space = bool((not use_count_outputs) and metrics_is_log1p and output_space != "embedding")
+        aggregate_main_in_count_space = bool(
+            (not use_count_outputs) and metrics_is_log1p and output_space != "embedding"
+        )
         aggregate_gene_in_count_space = bool(use_count_outputs and metrics_is_log1p)
         if aggregate_main_in_count_space or aggregate_gene_in_count_space:
             logger.info(
                 "Pseudobulk scale handling: detected log1p outputs; accumulating sums in count space via expm1."
             )
         else:
-            logger.info(
-                "Pseudobulk scale handling: using direct summation (no expm1 conversion before aggregation)."
-            )
+            logger.info("Pseudobulk scale handling: using direct summation (no expm1 conversion before aggregation).")
 
         pb_groups: dict[tuple[str, str], dict] = {}
         context_mode = None
         total_cells_seen = 0
 
         with torch.no_grad():
-            for batch_idx, batch in enumerate(
-                tqdm(test_loader, desc="Predicting", unit="batch", file=sys.stderr)
-            ):
+            for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch", file=sys.stderr)):
                 batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
                 batch_preds = model.predict_step(batch, batch_idx, padded=False)
 
@@ -640,8 +638,14 @@ def run_tx_predict(args: ap.ArgumentParser):
             adata_pred_eval = anndata.AnnData(X=pred_bulk_eval, obs=obs.copy())
             adata_real_eval = anndata.AnnData(X=real_bulk_eval, obs=obs.copy())
 
-        persist_mode = "sum(expm1(log1p(x)))" if (aggregate_main_in_count_space or aggregate_gene_in_count_space) else "sum(x)"
-        eval_mode = "log1p(sum(expm1(log1p(x))))" if (aggregate_main_in_count_space or aggregate_gene_in_count_space) else "mean(x)"
+        persist_mode = (
+            "sum(expm1(log1p(x)))" if (aggregate_main_in_count_space or aggregate_gene_in_count_space) else "sum(x)"
+        )
+        eval_mode = (
+            "log1p(sum(expm1(log1p(x))))"
+            if (aggregate_main_in_count_space or aggregate_gene_in_count_space)
+            else "mean(x)"
+        )
         pseudobulk_meta = {
             "persisted_aggregation": persist_mode,
             "eval_aggregation": eval_mode,

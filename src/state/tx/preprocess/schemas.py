@@ -117,8 +117,7 @@ class PreprocessTrainConfig(BaseModel):
     def validate_keys_different(self) -> "PreprocessTrainConfig":
         if self.efficiency_key == self.target_fc_key:
             raise ValueError(
-                f"efficiency_key and target_fc_key must be different, "
-                f"got '{self.efficiency_key}' for both"
+                f"efficiency_key and target_fc_key must be different, got '{self.efficiency_key}' for both"
             )
         return self
 

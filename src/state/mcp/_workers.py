@@ -161,7 +161,9 @@ def _run_tx_train_job_worker(
                 pass
 
 
-def _run_inference_job_worker(infer_args: Namespace, cancel_flag_path: str, event_conn: Any, worker_log_path: str, cuda_devices: str | None = None) -> None:
+def _run_inference_job_worker(
+    infer_args: Namespace, cancel_flag_path: str, event_conn: Any, worker_log_path: str, cuda_devices: str | None = None
+) -> None:
     if cuda_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = cuda_devices
 

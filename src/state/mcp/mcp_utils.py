@@ -236,10 +236,7 @@ def _choose_emb_checkpoint_from_folder(folder: Path, *, prefer_ckpt: bool = Fals
     candidates = _list_emb_checkpoint_candidates(folder)
     if not candidates:
         expected = ", ".join(_EMB_CHECKPOINT_SUFFIXES)
-        raise FileNotFoundError(
-            f"No embedding checkpoint file found in {folder}. "
-            f"Expected file suffixes: {expected}"
-        )
+        raise FileNotFoundError(f"No embedding checkpoint file found in {folder}. Expected file suffixes: {expected}")
 
     if prefer_ckpt:
         ckpt_candidates = [path for path in candidates if path.suffix == ".ckpt"]
@@ -276,8 +273,7 @@ def resolve_emb_checkpoint_path(
         if resolved.suffix not in _EMB_CHECKPOINT_SUFFIXES:
             expected = ", ".join(_EMB_CHECKPOINT_SUFFIXES)
             raise ValueError(
-                f"Unsupported embedding checkpoint extension {resolved.suffix!r}. "
-                f"Expected one of: {expected}"
+                f"Unsupported embedding checkpoint extension {resolved.suffix!r}. Expected one of: {expected}"
             )
         return str(resolved)
 
@@ -443,7 +439,9 @@ def inspect_emb_checkpoint(checkpoint_path: str | None = None, model_folder: str
                     continue
 
         has_cfg_yaml = isinstance(payload, dict) and isinstance(payload.get("cfg_yaml"), str)
-        has_packaged_protein_embeddings = isinstance(payload, dict) and isinstance(payload.get("protein_embeds_dict"), dict)
+        has_packaged_protein_embeddings = isinstance(payload, dict) and isinstance(
+            payload.get("protein_embeds_dict"), dict
+        )
         if has_packaged_protein_embeddings:
             try:
                 packaged_protein_embedding_count = len(payload["protein_embeds_dict"])
@@ -496,7 +494,9 @@ def inspect_emb_checkpoint(checkpoint_path: str | None = None, model_folder: str
             "model_n_latent": model_cfg.get("n_latent"),
             "model_batch_size": model_cfg.get("batch_size"),
             "model_dataset_correction": model_cfg.get("dataset_correction"),
-            "optimizer_name": _as_optional_str(cfg_data.get("optimizer", {}).get("name")) if isinstance(cfg_data, dict) else None,
+            "optimizer_name": _as_optional_str(cfg_data.get("optimizer", {}).get("name"))
+            if isinstance(cfg_data, dict)
+            else None,
             "hyper_parameter_keys": sorted(hyper_parameters.keys())[:50],
         },
         "warnings": warnings,
@@ -843,10 +843,7 @@ def _summarize_obs_column(
             nonzero = np.where(bincount > 0)[0]
             n_unique = int(len(nonzero))
             ranked = sorted(nonzero.tolist(), key=lambda i: int(bincount[i]), reverse=True)[:max_top_values]
-            top_values = [
-                {"value": categories[i], "count": int(bincount[i])}
-                for i in ranked
-            ]
+            top_values = [{"value": categories[i], "count": int(bincount[i])} for i in ranked]
         except Exception:
             if valid_codes.size > 0:
                 unique_codes, counts = np.unique(valid_codes, return_counts=True)
@@ -1211,9 +1208,7 @@ def _resolve_split_columns(
         cell_type_column.strip() if isinstance(cell_type_column, str) and cell_type_column.strip() else None
     )
     resolved_perturbation = (
-        perturbation_column.strip()
-        if isinstance(perturbation_column, str) and perturbation_column.strip()
-        else None
+        perturbation_column.strip() if isinstance(perturbation_column, str) and perturbation_column.strip() else None
     )
 
     sample_schema: dict[str, Any] | None = None
@@ -1295,10 +1290,7 @@ def _read_obs_column_values_as_strings(obs_group: Any, column: str) -> np.ndarra
         raw = obj[:]
         if len(obj.shape) > 1:
             return np.asarray(
-                [
-                    str(item.tolist() if hasattr(item, "tolist") else item)
-                    for item in raw
-                ],
+                [str(item.tolist() if hasattr(item, "tolist") else item) for item in raw],
                 dtype=object,
             )
         return np.asarray(_safe_decode_array(raw), dtype=object)
@@ -1379,9 +1371,7 @@ def _scan_split_context_counts(
                                 ct_index = int(ct_code)
                                 pert_index = int(pert_code)
                                 ct_name = (
-                                    ct_categories[ct_index]
-                                    if 0 <= ct_index < len(ct_categories)
-                                    else str(ct_index)
+                                    ct_categories[ct_index] if 0 <= ct_index < len(ct_categories) else str(ct_index)
                                 )
                                 pert_name = (
                                     pert_categories[pert_index]
@@ -1426,9 +1416,7 @@ def _scan_split_context_counts(
                         )
                         meta["source_files"].add(file_path)
             except Exception as exc:
-                errors.append(
-                    f"Failed to inspect {file_path} for split metadata: {type(exc).__name__}: {exc}"
-                )
+                errors.append(f"Failed to inspect {file_path} for split metadata: {type(exc).__name__}: {exc}")
 
     for meta in context_meta.values():
         source_files = sorted(str(p) for p in meta.get("source_files", set()))
@@ -1527,8 +1515,7 @@ def _random_split_perturbations(
     n_test = int(n_total * test_fraction)
     if n_val + n_test > n_total:
         raise ValueError(
-            f"Invalid fractions for context {context!r}: val={val_fraction}, test={test_fraction}, "
-            f"sum exceeds 1.0."
+            f"Invalid fractions for context {context!r}: val={val_fraction}, test={test_fraction}, sum exceeds 1.0."
         )
 
     val_items = sorted(shuffled[:n_val])
@@ -1550,8 +1537,7 @@ def _normalize_zeroshot_contexts(zeroshot_contexts: dict[str, Any] | None) -> di
             raise ValueError("`zeroshot_contexts` contains an empty context key.")
         if split not in {"train", "val", "test"}:
             raise ValueError(
-                f"Invalid zeroshot split {raw_split!r} for context {context!r}. "
-                "Expected one of: train, val, test."
+                f"Invalid zeroshot split {raw_split!r} for context {context!r}. Expected one of: train, val, test."
             )
         normalized[context] = split
     return normalized
@@ -1784,9 +1770,7 @@ def plan_tx_split_toml(
 
     if resolved_control is None and control_candidates:
         resolved_control = str(control_candidates[0]["value"])
-        warnings.append(
-            f"Inferred control perturbation label {resolved_control!r} from perturbation distributions."
-        )
+        warnings.append(f"Inferred control perturbation label {resolved_control!r} from perturbation distributions.")
     elif resolved_control is not None:
         observed = any(resolved_control in counts for counts in context_counts.values())
         if not observed:
@@ -1797,9 +1781,7 @@ def plan_tx_split_toml(
     test_fraction = _normalize_fraction("random_test_fraction", random_test_fraction)
     val_fraction = _normalize_fraction("random_val_fraction", random_val_fraction)
     if test_fraction + val_fraction > 1.0:
-        raise ValueError(
-            "`random_test_fraction + random_val_fraction` must be <= 1.0."
-        )
+        raise ValueError("`random_test_fraction + random_val_fraction` must be <= 1.0.")
     if random_seed < 0:
         raise ValueError("`random_seed` must be >= 0.")
 
@@ -1809,9 +1791,7 @@ def plan_tx_split_toml(
         cleaned = sorted({str(item).strip() for item in training_datasets if str(item).strip()})
         unknown = sorted(set(cleaned) - set(normalized_paths.keys()))
         if unknown:
-            raise ValueError(
-                "Unknown dataset names in `training_datasets`: " + ", ".join(unknown)
-            )
+            raise ValueError("Unknown dataset names in `training_datasets`: " + ", ".join(unknown))
         selected_training_datasets = cleaned
     training_section = {dataset: "train" for dataset in selected_training_datasets}
 
@@ -1822,23 +1802,15 @@ def plan_tx_split_toml(
     available_contexts = set(context_counts.keys())
     unknown_zeroshot_contexts = sorted(set(zeroshot_section.keys()) - available_contexts)
     if unknown_zeroshot_contexts:
-        raise ValueError(
-            "Unknown contexts in `zeroshot_contexts`: " + ", ".join(unknown_zeroshot_contexts)
-        )
+        raise ValueError("Unknown contexts in `zeroshot_contexts`: " + ", ".join(unknown_zeroshot_contexts))
     unknown_manual_contexts = sorted(set(fewshot_manual.keys()) - available_contexts)
     if unknown_manual_contexts:
-        raise ValueError(
-            "Unknown contexts in `fewshot_overrides`: " + ", ".join(unknown_manual_contexts)
-        )
+        raise ValueError("Unknown contexts in `fewshot_overrides`: " + ", ".join(unknown_manual_contexts))
 
-    random_contexts = sorted(
-        {str(item).strip() for item in (random_holdout_contexts or []) if str(item).strip()}
-    )
+    random_contexts = sorted({str(item).strip() for item in (random_holdout_contexts or []) if str(item).strip()})
     unknown_random_contexts = sorted(set(random_contexts) - available_contexts)
     if unknown_random_contexts:
-        raise ValueError(
-            "Unknown contexts in `random_holdout_contexts`: " + ", ".join(unknown_random_contexts)
-        )
+        raise ValueError("Unknown contexts in `random_holdout_contexts`: " + ", ".join(unknown_random_contexts))
 
     random_assignments: dict[str, dict[str, list[str]]] = {}
     random_assignment_summary: list[dict[str, Any]] = []
@@ -1887,9 +1859,7 @@ def plan_tx_split_toml(
     fewshot_section = dict(random_assignments)
     for context, spec in fewshot_manual.items():
         if context in fewshot_section:
-            warnings.append(
-                f"Manual fewshot override replaced random assignment for context {context!r}."
-            )
+            warnings.append(f"Manual fewshot override replaced random assignment for context {context!r}.")
         fewshot_section[context] = {"val": list(spec.get("val", [])), "test": list(spec.get("test", []))}
 
     toml_text = _render_tx_split_toml(
@@ -2105,8 +2075,7 @@ def inspect_tx_split_toml(
     missing_dataset_paths = sorted(referenced_datasets - set(datasets_section.keys()))
     if missing_dataset_paths:
         errors.append(
-            "Datasets referenced in training/splits but missing from `[datasets]`: "
-            + ", ".join(missing_dataset_paths)
+            "Datasets referenced in training/splits but missing from `[datasets]`: " + ", ".join(missing_dataset_paths)
         )
 
     zeroshot_entries: list[dict[str, Any]] = []

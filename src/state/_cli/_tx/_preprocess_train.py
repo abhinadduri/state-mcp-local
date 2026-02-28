@@ -37,10 +37,14 @@ def add_arguments_preprocess_train(parser: ap.ArgumentParser):
     parser.add_argument("--already-log1p", action="store_true", help="Apply expm1 before normalization")
 
     # Column mapping
-    parser.add_argument("--perturbation-col", type=str, default="target_gene", help="obs column for perturbation identifiers")
+    parser.add_argument(
+        "--perturbation-col", type=str, default="target_gene", help="obs column for perturbation identifiers"
+    )
     parser.add_argument("--control-perturbation", type=str, default="non-targeting", help="Control perturbation label")
     parser.add_argument("--context-col", type=str, default=None, help="obs column to copy into obs['context']")
-    parser.add_argument("--batch-col", type=str, default=None, help="obs column to combine with context into obs['batch_col']")
+    parser.add_argument(
+        "--batch-col", type=str, default=None, help="obs column to combine with context into obs['batch_col']"
+    )
 
     # Ordering
     parser.add_argument(
@@ -108,4 +112,6 @@ def run_tx_preprocess_train(args: ap.Namespace):
     )
 
     result = normalize_transform_files(config)
-    print(f"\nProcessed {result.files_processed} files, {result.files_skipped} skipped, {result.total_cells:,} total cells.")
+    print(
+        f"\nProcessed {result.files_processed} files, {result.files_skipped} skipped, {result.total_cells:,} total cells."
+    )

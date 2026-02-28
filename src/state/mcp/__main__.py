@@ -261,7 +261,9 @@ def _resolve_tx_inference_request(
         ",".join(ct.strip() for ct in include_cell_types if ct and ct.strip()) if include_cell_types else None
     )
     resolved_output = (
-        str(Path(output_path).expanduser().resolve()) if output_path else adata_resolved.replace(".h5ad", "_simulated.h5ad")
+        str(Path(output_path).expanduser().resolve())
+        if output_path
+        else adata_resolved.replace(".h5ad", "_simulated.h5ad")
     )
 
     infer_args = Namespace(
@@ -426,18 +428,25 @@ _PRESET_ALIASES: dict[str, str] = {
 _OUTPUT_SPACE_ALIASES: dict[str, str] = {"hvg": "gene", "transcriptome": "all"}
 
 _KNOWN_PRESETS: set[str] = {
-    "state", "state_sm", "state_lg",
-    "context_mean", "perturb_mean",
-    "embedsum", "globalsimplesum", "pseudobulk", "decoder_only", "pertsets",
+    "state",
+    "state_sm",
+    "state_lg",
+    "context_mean",
+    "perturb_mean",
+    "embedsum",
+    "globalsimplesum",
+    "pseudobulk",
+    "decoder_only",
+    "pertsets",
 }
 
 # Key model kwargs defaults per preset (from configs/model/*.yaml)
 _PRESET_MODEL_DEFAULTS: dict[str, dict[str, Any]] = {
-    "state":        {"hidden_dim": 384,  "cell_set_len": 64,  "batch_encoder": False, "nb_loss": False},
-    "state_sm":     {"hidden_dim": 672,  "cell_set_len": 128, "batch_encoder": False, "nb_loss": False},
-    "state_lg":     {"hidden_dim": 1488, "cell_set_len": 512, "batch_encoder": False, "nb_loss": False},
-    "context_mean": {"hidden_dim": 512,  "cell_set_len": 512, "batch_encoder": False, "nb_loss": False},
-    "perturb_mean": {"hidden_dim": 512,  "cell_set_len": 512, "batch_encoder": False, "nb_loss": False},
+    "state": {"hidden_dim": 384, "cell_set_len": 64, "batch_encoder": False, "nb_loss": False},
+    "state_sm": {"hidden_dim": 672, "cell_set_len": 128, "batch_encoder": False, "nb_loss": False},
+    "state_lg": {"hidden_dim": 1488, "cell_set_len": 512, "batch_encoder": False, "nb_loss": False},
+    "context_mean": {"hidden_dim": 512, "cell_set_len": 512, "batch_encoder": False, "nb_loss": False},
+    "perturb_mean": {"hidden_dim": 512, "cell_set_len": 512, "batch_encoder": False, "nb_loss": False},
 }
 
 # Hydra training/data defaults (from configs/training/default.yaml and data/perturbation.yaml)
@@ -674,7 +683,9 @@ def _build_tx_train_plan(
     if isinstance(resolved_embed_key, str) and resolved_embed_key.lower() in {"null", "none"}:
         resolved_embed_key = None
 
-    resolved_output_space = output_space.strip().lower() if isinstance(output_space, str) and output_space.strip() else None
+    resolved_output_space = (
+        output_space.strip().lower() if isinstance(output_space, str) and output_space.strip() else None
+    )
     if resolved_output_space is not None:
         resolved_output_space = _OUTPUT_SPACE_ALIASES.get(resolved_output_space, resolved_output_space)
     if resolved_output_space is None:
@@ -686,9 +697,7 @@ def _build_tx_train_plan(
         resolved_output_space = "gene"
 
     resolved_control_pert = (
-        control_perturbation.strip()
-        if isinstance(control_perturbation, str) and control_perturbation.strip()
-        else None
+        control_perturbation.strip() if isinstance(control_perturbation, str) and control_perturbation.strip() else None
     )
     if resolved_control_pert is None:
         if resolved_perturbation_column == "drugname_drugconc":
@@ -724,21 +733,18 @@ def _build_tx_train_plan(
                 _avail = ", ".join(sorted(obs_column_names)[:20])
                 if _user:
                     validation_warnings.append(
-                        f"`{_param}` = {_val!r} not found in sample data obs columns. "
-                        f"Available: [{_avail}]"
+                        f"`{_param}` = {_val!r} not found in sample data obs columns. Available: [{_avail}]"
                     )
                 else:
                     missing_fields.append(_param)
                     suggestions[f"{_param}_reason"] = (
-                        f"Auto-default {_val!r} not found in sample data. "
-                        f"Available obs columns: [{_avail}]"
+                        f"Auto-default {_val!r} not found in sample data. Available obs columns: [{_avail}]"
                     )
 
         if resolved_embed_key is not None and resolved_embed_key not in obsm_keys:
             _avail_obsm = ", ".join(sorted(obsm_keys)[:20])
             validation_warnings.append(
-                f"`embed_key` = {resolved_embed_key!r} not found in sample data obsm keys. "
-                f"Available: [{_avail_obsm}]"
+                f"`embed_key` = {resolved_embed_key!r} not found in sample data obsm keys. Available: [{_avail_obsm}]"
             )
 
         # Validate control_perturbation against perturbation column values
@@ -752,14 +758,10 @@ def _build_tx_train_plan(
                     break
             _ctrl_candidates = sample_schema.get("control_label_candidates", [])
             _known_ctrl = {
-                c["value"] for c in _ctrl_candidates
-                if isinstance(c, dict) and isinstance(c.get("value"), str)
+                c["value"] for c in _ctrl_candidates if isinstance(c, dict) and isinstance(c.get("value"), str)
             }
             if resolved_control_pert not in _pert_top_values and resolved_control_pert not in _known_ctrl:
-                _suggestion_vals = [
-                    c.get("value") for c in _ctrl_candidates[:5]
-                    if isinstance(c, dict)
-                ]
+                _suggestion_vals = [c.get("value") for c in _ctrl_candidates[:5] if isinstance(c, dict)]
                 if _ctrl_user:
                     validation_warnings.append(
                         f"`control_perturbation` = {resolved_control_pert!r} not found among "
@@ -878,9 +880,7 @@ def _build_tx_train_plan(
             f"learning_rate not set — Hydra default is {_DEFAULT_TRAINING_PARAMS['learning_rate']}."
         )
     if val_freq is None:
-        submission_hints.append(
-            f"val_freq not set — Hydra default is {_DEFAULT_TRAINING_PARAMS['val_freq']} steps."
-        )
+        submission_hints.append(f"val_freq not set — Hydra default is {_DEFAULT_TRAINING_PARAMS['val_freq']} steps.")
     if use_consecutive_loading is None:
         if resolved_output_space == "all":
             submission_hints.append(
@@ -939,9 +939,7 @@ def _build_tx_train_plan(
                 f"{', '.join(wandb_missing)} not set. These are required when W&B is enabled."
             )
         if not wandb_tags:
-            submission_hints.append(
-                "wandb_tags not set. Consider specifying tags for better experiment filtering."
-            )
+            submission_hints.append("wandb_tags not set. Consider specifying tags for better experiment filtering.")
     if backend_mode == "local" and is_nvidia_smi_available():
         free = find_free_devices(1)
         if free:
@@ -1033,6 +1031,7 @@ def _build_tx_train_plan(
 # ---------------------------------------------------------------------------
 # MCP tool definitions
 # ---------------------------------------------------------------------------
+
 
 @mcp.tool()
 def set_tx_model_folder(model_folder: str) -> dict[str, str]:
@@ -1216,8 +1215,7 @@ def inspect_folder(
         tx_result = inspect_model_folder(resolved_tx)
         tx_result.setdefault("warnings", [])
         tx_result["warnings"].append(
-            "Path also matched an EMB checkpoint directory shape. "
-            "Defaulting to TX run-folder inspection."
+            "Path also matched an EMB checkpoint directory shape. Defaulting to TX run-folder inspection."
         )
         return tx_result
 
@@ -1999,7 +1997,9 @@ def cancel_tx_train(job_id: str, force: bool = False) -> dict[str, Any]:
                             scancel_message = "scancel request submitted."
                             _append_train_job_log(job, f"[cancelling] Sent scancel for {job.scheduler_job_id}.")
                         else:
-                            scancel_message = f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            scancel_message = (
+                                f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            )
                             _append_train_job_log(job, f"[warning] {scancel_message}")
                     except Exception as exc:
                         scancel_message = f"Failed to invoke scancel: {type(exc).__name__}: {exc}"
@@ -2022,7 +2022,9 @@ def cancel_tx_train(job_id: str, force: bool = False) -> dict[str, Any]:
                     job.process.terminate()
                     terminate_sent = True
                     job.terminate_sent_at_monotonic = now_mono
-                    _append_train_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
+                    _append_train_job_log(
+                        job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process."
+                    )
                 except Exception as exc:
                     _append_train_job_log(
                         job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}"
@@ -2146,6 +2148,7 @@ def run_emb_inference(
         slurm_time=slurm_time,
         cuda_devices=cuda_devices,
     )
+
 
 @mcp.tool()
 def start_emb_inference(
@@ -2467,7 +2470,9 @@ def cancel_emb_inference(job_id: str, force: bool = False) -> dict[str, Any]:
                             scancel_message = "scancel request submitted."
                             _append_job_log(job, f"[cancelling] Sent scancel for {job.scheduler_job_id}.")
                         else:
-                            scancel_message = f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            scancel_message = (
+                                f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            )
                             _append_job_log(job, f"[warning] {scancel_message}")
                     except Exception as exc:
                         scancel_message = f"Failed to invoke scancel: {type(exc).__name__}: {exc}"
@@ -2492,7 +2497,9 @@ def cancel_emb_inference(job_id: str, force: bool = False) -> dict[str, Any]:
                     job.terminate_sent_at_monotonic = now_mono
                     _append_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
                 except Exception as exc:
-                    _append_job_log(job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}")
+                    _append_job_log(
+                        job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}"
+                    )
             elif first_request:
                 _append_job_log(
                     job,
@@ -2860,7 +2867,9 @@ def cancel_tx_inference(job_id: str, force: bool = False) -> dict[str, Any]:
                             scancel_message = "scancel request submitted."
                             _append_job_log(job, f"[cancelling] Sent scancel for {job.scheduler_job_id}.")
                         else:
-                            scancel_message = f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            scancel_message = (
+                                f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            )
                             _append_job_log(job, f"[warning] {scancel_message}")
                     except Exception as exc:
                         scancel_message = f"Failed to invoke scancel: {type(exc).__name__}: {exc}"
@@ -2885,7 +2894,9 @@ def cancel_tx_inference(job_id: str, force: bool = False) -> dict[str, Any]:
                     job.terminate_sent_at_monotonic = now_mono
                     _append_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
                 except Exception as exc:
-                    _append_job_log(job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}")
+                    _append_job_log(
+                        job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}"
+                    )
             elif first_request:
                 _append_job_log(
                     job,
@@ -2986,9 +2997,7 @@ def plan_tx_predict(
     ckpt_dir = Path(output_dir_resolved) / "checkpoints"
     available_checkpoints: list[str] = []
     if ckpt_dir.is_dir():
-        available_checkpoints = sorted(
-            p.name for p in ckpt_dir.iterdir() if p.is_file() and p.suffix == ".ckpt"
-        )
+        available_checkpoints = sorted(p.name for p in ckpt_dir.iterdir() if p.is_file() and p.suffix == ".ckpt")
 
     resolved_checkpoint = checkpoint
     ckpt_path = ckpt_dir / checkpoint
@@ -3046,9 +3055,7 @@ def plan_tx_predict(
     if test_cell_estimate is not None and output_dim is not None:
         # Two AnnData objects (pred + real), float32
         bytes_per_cell = int(output_dim) * 4 * 2
-        estimated_output_size_gb = round(
-            (test_cell_estimate * bytes_per_cell) / (1024**3), 3
-        )
+        estimated_output_size_gb = round((test_cell_estimate * bytes_per_cell) / (1024**3), 3)
 
     # ---- submission hints -------------------------------------------------
     submission_hints: list[str] = []
@@ -3060,8 +3067,7 @@ def plan_tx_predict(
             )
         elif test_cell_estimate >= 1_000_000:
             submission_hints.append(
-                f"~{test_cell_estimate:,} test cells detected. Consider `pseudobulk=True` "
-                f"for faster evaluation."
+                f"~{test_cell_estimate:,} test cells detected. Consider `pseudobulk=True` for faster evaluation."
             )
         elif test_cell_estimate >= 100_000:
             submission_hints.append(
@@ -3069,14 +3075,11 @@ def plan_tx_predict(
                 f"`skip_de=True` will speed up evaluation."
             )
         else:
-            submission_hints.append(
-                f"~{test_cell_estimate:,} test cells. All profiles should work fine."
-            )
+            submission_hints.append(f"~{test_cell_estimate:,} test cells. All profiles should work fine.")
 
     if not ckpt_exists:
         submission_hints.append(
-            f"Checkpoint '{checkpoint}' not found in {ckpt_dir}. "
-            f"Available: {available_checkpoints or '(none)'}."
+            f"Checkpoint '{checkpoint}' not found in {ckpt_dir}. Available: {available_checkpoints or '(none)'}."
         )
 
     if profile not in ("full", "minimal", "de", "anndata"):
@@ -3477,7 +3480,9 @@ def cancel_tx_predict(job_id: str, force: bool = False) -> dict[str, Any]:
                             scancel_message = "scancel request submitted."
                             _append_job_log(job, f"[cancelling] Sent scancel for {job.scheduler_job_id}.")
                         else:
-                            scancel_message = f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            scancel_message = (
+                                f"scancel failed with code {result.returncode}. stdout={out!r} stderr={err!r}"
+                            )
                             _append_job_log(job, f"[warning] {scancel_message}")
                     except Exception as exc:
                         scancel_message = f"Failed to invoke scancel: {type(exc).__name__}: {exc}"
@@ -3502,7 +3507,9 @@ def cancel_tx_predict(job_id: str, force: bool = False) -> dict[str, Any]:
                     job.terminate_sent_at_monotonic = now_mono
                     _append_job_log(job, "[cancelling] Force cancellation requested; sent SIGTERM to worker process.")
                 except Exception as exc:
-                    _append_job_log(job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}")
+                    _append_job_log(
+                        job, f"[warning] Failed to force-cancel worker process: {type(exc).__name__}: {exc}"
+                    )
             elif first_request:
                 _append_job_log(
                     job,
@@ -3533,6 +3540,7 @@ def cancel_tx_predict(job_id: str, force: bool = False) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Preprocessing tools
 # ---------------------------------------------------------------------------
+
 
 def _resolve_preprocess_request(
     *,
@@ -3750,9 +3758,7 @@ def start_preprocess_train(
             child_conn.close()
         except Exception:
             pass
-        raise RuntimeError(
-            f"Unable to start preprocess worker process: {type(exc).__name__}: {exc}"
-        ) from exc
+        raise RuntimeError(f"Unable to start preprocess worker process: {type(exc).__name__}: {exc}") from exc
 
     with _PREPROCESS_JOBS_LOCK:
         current = _get_session_preprocess_jobs_locked(session_key).get(job_id)

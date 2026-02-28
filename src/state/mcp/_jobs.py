@@ -25,6 +25,7 @@ _TERMINATE_GRACE_SECONDS = 10.0
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -40,6 +41,7 @@ def _get_worker_mp_context() -> mp.context.BaseContext:
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class InferenceJob:
@@ -116,6 +118,7 @@ class TrainJob:
 # Exception classes
 # ---------------------------------------------------------------------------
 
+
 class EmbInferenceCancelledError(RuntimeError):
     pass
 
@@ -153,6 +156,7 @@ _PREPROCESS_JOBS_LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 # Session helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_session_server_state_locked(session_key: str) -> dict[str, str | None]:
     state = _SESSION_SERVER_STATE.get(session_key)
@@ -211,6 +215,7 @@ def _get_train_job_locked(job_id: str, jobs_by_id: dict[str, TrainJob]) -> Train
 # Job lifecycle
 # ---------------------------------------------------------------------------
 
+
 def _touch_job(job: InferenceJob) -> None:
     job.last_update_at = _utc_now_iso()
     job.last_update_monotonic = time.monotonic()
@@ -240,6 +245,7 @@ def _append_train_job_log(job: TrainJob, message: str) -> None:
 # ---------------------------------------------------------------------------
 # PreprocessJob dataclass + helpers
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class PreprocessJob:

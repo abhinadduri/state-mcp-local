@@ -33,6 +33,7 @@ class PreprocessCancelledError(RuntimeError):
 # Sparse matrix utilities
 # ---------------------------------------------------------------------------
 
+
 def ensure_csr(adata: ad.AnnData) -> None:
     """Ensure sparse X is stored as CSR."""
     X = adata.X
@@ -43,6 +44,7 @@ def ensure_csr(adata: ad.AnnData) -> None:
 # ---------------------------------------------------------------------------
 # Log1p reversal
 # ---------------------------------------------------------------------------
+
 
 def apply_expm1_if_needed(adata: ad.AnnData, already_log1p: bool) -> None:
     """Undo log1p in X when requested, keeping sparse matrices sparse."""
@@ -62,6 +64,7 @@ def apply_expm1_if_needed(adata: ad.AnnData, already_log1p: bool) -> None:
 # ---------------------------------------------------------------------------
 # Gene set alignment
 # ---------------------------------------------------------------------------
+
 
 def load_gene_set(gene_set_path: Path) -> list[str]:
     """Load ordered gene names from a .npy file."""
@@ -189,6 +192,7 @@ def align_to_gene_set(
 # Perturbation / context / batch standardization
 # ---------------------------------------------------------------------------
 
+
 def standardize_perturbation_fields(
     adata: ad.AnnData,
     perturbation_col: str,
@@ -205,9 +209,7 @@ def standardize_perturbation_fields(
 
     adata.obs[canonical_col] = adata.obs[canonical_col].astype(str)
     if control_perturbation != CANONICAL_CONTROL_LABEL:
-        adata.obs[canonical_col] = adata.obs[canonical_col].replace(
-            {control_perturbation: CANONICAL_CONTROL_LABEL}
-        )
+        adata.obs[canonical_col] = adata.obs[canonical_col].replace({control_perturbation: CANONICAL_CONTROL_LABEL})
     adata.obs[canonical_col] = adata.obs[canonical_col].astype("category")
     return canonical_col, CANONICAL_CONTROL_LABEL
 
@@ -238,6 +240,7 @@ def apply_context_and_batch(
 # ---------------------------------------------------------------------------
 # Sorting
 # ---------------------------------------------------------------------------
+
 
 def sort_adata_by_columns(adata: ad.AnnData, columns: list[str]) -> ad.AnnData:
     """Sort cells by obs columns, returning a reordered copy when needed."""
@@ -286,6 +289,7 @@ def sort_adata_by_columns(adata: ad.AnnData, columns: list[str]) -> ad.AnnData:
 # Downsampling
 # ---------------------------------------------------------------------------
 
+
 def downsample_counts(
     adata: ad.AnnData,
     frac: float,
@@ -318,6 +322,7 @@ def downsample_counts(
 # ---------------------------------------------------------------------------
 # Knockdown efficiency / log deviation
 # ---------------------------------------------------------------------------
+
 
 def compute_control_baseline(
     adata: ad.AnnData,
@@ -440,6 +445,7 @@ def compute_log_deviation(
 # Global pseudobulk-based HVG selection
 # ---------------------------------------------------------------------------
 
+
 def _to_2d_array(matrix: Any) -> NDArrayFloat:
     """Convert an arbitrary matrix-like object to a dense 2D float32 array."""
     if hasattr(matrix, "to_numpy"):
@@ -472,19 +478,14 @@ def _pseudobulk_with_adpbulk(adata: ad.AnnData, perturbation_col: str) -> ad.Ann
     Returns a small AnnData with one row per perturbation group, preserving var.
     """
     if perturbation_col not in adata.obs.columns:
-        raise KeyError(
-            f"Column '{perturbation_col}' not found in adata.obs for pseudobulk"
-        )
+        raise KeyError(f"Column '{perturbation_col}' not found in adata.obs for pseudobulk")
 
     from adpbulk import ADPBulk
 
     adpb = ADPBulk(adata, perturbation_col)
     matrix = _to_2d_array(adpb.fit_transform())
     if matrix.shape[1] != adata.n_vars:
-        raise ValueError(
-            f"Pseudobulk matrix gene dimension mismatch: "
-            f"expected {adata.n_vars}, got {matrix.shape[1]}"
-        )
+        raise ValueError(f"Pseudobulk matrix gene dimension mismatch: expected {adata.n_vars}, got {matrix.shape[1]}")
 
     pseudobulk = ad.AnnData(X=matrix, var=adata.var.copy())
     pseudobulk.var_names = [_normalize_gene_label(v) for v in adata.var_names]
@@ -511,9 +512,7 @@ def select_hvgs_from_adata(adata: ad.AnnData, num_hvgs: int) -> list[str]:
     if num_hvgs < 1:
         raise ValueError(f"num_hvgs must be >= 1, got {num_hvgs}")
     if num_hvgs > adata.n_vars:
-        raise ValueError(
-            f"num_hvgs ({num_hvgs}) exceeds total genes ({adata.n_vars})"
-        )
+        raise ValueError(f"num_hvgs ({num_hvgs}) exceeds total genes ({adata.n_vars})")
 
     work = adata.copy()
     work.var_names = [_normalize_gene_label(v) for v in work.var_names]
@@ -557,19 +556,19 @@ def compute_global_hvgs(
 
     for idx, file_path in enumerate(h5ad_files):
         if cancel_check is not None and cancel_check():
-            raise PreprocessCancelledError(
-                f"HVG computation cancelled after {idx}/{len(h5ad_files)} files."
-            )
+            raise PreprocessCancelledError(f"HVG computation cancelled after {idx}/{len(h5ad_files)} files.")
 
         if progress_callback:
-            progress_callback({
-                "kind": "progress",
-                "phase": "computing_hvgs",
-                "files_done": idx,
-                "files_total": len(h5ad_files),
-                "current_file": str(file_path.name),
-                "message": f"Pseudobulking file {idx + 1}/{len(h5ad_files)} for HVG selection: {file_path.name}",
-            })
+            progress_callback(
+                {
+                    "kind": "progress",
+                    "phase": "computing_hvgs",
+                    "files_done": idx,
+                    "files_total": len(h5ad_files),
+                    "current_file": str(file_path.name),
+                    "message": f"Pseudobulking file {idx + 1}/{len(h5ad_files)} for HVG selection: {file_path.name}",
+                }
+            )
 
         adata = ad.read_h5ad(file_path)
         try:
@@ -584,13 +583,15 @@ def compute_global_hvgs(
             force_release_memory()
 
     if progress_callback:
-        progress_callback({
-            "kind": "progress",
-            "phase": "computing_hvgs",
-            "files_done": len(h5ad_files),
-            "files_total": len(h5ad_files),
-            "message": "Concatenating pseudobulks and selecting HVGs...",
-        })
+        progress_callback(
+            {
+                "kind": "progress",
+                "phase": "computing_hvgs",
+                "files_done": len(h5ad_files),
+                "files_total": len(h5ad_files),
+                "message": "Concatenating pseudobulks and selecting HVGs...",
+            }
+        )
 
     combined = ad.concat(
         pseudobulks,
@@ -611,6 +612,7 @@ def compute_global_hvgs(
 # ---------------------------------------------------------------------------
 # Per-file processing pipeline
 # ---------------------------------------------------------------------------
+
 
 def normalize_log_transform_single(
     input_path: Path,
@@ -648,10 +650,7 @@ def normalize_log_transform_single(
     # Gene alignment
     if gene_set is not None:
         adata, source_name, overlap = align_to_gene_set(adata, gene_set)
-        logger.info(
-            f"Aligned genes to gene_set ({adata.n_vars} genes), source={source_name}, "
-            f"overlap={overlap}"
-        )
+        logger.info(f"Aligned genes to gene_set ({adata.n_vars} genes), source={source_name}, overlap={overlap}")
         ensure_csr(adata)
 
     # Standardize perturbation fields
@@ -761,6 +760,7 @@ def normalize_log_transform_single(
 # Multi-file orchestrator
 # ---------------------------------------------------------------------------
 
+
 def normalize_transform_files(
     config: PreprocessTrainConfig,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
@@ -801,13 +801,15 @@ def normalize_transform_files(
             output_path = compute_output_path(f, config.output_dir)
             logger.info(f"  {f} -> {output_path}")
         if progress_callback:
-            progress_callback({
-                "kind": "progress",
-                "phase": "dry_run_complete",
-                "files_discovered": len(h5ad_files),
-                "files_excluded": len(excluded_files),
-                "message": f"[DRY RUN] Discovered {len(h5ad_files)} input files.",
-            })
+            progress_callback(
+                {
+                    "kind": "progress",
+                    "phase": "dry_run_complete",
+                    "files_discovered": len(h5ad_files),
+                    "files_excluded": len(excluded_files),
+                    "message": f"[DRY RUN] Discovered {len(h5ad_files)} input files.",
+                }
+            )
         return PreprocessTrainResult(
             files_processed=0,
             files_skipped=0,
@@ -821,12 +823,14 @@ def normalize_transform_files(
     hvg_names: list[str] | None = None
     if config.num_hvgs is not None:
         if progress_callback:
-            progress_callback({
-                "kind": "progress",
-                "phase": "computing_hvgs",
-                "files_total": len(h5ad_files),
-                "message": f"Computing global HVGs from {len(h5ad_files)} files via pseudobulk...",
-            })
+            progress_callback(
+                {
+                    "kind": "progress",
+                    "phase": "computing_hvgs",
+                    "files_total": len(h5ad_files),
+                    "message": f"Computing global HVGs from {len(h5ad_files)} files via pseudobulk...",
+                }
+            )
         hvg_names = compute_global_hvgs(
             h5ad_files=h5ad_files,
             num_hvgs=config.num_hvgs,
@@ -842,29 +846,31 @@ def normalize_transform_files(
     total_cells = 0
 
     if progress_callback:
-        progress_callback({
-            "kind": "progress",
-            "phase": "starting",
-            "files_total": len(h5ad_files),
-            "message": f"Starting preprocessing of {len(h5ad_files)} files.",
-        })
+        progress_callback(
+            {
+                "kind": "progress",
+                "phase": "starting",
+                "files_total": len(h5ad_files),
+                "message": f"Starting preprocessing of {len(h5ad_files)} files.",
+            }
+        )
 
     for idx, h5ad_path in enumerate(h5ad_files):
         # Check for cancellation
         if cancel_check is not None and cancel_check():
-            raise PreprocessCancelledError(
-                f"Preprocessing cancelled after {idx}/{len(h5ad_files)} files."
-            )
+            raise PreprocessCancelledError(f"Preprocessing cancelled after {idx}/{len(h5ad_files)} files.")
 
         if progress_callback:
-            progress_callback({
-                "kind": "progress",
-                "phase": "processing",
-                "files_done": idx,
-                "files_total": len(h5ad_files),
-                "current_file": str(h5ad_path.name),
-                "message": f"Processing file {idx + 1}/{len(h5ad_files)}: {h5ad_path.name}",
-            })
+            progress_callback(
+                {
+                    "kind": "progress",
+                    "phase": "processing",
+                    "files_done": idx,
+                    "files_total": len(h5ad_files),
+                    "current_file": str(h5ad_path.name),
+                    "message": f"Processing file {idx + 1}/{len(h5ad_files)}: {h5ad_path.name}",
+                }
+            )
 
         output_path = compute_output_path(h5ad_path, config.output_dir)
 
@@ -875,9 +881,7 @@ def normalize_transform_files(
             continue
 
         file_seed = config.seed + idx
-        stats = normalize_log_transform_single(
-            h5ad_path, output_path, config, file_seed, gene_set, hvg_names
-        )
+        stats = normalize_log_transform_single(h5ad_path, output_path, config, file_seed, gene_set, hvg_names)
 
         if stats is None:
             skipped_count += 1

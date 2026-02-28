@@ -35,9 +35,7 @@ def _resolve_slurm_backend_profile_args(
         return [], "No slurm profile arguments provided."
 
     profile_text = str(backend_profile).strip()
-    env_key = env_prefix + "".join(
-        char.upper() if char.isalnum() else "_" for char in profile_text
-    )
+    env_key = env_prefix + "".join(char.upper() if char.isalnum() else "_" for char in profile_text)
     env_value = os.getenv(env_key)
     if isinstance(env_value, str) and env_value.strip():
         return shlex.split(env_value), f"Loaded slurm args from ${env_key}."
