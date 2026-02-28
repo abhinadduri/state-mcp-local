@@ -858,13 +858,6 @@ def _build_tx_train_plan(
 
     all_overrides = list(curated_overrides) + list(cleaned_extra_overrides)
 
-    if validation_errors:
-        status = "invalid"
-    elif missing_fields:
-        status = "needs_input"
-    else:
-        status = "ready"
-
     preset_defaults = _PRESET_MODEL_DEFAULTS.get(model_preset_clean, {})
 
     submission_hints: list[str] = []
@@ -931,18 +924,21 @@ def _build_tx_train_plan(
                 "when num_workers is not set explicitly."
             )
     if wandb_enabled:
-        wandb_detail_hints: list[str] = []
+        wandb_missing: list[str] = []
         if wandb_project is None:
-            wandb_detail_hints.append("wandb_project")
+            wandb_missing.append("wandb_project")
+            missing_fields.append("wandb_project")
         if wandb_entity is None:
-            wandb_detail_hints.append("wandb_entity")
-        if not wandb_tags:
-            wandb_detail_hints.append("wandb_tags")
-        if wandb_detail_hints:
+            wandb_missing.append("wandb_entity")
+            missing_fields.append("wandb_entity")
+        if wandb_missing:
             submission_hints.append(
                 f"W&B logging is enabled ({wandb_reason.rstrip('.')}), but "
-                f"{', '.join(wandb_detail_hints)} not set. Consider specifying these "
-                "for better experiment organization and tracking."
+                f"{', '.join(wandb_missing)} not set. These are required when W&B is enabled."
+            )
+        if not wandb_tags:
+            submission_hints.append(
+                "wandb_tags not set. Consider specifying tags for better experiment filtering."
             )
     if backend_mode == "local" and is_nvidia_smi_available():
         free = find_free_devices(1)
@@ -956,6 +952,13 @@ def _build_tx_train_plan(
                 "Local GPUs detected but none are currently free (all above utilization/memory "
                 "thresholds). Consider waiting or explicitly setting cuda_devices."
             )
+
+    if validation_errors:
+        status = "invalid"
+    elif missing_fields:
+        status = "needs_input"
+    else:
+        status = "ready"
 
     return {
         "status": status,
@@ -1439,8 +1442,8 @@ def plan_tx_train(
 
     **W&B parameters** (use these dedicated params — do NOT set via `extra_overrides`):
     - `use_wandb`: `"auto"` (detect credentials), `"true"`, or `"false"`
-    - `wandb_project`: W&B project name (Hydra key `wandb.project`)
-    - `wandb_entity`: W&B entity/team name (Hydra key `wandb.entity`)
+    - `wandb_project`: W&B project name — **required** when W&B is enabled (Hydra key `wandb.project`)
+    - `wandb_entity`: W&B entity/team name — **required** when W&B is enabled (Hydra key `wandb.entity`)
     - `wandb_tags`: list of W&B tags (Hydra key `wandb.tags`)
 
     **Backend / Slurm parameters:**
