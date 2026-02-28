@@ -5,6 +5,7 @@ Ported from arc-bench normalize_transform with additions for STATE
 """
 
 import logging
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
@@ -436,6 +437,178 @@ def compute_log_deviation(
 
 
 # ---------------------------------------------------------------------------
+# Global pseudobulk-based HVG selection
+# ---------------------------------------------------------------------------
+
+def _to_2d_array(matrix: Any) -> NDArrayFloat:
+    """Convert an arbitrary matrix-like object to a dense 2D float32 array."""
+    if hasattr(matrix, "to_numpy"):
+        arr = matrix.to_numpy()
+    elif hasattr(matrix, "toarray"):
+        arr = matrix.toarray()
+    else:
+        arr = np.asarray(matrix)
+    arr2d: NDArrayFloat = np.asarray(arr, dtype=np.float32)
+    if arr2d.ndim != 2:
+        raise ValueError(f"Expected 2D pseudobulk matrix, got shape {arr2d.shape}")
+    return arr2d
+
+
+def _to_dense_nonnegative(adata: ad.AnnData) -> NDArrayFloat:
+    """Convert X to dense float32 and clip to >= 1e-10 (required by seurat_v3)."""
+    X_raw = adata.X
+    if X_raw is None:
+        raise ValueError("AnnData.X is None")
+    X = X_raw.toarray() if hasattr(X_raw, "toarray") else np.asarray(X_raw)
+    if X.ndim != 2:
+        raise ValueError(f"Expected 2D matrix, got shape {X.shape}")
+    X_float: NDArrayFloat = np.asarray(X, dtype=np.float32)
+    return np.maximum(X_float, 1e-10)
+
+
+def _pseudobulk_with_adpbulk(adata: ad.AnnData, perturbation_col: str) -> ad.AnnData:
+    """Pseudobulk an AnnData object by perturbation using adpbulk.
+
+    Returns a small AnnData with one row per perturbation group, preserving var.
+    """
+    if perturbation_col not in adata.obs.columns:
+        raise KeyError(
+            f"Column '{perturbation_col}' not found in adata.obs for pseudobulk"
+        )
+
+    from adpbulk import ADPBulk
+
+    adpb = ADPBulk(adata, perturbation_col)
+    matrix = _to_2d_array(adpb.fit_transform())
+    if matrix.shape[1] != adata.n_vars:
+        raise ValueError(
+            f"Pseudobulk matrix gene dimension mismatch: "
+            f"expected {adata.n_vars}, got {matrix.shape[1]}"
+        )
+
+    pseudobulk = ad.AnnData(X=matrix, var=adata.var.copy())
+    pseudobulk.var_names = [_normalize_gene_label(v) for v in adata.var_names]
+
+    meta = adpb.get_meta()
+    if hasattr(meta, "copy") and hasattr(meta, "__len__") and len(meta) == pseudobulk.n_obs:
+        try:
+            pseudobulk.obs = meta.copy()
+            pseudobulk.obs_names = [str(v) for v in pseudobulk.obs_names]
+        except Exception:
+            pseudobulk.obs_names = [f"{perturbation_col}_{i}" for i in range(pseudobulk.n_obs)]
+    else:
+        pseudobulk.obs_names = [f"{perturbation_col}_{i}" for i in range(pseudobulk.n_obs)]
+
+    return pseudobulk
+
+
+def select_hvgs_from_adata(adata: ad.AnnData, num_hvgs: int) -> list[str]:
+    """Select top HVGs from an AnnData using seurat_v3 flavor.
+
+    Expects non-log-transformed data (counts or normalized counts).
+    Returns a list of HVG gene names.
+    """
+    if num_hvgs < 1:
+        raise ValueError(f"num_hvgs must be >= 1, got {num_hvgs}")
+    if num_hvgs > adata.n_vars:
+        raise ValueError(
+            f"num_hvgs ({num_hvgs}) exceeds total genes ({adata.n_vars})"
+        )
+
+    work = adata.copy()
+    work.var_names = [_normalize_gene_label(v) for v in work.var_names]
+    work.X = _to_dense_nonnegative(work)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*flavor='seurat_v3'.*")
+        sc.pp.highly_variable_genes(
+            work,
+            n_top_genes=num_hvgs,
+            flavor="seurat_v3",
+        )
+
+    if "highly_variable" not in work.var:
+        raise ValueError("HVG computation did not produce 'highly_variable' mask")
+
+    hvg_mask = work.var["highly_variable"]
+    selected = work.var_names[hvg_mask]
+    return [_normalize_gene_label(v) for v in selected.tolist()]
+
+
+def compute_global_hvgs(
+    h5ad_files: list[Path],
+    num_hvgs: int,
+    perturbation_col: str,
+    cancel_check: Callable[[], bool] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[str]:
+    """Compute a single global HVG set across all files using pseudobulk aggregation.
+
+    Pass 1: For each file, load → pseudobulk by perturbation_col → collect.
+    Then concatenate all pseudobulks (inner join) and select HVGs once.
+
+    Returns an ordered list of HVG gene names.
+    """
+    if not h5ad_files:
+        raise ValueError("No input files provided for HVG computation")
+
+    pseudobulks: list[ad.AnnData] = []
+    concat_keys: list[str] = []
+
+    for idx, file_path in enumerate(h5ad_files):
+        if cancel_check is not None and cancel_check():
+            raise PreprocessCancelledError(
+                f"HVG computation cancelled after {idx}/{len(h5ad_files)} files."
+            )
+
+        if progress_callback:
+            progress_callback({
+                "kind": "progress",
+                "phase": "computing_hvgs",
+                "files_done": idx,
+                "files_total": len(h5ad_files),
+                "current_file": str(file_path.name),
+                "message": f"Pseudobulking file {idx + 1}/{len(h5ad_files)} for HVG selection: {file_path.name}",
+            })
+
+        adata = ad.read_h5ad(file_path)
+        try:
+            # Standardize perturbation column so pseudobulk can find it
+            if perturbation_col in adata.obs.columns:
+                adata.obs[perturbation_col] = adata.obs[perturbation_col].astype(str).astype("category")
+            pseudobulk = _pseudobulk_with_adpbulk(adata, perturbation_col)
+            pseudobulks.append(pseudobulk)
+            concat_keys.append(file_path.stem)
+        finally:
+            del adata
+            force_release_memory()
+
+    if progress_callback:
+        progress_callback({
+            "kind": "progress",
+            "phase": "computing_hvgs",
+            "files_done": len(h5ad_files),
+            "files_total": len(h5ad_files),
+            "message": "Concatenating pseudobulks and selecting HVGs...",
+        })
+
+    combined = ad.concat(
+        pseudobulks,
+        axis=0,
+        join="inner",
+        keys=concat_keys,
+        label="source_file",
+        index_unique="|",
+    )
+    del pseudobulks
+    force_release_memory()
+
+    hvg_names = select_hvgs_from_adata(combined, num_hvgs)
+    logger.info(f"Selected {len(hvg_names)} global HVGs from {len(h5ad_files)} pseudobulked files")
+    return hvg_names
+
+
+# ---------------------------------------------------------------------------
 # Per-file processing pipeline
 # ---------------------------------------------------------------------------
 
@@ -445,6 +618,7 @@ def normalize_log_transform_single(
     config: PreprocessTrainConfig,
     file_seed: int,
     gene_set: list[str] | None,
+    hvg_names: list[str] | None = None,
 ) -> TransformStats | None:
     """Process a single H5AD file: normalize, transform, add metrics.
 
@@ -460,7 +634,7 @@ def normalize_log_transform_single(
     9. Compute knockdown efficiency (BEFORE log1p)
     10. Apply log1p transformation
     11. Compute log deviation (AFTER log1p)
-    12. Optional HVG selection
+    12. Optional HVG subsetting (from pre-computed global HVG list)
     13. Write output
     """
     try:
@@ -560,11 +734,13 @@ def normalize_log_transform_single(
             adata.obs[config.target_fc_key] = log_fc
             logger.info(f"Computed {config.target_fc_key}")
 
-    # Optional HVG selection (STATE-specific)
-    if config.num_hvgs is not None:
-        sc.pp.highly_variable_genes(adata, n_top_genes=config.num_hvgs)
-        adata.obsm["X_hvg"] = adata[:, adata.var.highly_variable].X.toarray()
-        logger.info(f"Selected {config.num_hvgs} HVGs, stored in obsm['X_hvg']")
+    # Optional HVG subsetting (from pre-computed global HVG list)
+    if hvg_names is not None:
+        hvg_mask = adata.var_names.isin(hvg_names)
+        n_found = int(hvg_mask.sum())
+        X_hvg = adata[:, hvg_mask].X
+        adata.obsm["X_hvg"] = X_hvg.toarray() if sp.issparse(X_hvg) else np.asarray(X_hvg)
+        logger.info(f"Stored {n_found} global HVGs in obsm['X_hvg']")
 
     # Write output
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -641,6 +817,26 @@ def normalize_transform_files(
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Pass 1: Global HVG computation via pseudobulk (when requested) ---
+    hvg_names: list[str] | None = None
+    if config.num_hvgs is not None:
+        if progress_callback:
+            progress_callback({
+                "kind": "progress",
+                "phase": "computing_hvgs",
+                "files_total": len(h5ad_files),
+                "message": f"Computing global HVGs from {len(h5ad_files)} files via pseudobulk...",
+            })
+        hvg_names = compute_global_hvgs(
+            h5ad_files=h5ad_files,
+            num_hvgs=config.num_hvgs,
+            perturbation_col=config.perturbation_col,
+            cancel_check=cancel_check,
+            progress_callback=progress_callback,
+        )
+        logger.info(f"Global HVG set computed: {len(hvg_names)} genes")
+
+    # --- Pass 2: Full transform pipeline per file ---
     file_stats: list[TransformStats] = []
     skipped_count = 0
     total_cells = 0
@@ -680,7 +876,7 @@ def normalize_transform_files(
 
         file_seed = config.seed + idx
         stats = normalize_log_transform_single(
-            h5ad_path, output_path, config, file_seed, gene_set
+            h5ad_path, output_path, config, file_seed, gene_set, hvg_names
         )
 
         if stats is None:

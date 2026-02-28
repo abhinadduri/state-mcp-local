@@ -3039,9 +3039,11 @@ def start_preprocess_train(
     value: `["context", "perturbation"]` (or the raw column names, e.g.
     `["cell_type", "perturbation"]`).
 
-    **num_hvgs**: when set, runs `sc.pp.highly_variable_genes` and stores the
-    HVG expression sub-matrix in `obsm['X_hvg']`. Useful for
-    `output_space='gene'` (legacy: `output_space='hvg'`) training.
+    **num_hvgs**: when set, computes a **global** HVG set across all input files
+    using pseudobulk aggregation (via adpbulk) followed by seurat_v3 HVG selection.
+    This ensures all output files share the same HVG columns. The HVG expression
+    sub-matrix is stored in `obsm['X_hvg']`. Useful for `output_space='gene'`
+    (legacy: `output_space='hvg'`) training.
 
     Poll status with `get_preprocess_train_status`, fetch logs with `get_preprocess_train_logs`,
     and cancel with `cancel_preprocess_train`.
