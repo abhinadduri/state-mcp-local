@@ -30,7 +30,6 @@ from ._jobs import (
     TrainJob,
     _CANCEL_GRACE_SECONDS,
     _FALLBACK_SESSION_KEY,
-    _JOBS,
     _JOBS_LOCK,
     _PREPROCESS_JOBS_LOCK,
     _SESSION_SERVER_STATE_LOCK,
@@ -48,9 +47,6 @@ from ._jobs import (
     _get_session_train_jobs_locked,
     _get_train_job_locked,
     _get_worker_mp_context,
-    _touch_job,
-    _touch_preprocess_job,
-    _touch_train_job,
     _utc_now_iso,
 )
 
@@ -2940,6 +2936,7 @@ def plan_tx_predict(
     pseudobulk: bool = False,
     shared_only: bool = False,
     eval_train_data: bool = False,
+    eval_batch_size: int = 0,
 ) -> dict[str, Any]:
     """
     Inspect a TX training run folder and estimate the evaluation workload
@@ -3063,7 +3060,8 @@ def plan_tx_predict(
         if test_cell_estimate >= 5_000_000:
             submission_hints.append(
                 f"~{test_cell_estimate:,} test cells detected. Recommend `pseudobulk=True` "
-                f"and `skip_de=True` to avoid OOM."
+                f"with `eval_batch_size=50` for cell-level DE without OOM, "
+                f"or `skip_de=True` to skip DE entirely."
             )
         elif test_cell_estimate >= 1_000_000:
             submission_hints.append(
@@ -3117,6 +3115,7 @@ def plan_tx_predict(
             "pseudobulk": pseudobulk,
             "shared_only": shared_only,
             "eval_train_data": eval_train_data,
+            "eval_batch_size": eval_batch_size,
         },
         "submission_hints": submission_hints,
     }
@@ -3133,6 +3132,7 @@ def start_tx_predict(
     pseudobulk: bool = False,
     shared_only: bool = False,
     eval_train_data: bool = False,
+    eval_batch_size: int = 0,
     backend: str = "auto",
     backend_profile: str | None = None,
     slurm_partition: str | None = None,
@@ -3186,7 +3186,6 @@ def start_tx_predict(
         output_dir=output_dir_resolved,
         toml=resolved_toml,
         checkpoint=resolved_checkpoint,
-        test_time_finetune=0,
         profile=profile,
         predict_only=predict_only,
         skip_adatas=False,
@@ -3194,6 +3193,7 @@ def start_tx_predict(
         shared_only=shared_only,
         eval_train_data=eval_train_data,
         pseudobulk=pseudobulk,
+        eval_batch_size=eval_batch_size,
     )
 
     resolved_info = {
@@ -3206,6 +3206,7 @@ def start_tx_predict(
         "pseudobulk": pseudobulk,
         "shared_only": shared_only,
         "eval_train_data": eval_train_data,
+        "eval_batch_size": eval_batch_size,
     }
 
     session_key = _get_current_session_key()

@@ -308,8 +308,6 @@ def _build_tx_predict_cli_args(predict_args: Namespace) -> list[str]:
     args.extend(["--profile", str(predict_args.profile)])
     if predict_args.toml is not None:
         args.extend(["--toml", str(predict_args.toml)])
-    if getattr(predict_args, "test_time_finetune", 0) > 0:
-        args.extend(["--test-time-finetune", str(predict_args.test_time_finetune)])
     if getattr(predict_args, "predict_only", False):
         args.append("--predict-only")
     if getattr(predict_args, "skip_adatas", False):
@@ -322,6 +320,8 @@ def _build_tx_predict_cli_args(predict_args: Namespace) -> list[str]:
         args.append("--eval-train-data")
     if getattr(predict_args, "pseudobulk", False):
         args.append("--pseudobulk")
+    if getattr(predict_args, "eval_batch_size", 0) > 0:
+        args.extend(["--eval-batch-size", str(predict_args.eval_batch_size)])
     return args
 
 
