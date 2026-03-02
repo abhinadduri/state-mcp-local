@@ -235,7 +235,8 @@ def _run_batched_de(
     import polars as pl
     from cell_eval import MetricsEvaluator
 
-    h5f = h5py.File(h5_path, "r")
+    # locking=False avoids POSIX file-lock issues on NFS / parallel filesystems
+    h5f = h5py.File(h5_path, "r", locking=False)
     try:
         all_perts = h5f["pert_name"][:].astype(str)
         all_celltypes = h5f["cell_type"][:].astype(str)
@@ -299,6 +300,13 @@ def _run_batched_de(
                     write_csv=False,
                 )
                 all_de_results.append(de_results_df)
+
+                # Clean up intermediate DE CSV files written by MetricsEvaluator
+                batch_prefix = f"_debatch_{ct_safe}_{batch_start}"
+                for suffix in ("_pred_de.csv", "_real_de.csv", "_results.csv", "_agg_results.csv"):
+                    tmp_csv = os.path.join(results_dir, f"{batch_prefix}{suffix}")
+                    if os.path.exists(tmp_csv):
+                        os.remove(tmp_csv)
 
                 del batch_pred_X, batch_real_X, evaluator, adata_pred_batch, adata_real_batch
                 gc.collect()
@@ -692,7 +700,7 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         if write_h5:
             h5_path = os.path.join(results_dir, "_tmp_celllevel.h5")
-            h5f_writer = h5py.File(h5_path, "w")
+            h5f_writer = h5py.File(h5_path, "w", locking=False)
             str_dt = h5py.string_dtype()
             chunk_rows = min(1024, num_cells)
             h5f_writer.create_dataset(
@@ -834,6 +842,7 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         # Close h5py writer
         if h5f_writer is not None:
+            h5f_writer.flush()
             h5f_writer.close()
             h5f_writer = None
             logger.info("Closed h5py writer (%d cells written).", h5_idx)
