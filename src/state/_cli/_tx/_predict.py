@@ -626,6 +626,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     output_dim = var_dims["output_dim"]
     gene_dim = var_dims["gene_dim"]
     hvg_dim = var_dims["hvg_dim"]
+    gene_var_names = var_dims.get("gene_names")
 
     logger.info("Generating predictions on test set using manual loop...")
     device = next(model.parameters()).device
@@ -815,6 +816,8 @@ def run_tx_predict(args: ap.ArgumentParser):
 
                     entry = pb_groups.get((context_label, pert_name))
                     if entry is None:
+                        _need_gene_logsum = use_count_outputs and aggregate_gene_in_count_space
+                        _need_main_logsum = aggregate_main_in_count_space
                         entry = {
                             "context": context_label,
                             "pert_name": pert_name,
@@ -825,6 +828,10 @@ def run_tx_predict(args: ap.ArgumentParser):
                             "real_sum": np.zeros(output_dim, dtype=np.float64),
                             "x_hvg_sum": np.zeros(pseudo_x_dim, dtype=np.float64) if use_count_outputs else None,
                             "counts_pred_sum": np.zeros(pseudo_x_dim, dtype=np.float64) if use_count_outputs else None,
+                            "gene_pred_logsum": np.zeros(pseudo_x_dim, dtype=np.float64) if _need_gene_logsum else None,
+                            "gene_real_logsum": np.zeros(pseudo_x_dim, dtype=np.float64) if _need_gene_logsum else None,
+                            "main_pred_logsum": np.zeros(output_dim, dtype=np.float64) if _need_main_logsum else None,
+                            "main_real_logsum": np.zeros(output_dim, dtype=np.float64) if _need_main_logsum else None,
                         }
                         pb_groups[(context_label, pert_name)] = entry
                     elif entry["celltype_name"] != current_celltype:
@@ -836,9 +843,16 @@ def run_tx_predict(args: ap.ArgumentParser):
                     entry["count"] += int(idx_arr.size)
                     entry["pred_sum"] += batch_pred_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
                     entry["real_sum"] += batch_real_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
+                    if entry["main_pred_logsum"] is not None:
+                        entry["main_pred_logsum"] += batch_pred_np[idx_arr].sum(axis=0, dtype=np.float64)
+                        entry["main_real_logsum"] += batch_real_np[idx_arr].sum(axis=0, dtype=np.float64)
                     if use_count_outputs:
                         entry["x_hvg_sum"] += batch_real_gene_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
                         entry["counts_pred_sum"] += batch_gene_pred_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
+                        if entry["gene_real_logsum"] is not None:
+                            # Accumulate in log1p space for eval (mean of log1p values)
+                            entry["gene_pred_logsum"] += batch_gene_pred_np[idx_arr].sum(axis=0, dtype=np.float64)
+                            entry["gene_real_logsum"] += batch_real_gene_np[idx_arr].sum(axis=0, dtype=np.float64)
 
         # Close h5py writer
         if h5f_writer is not None:
@@ -906,8 +920,8 @@ def run_tx_predict(args: ap.ArgumentParser):
             pred_bulk_sum[idx, :] = entry["pred_sum"].astype(np.float32, copy=False)
             real_bulk_sum[idx, :] = entry["real_sum"].astype(np.float32, copy=False)
             if aggregate_main_in_count_space:
-                pred_bulk_eval[idx, :] = np.log1p(entry["pred_sum"]).astype(np.float32, copy=False)
-                real_bulk_eval[idx, :] = np.log1p(entry["real_sum"]).astype(np.float32, copy=False)
+                pred_bulk_eval[idx, :] = (entry["main_pred_logsum"] / denom).astype(np.float32, copy=False)
+                real_bulk_eval[idx, :] = (entry["main_real_logsum"] / denom).astype(np.float32, copy=False)
             else:
                 pred_bulk_eval[idx, :] = (entry["pred_sum"] / denom).astype(np.float32, copy=False)
                 real_bulk_eval[idx, :] = (entry["real_sum"] / denom).astype(np.float32, copy=False)
@@ -915,8 +929,8 @@ def run_tx_predict(args: ap.ArgumentParser):
                 pred_x_sum[idx, :] = entry["counts_pred_sum"].astype(np.float32, copy=False)
                 real_x_sum[idx, :] = entry["x_hvg_sum"].astype(np.float32, copy=False)
                 if aggregate_gene_in_count_space:
-                    pred_x_eval[idx, :] = np.log1p(entry["counts_pred_sum"]).astype(np.float32, copy=False)
-                    real_x_eval[idx, :] = np.log1p(entry["x_hvg_sum"]).astype(np.float32, copy=False)
+                    pred_x_eval[idx, :] = (entry["gene_pred_logsum"] / denom).astype(np.float32, copy=False)
+                    real_x_eval[idx, :] = (entry["gene_real_logsum"] / denom).astype(np.float32, copy=False)
                 else:
                     pred_x_eval[idx, :] = (entry["counts_pred_sum"] / denom).astype(np.float32, copy=False)
                     real_x_eval[idx, :] = (entry["x_hvg_sum"] / denom).astype(np.float32, copy=False)
@@ -930,17 +944,18 @@ def run_tx_predict(args: ap.ArgumentParser):
                 obs_dict[data_module.batch_col].append(entry["batch_name"])
 
         obs = pd.DataFrame(obs_dict)
+        gene_var_df = pd.DataFrame(index=gene_var_names) if gene_var_names is not None else None
         if use_count_outputs:
             # Persisted outputs: summed pseudobulks.
-            adata_pred = anndata.AnnData(X=pred_x_sum, obs=obs)
-            adata_real = anndata.AnnData(X=real_x_sum, obs=obs)
+            adata_pred = anndata.AnnData(X=pred_x_sum, obs=obs, var=gene_var_df)
+            adata_real = anndata.AnnData(X=real_x_sum, obs=obs, var=gene_var_df)
             if data_module.embed_key is not None:
                 adata_pred.obsm[data_module.embed_key] = pred_bulk_sum
                 adata_real.obsm[data_module.embed_key] = real_bulk_sum
 
-            # Metric inputs: log1p(sum) pseudobulks for log1p outputs, mean otherwise.
-            adata_pred_eval = anndata.AnnData(X=pred_x_eval, obs=obs.copy())
-            adata_real_eval = anndata.AnnData(X=real_x_eval, obs=obs.copy())
+            # Metric inputs: mean(log1p) pseudobulks for log1p outputs, mean otherwise.
+            adata_pred_eval = anndata.AnnData(X=pred_x_eval, obs=obs.copy(), var=gene_var_df)
+            adata_real_eval = anndata.AnnData(X=real_x_eval, obs=obs.copy(), var=gene_var_df)
             if data_module.embed_key is not None:
                 adata_pred_eval.obsm[data_module.embed_key] = pred_bulk_eval
                 adata_real_eval.obsm[data_module.embed_key] = real_bulk_eval
@@ -948,7 +963,7 @@ def run_tx_predict(args: ap.ArgumentParser):
             # Persisted outputs: summed pseudobulks.
             adata_pred = anndata.AnnData(X=pred_bulk_sum, obs=obs)
             adata_real = anndata.AnnData(X=real_bulk_sum, obs=obs)
-            # Metric inputs: log1p(sum) pseudobulks for log1p outputs, mean otherwise.
+            # Metric inputs: mean(log1p) pseudobulks for log1p outputs, mean otherwise.
             adata_pred_eval = anndata.AnnData(X=pred_bulk_eval, obs=obs.copy())
             adata_real_eval = anndata.AnnData(X=real_bulk_eval, obs=obs.copy())
 
@@ -956,7 +971,7 @@ def run_tx_predict(args: ap.ArgumentParser):
             "sum(expm1(log1p(x)))" if (aggregate_main_in_count_space or aggregate_gene_in_count_space) else "sum(x)"
         )
         eval_mode = (
-            "log1p(sum(expm1(log1p(x))))"
+            "mean(log1p(x))"
             if (aggregate_main_in_count_space or aggregate_gene_in_count_space)
             else "mean(x)"
         )
@@ -1076,11 +1091,12 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         obs = pd.DataFrame(df_dict)
 
+        gene_var_df = pd.DataFrame(index=gene_var_names) if gene_var_names is not None else None
         if final_X_hvg is not None:
             # Create adata for predictions - using the decoded gene expression values
-            adata_pred = anndata.AnnData(X=final_pert_cell_counts_preds, obs=obs)
+            adata_pred = anndata.AnnData(X=final_pert_cell_counts_preds, obs=obs, var=gene_var_df)
             # Create adata for real - using the true gene expression values
-            adata_real = anndata.AnnData(X=final_X_hvg, obs=obs)
+            adata_real = anndata.AnnData(X=final_X_hvg, obs=obs, var=gene_var_df)
 
             # add the embedding predictions
             if data_module.embed_key is not None:
@@ -1089,9 +1105,10 @@ def run_tx_predict(args: ap.ArgumentParser):
                 logger.info(f"Added predicted embeddings to adata.obsm['{data_module.embed_key}']")
         else:
             # Create adata for predictions - model was trained on gene expression space already
-            adata_pred = anndata.AnnData(X=final_preds, obs=obs)
+            _var = gene_var_df if (gene_var_df is not None and len(gene_var_df) == final_preds.shape[1]) else None
+            adata_pred = anndata.AnnData(X=final_preds, obs=obs, var=_var)
             # Create adata for real - using the true gene expression values
-            adata_real = anndata.AnnData(X=final_reals, obs=obs)
+            adata_real = anndata.AnnData(X=final_reals, obs=obs, var=_var)
 
         # Cell-level: eval adatas are the same as save adatas
         adata_pred_eval = adata_pred
