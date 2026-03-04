@@ -242,6 +242,12 @@ def run_tx_train(cfg: DictConfig):
         cumulative_flops_cb = CumulativeFLOPSCallback(use_backward=cumulative_flops_use_backward)
         callbacks.append(cumulative_flops_cb)
 
+    # Add data loading profiler if CELL_LOAD_PROFILE=1
+    if os.environ.get("CELL_LOAD_PROFILE", "0") == "1":
+        from state.tx.callbacks import DataLoadProfilerCallback
+        callbacks.append(DataLoadProfilerCallback(log_interval=50))
+        logger.info("DataLoadProfilerCallback added (CELL_LOAD_PROFILE=1)")
+
     logger.info("Loggers and callbacks set up.")
 
     plugins = []
