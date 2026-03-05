@@ -162,6 +162,7 @@ def _run_cell_eval(
     embed_key,
     skip_de=False,
     write_csv=True,
+    allow_discrete=False,
 ):
     """
     Run MetricsEvaluator per cell type.
@@ -196,6 +197,7 @@ def _run_cell_eval(
             pdex_kwargs=pdex_kwargs,
             batch_size=2048,
             skip_de=skip_de,
+            allow_discrete=allow_discrete,
         )
         results_df, agg_df = evaluator.compute(
             profile=profile,
@@ -217,6 +219,7 @@ def _run_batched_de(
     non_de_results,
     shared_perts,
     logger,
+    allow_discrete=False,
 ):
     """
     Run cell-level DE in batches from temporary h5py storage.
@@ -294,6 +297,7 @@ def _run_batched_de(
                     pdex_kwargs=pdex_kwargs,
                     batch_size=2048,
                     skip_de=False,
+                    allow_discrete=allow_discrete,
                 )
                 de_results_df, _ = evaluator.compute(
                     profile="de",
@@ -1172,6 +1176,12 @@ def run_tx_predict(args: ap.ArgumentParser):
         logger.info("Computing metrics using cell-eval...")
 
         pdex_kwargs = dict(exp_post_agg=True, is_log1p=metrics_is_log1p)
+        allow_discrete_eval = not metrics_is_log1p
+        logger.info(
+            "Cell-eval config: allow_discrete=%s (pdex is_log1p=%s)",
+            allow_discrete_eval,
+            metrics_is_log1p,
+        )
 
         if args.pseudobulk and args.eval_batch_size > 0 and not args.skip_de and h5_path is not None:
             # Batched DE mode:
@@ -1181,12 +1191,14 @@ def run_tx_predict(args: ap.ArgumentParser):
                 adata_real_eval, adata_pred_eval, data_module, results_dir,
                 args.profile, pdex_kwargs, data_module.embed_key,
                 skip_de=True, write_csv=False,
+                allow_discrete=allow_discrete_eval,
             )
             # 2. Batched cell-level DE from h5py
             logger.info("Running batched cell-level DE with batch_size=%d...", args.eval_batch_size)
             _run_batched_de(
                 h5_path, results_dir, data_module, args.eval_batch_size,
                 pdex_kwargs, non_de_results, shared_perts_set, logger,
+                allow_discrete=allow_discrete_eval,
             )
             h5_path = None  # Already cleaned up by _run_batched_de
         else:
@@ -1195,6 +1207,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 adata_real_eval, adata_pred_eval, data_module, results_dir,
                 args.profile, pdex_kwargs, data_module.embed_key,
                 skip_de=args.skip_de,
+                allow_discrete=allow_discrete_eval,
             )
 
     # Clean up h5py temp file if it wasn't used (e.g., predict_only or skip_de)
