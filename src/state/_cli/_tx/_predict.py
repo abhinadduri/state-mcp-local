@@ -679,24 +679,6 @@ def run_tx_predict(args: ap.ArgumentParser):
             )
         cfg["data"]["kwargs"]["is_log1p"] = resolved_is_log1p
         cfg["data"]["kwargs"]["exp_counts"] = expected_exp_counts
-    resolved_exp_counts = bool(getattr(data_module, "exp_counts", cfg["data"]["kwargs"].get("exp_counts", False)))
-    default_metrics_is_log1p = not (nb_loss_enabled or resolved_exp_counts)
-    if nb_loss_enabled:
-        cfg_nb_eval_scale_mode = str(eval_cfg.get("nb_eval_scale_mode", "legacy")).strip().lower()
-        if args.nb_eval_scale_mode != "auto":
-            nb_eval_scale_mode = args.nb_eval_scale_mode
-        else:
-            nb_eval_scale_mode = cfg_nb_eval_scale_mode
-        if nb_eval_scale_mode not in {"legacy", "log1p"}:
-            raise ValueError(
-                "nb_eval_scale_mode must be one of {'legacy', 'log1p'}; "
-                f"got {nb_eval_scale_mode!r}."
-            )
-        metrics_is_log1p = True if nb_eval_scale_mode == "log1p" else default_metrics_is_log1p
-    else:
-        nb_eval_scale_mode = "legacy"
-        metrics_is_log1p = default_metrics_is_log1p
-
     cfg_nb_dispersion_mode = str(cfg.get("model", {}).get("kwargs", {}).get("nb_inference_dispersion_mode", "per_cell"))
     cfg_nb_output_mode = str(cfg.get("model", {}).get("kwargs", {}).get("nb_inference_output_mode", "mean"))
     cfg_nb_library_mode = str(
@@ -716,6 +698,33 @@ def run_tx_predict(args: ap.ArgumentParser):
         raise ValueError(f"Unsupported NB output mode: {nb_output_mode!r}")
     if nb_loss_enabled and nb_library_mode not in {"per_cell", "set_median"}:
         raise ValueError(f"Unsupported NB library mode: {nb_library_mode!r}")
+
+    resolved_exp_counts = bool(getattr(data_module, "exp_counts", cfg["data"]["kwargs"].get("exp_counts", False)))
+    default_metrics_is_log1p = not (nb_loss_enabled or resolved_exp_counts)
+    if nb_loss_enabled:
+        cfg_nb_eval_scale_mode = str(eval_cfg.get("nb_eval_scale_mode", "auto")).strip().lower()
+        if cfg_nb_eval_scale_mode not in {"auto", "legacy", "log1p"}:
+            raise ValueError(
+                "evaluation.nb_eval_scale_mode must be one of {'auto', 'legacy', 'log1p'}; "
+                f"got {cfg_nb_eval_scale_mode!r}."
+            )
+        if args.nb_eval_scale_mode != "auto":
+            nb_eval_scale_mode = args.nb_eval_scale_mode
+        elif cfg_nb_eval_scale_mode != "auto":
+            nb_eval_scale_mode = cfg_nb_eval_scale_mode
+        else:
+            # NB mean outputs are continuous expectations, so log1p-scale metrics are the
+            # consistent default. Sampled outputs remain count-like and stay in legacy mode.
+            nb_eval_scale_mode = "log1p" if nb_output_mode == "mean" else "legacy"
+        if nb_eval_scale_mode not in {"legacy", "log1p"}:
+            raise ValueError(
+                "nb_eval_scale_mode must be one of {'legacy', 'log1p'}; "
+                f"got {nb_eval_scale_mode!r}."
+            )
+        metrics_is_log1p = True if nb_eval_scale_mode == "log1p" else default_metrics_is_log1p
+    else:
+        nb_eval_scale_mode = "legacy"
+        metrics_is_log1p = default_metrics_is_log1p
     logger.info(
         "Metrics config: setting pdex is_log1p=%s (nb_loss=%s, exp_counts=%s, nb_eval_scale_mode=%s)",
         metrics_is_log1p,
