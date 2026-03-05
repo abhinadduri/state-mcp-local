@@ -274,6 +274,10 @@ def run_tx_train(cfg: DictConfig):
         use_distributed_sampler=False,
     )
 
+    # Optional mixed precision
+    if cfg["training"].get("precision"):
+        trainer_kwargs["precision"] = cfg["training"]["precision"]
+
     # Align logging cadence with rolling MFU window (and W&B logging)
     if "log_every_n_steps" in cfg["training"]:
         trainer_kwargs["log_every_n_steps"] = cfg["training"]["log_every_n_steps"]
