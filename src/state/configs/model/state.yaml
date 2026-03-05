@@ -8,6 +8,7 @@ kwargs:
   hidden_dim: 384
   loss: energy
   nb_loss: false
+  nb_embed_loss_weight: 0.0
   n_encoder_layers: 1
   n_decoder_layers: 1
   predict_residual: True
