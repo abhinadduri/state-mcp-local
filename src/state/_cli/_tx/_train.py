@@ -185,6 +185,12 @@ def run_tx_train(cfg: DictConfig):
         "Model created. Estimated params size: %.2f GB",
         sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3,
     )
+
+    # Optional torch.compile
+    if cfg["training"].get("compile"):
+        compile_mode = cfg["training"]["compile"] if isinstance(cfg["training"]["compile"], str) else "default"
+        logger.info("Compiling model with torch.compile(mode=%s)", compile_mode)
+        model = torch.compile(model, mode=compile_mode)
     loggers = get_loggers(
         output_dir=cfg["output_dir"],
         name=cfg["name"],
@@ -279,6 +285,10 @@ def run_tx_train(cfg: DictConfig):
         accumulate_grad_batches=cfg["training"].get("gradient_accumulation_steps", 1),
         use_distributed_sampler=False,
     )
+
+    # Optional mixed precision
+    if cfg["training"].get("precision"):
+        trainer_kwargs["precision"] = cfg["training"]["precision"]
 
     # Align logging cadence with rolling MFU window (and W&B logging)
     if "log_every_n_steps" in cfg["training"]:
