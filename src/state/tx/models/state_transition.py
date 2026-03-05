@@ -25,6 +25,18 @@ class StateTransitionPerturbationModel(PerturbationModel):
       a sample-to-sample single-cell map.
     """
 
+    @staticmethod
+    def _resolve_nb_embed_loss_weight(embed_key: Optional[str], kwargs: Dict[str, object]) -> Tuple[float, bool]:
+        """Resolve NB embedding auxiliary-loss weight.
+
+        Returns:
+            (weight, used_default)
+        """
+        if "nb_embed_loss_weight" in kwargs:
+            return float(kwargs["nb_embed_loss_weight"]), False
+        # Default to NB-only training objective. Explicitly opt in to embedding auxiliary loss.
+        return 0.0, True
+
     def __init__(
         self,
         input_dim: int,
@@ -82,8 +94,38 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.gene_dim = gene_dim
         self.nb_loss = bool(kwargs.get("nb_loss", False))
         self.nb_eps = float(kwargs.get("nb_eps", 1e-8))
-        default_nb_embed_loss_weight = 1.0 if self.embed_key is not None else 0.0
-        self.nb_embed_loss_weight = float(kwargs.get("nb_embed_loss_weight", default_nb_embed_loss_weight))
+        self.nb_embed_loss_weight, used_default_nb_embed_weight = self._resolve_nb_embed_loss_weight(
+            self.embed_key,
+            kwargs,
+        )
+        self.nb_inference_dispersion_mode = str(kwargs.get("nb_inference_dispersion_mode", "per_cell")).strip().lower()
+        self.nb_inference_output_mode = str(kwargs.get("nb_inference_output_mode", "mean")).strip().lower()
+        self.nb_library_size_mode = str(kwargs.get("nb_library_size_mode", "set_median")).strip().lower()
+        self.nb_inference_library_size_mode = str(kwargs.get("nb_inference_library_size_mode", "auto")).strip().lower()
+        valid_dispersion_modes = {"per_cell", "set_median"}
+        valid_output_modes = {"mean", "sample"}
+        valid_library_modes = {"per_cell", "set_median"}
+        valid_inference_library_modes = {"auto", *valid_library_modes}
+        if self.nb_inference_dispersion_mode not in valid_dispersion_modes:
+            raise ValueError(
+                "nb_inference_dispersion_mode must be one of "
+                f"{sorted(valid_dispersion_modes)}; got {self.nb_inference_dispersion_mode!r}."
+            )
+        if self.nb_inference_output_mode not in valid_output_modes:
+            raise ValueError(
+                "nb_inference_output_mode must be one of "
+                f"{sorted(valid_output_modes)}; got {self.nb_inference_output_mode!r}."
+            )
+        if self.nb_library_size_mode not in valid_library_modes:
+            raise ValueError(
+                "nb_library_size_mode must be one of "
+                f"{sorted(valid_library_modes)}; got {self.nb_library_size_mode!r}."
+            )
+        if self.nb_inference_library_size_mode not in valid_inference_library_modes:
+            raise ValueError(
+                "nb_inference_library_size_mode must be one of "
+                f"{sorted(valid_inference_library_modes)}; got {self.nb_inference_library_size_mode!r}."
+            )
         if self.nb_loss and self.output_space == "embedding":
             raise ValueError(
                 "nb_loss=True is incompatible with output_space='embedding'. "
@@ -91,6 +133,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
             )
         if self.nb_loss and self.output_space not in {"gene", "all"}:
             raise ValueError(f"nb_loss=True requires output_space in {{'gene', 'all'}}; got {self.output_space!r}.")
+        if self.nb_loss and used_default_nb_embed_weight:
+            logger.info(
+                "nb_loss=True: using default nb_embed_loss_weight=0.0 "
+                "(set model.kwargs.nb_embed_loss_weight>0 to enable auxiliary embedding loss)."
+            )
+        if self.nb_loss and self.nb_embed_loss_weight > 0.0:
+            logger.warning(
+                "nb_loss=True with nb_embed_loss_weight=%.3f enables an auxiliary embedding-space loss "
+                "that can dominate NB optimization for full-transcriptome objectives.",
+                self.nb_embed_loss_weight,
+            )
         if self.nb_loss:
             if self.gene_decoder is not None:
                 logger.info("nb_loss=True: disabling gene_decoder and decoder loss branches.")
@@ -298,12 +351,28 @@ class StateTransitionPerturbationModel(PerturbationModel):
         counts = torch.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
         return counts.clamp_min(0.0).round()
 
-    def _compute_set_library_sizes_from_control(self, ctrl_cells: torch.Tensor) -> torch.Tensor:
+    def _compute_per_cell_library_sizes_from_control(self, ctrl_cells: torch.Tensor) -> torch.Tensor:
         ctrl_counts = self._to_count_space(ctrl_cells)
         per_cell_library_sizes = ctrl_counts.sum(dim=-1)
         per_cell_library_sizes = torch.nan_to_num(per_cell_library_sizes, nan=0.0, posinf=0.0, neginf=0.0)
-        per_set_library_sizes = per_cell_library_sizes.median(dim=1, keepdim=True).values.clamp_min(1.0)
-        return per_set_library_sizes.unsqueeze(-1)
+        return per_cell_library_sizes.unsqueeze(-1).clamp_min(1.0)
+
+    def _compute_library_sizes_from_control(self, ctrl_cells: torch.Tensor, mode: str) -> torch.Tensor:
+        per_cell_library_sizes = self._compute_per_cell_library_sizes_from_control(ctrl_cells)
+        if mode == "set_median":
+            return per_cell_library_sizes.median(dim=1, keepdim=True).values
+        return per_cell_library_sizes
+
+    @staticmethod
+    def _rescale_nb_mean_between_library_modes(
+        nb_mean: torch.Tensor,
+        source_library_sizes: torch.Tensor,
+        target_library_sizes: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        source = source_library_sizes.clamp_min(eps)
+        scale = target_library_sizes / source
+        return nb_mean * scale
 
     def _reshape_sequence_tensor(self, x: torch.Tensor, padded: bool) -> torch.Tensor:
         if padded:
@@ -358,6 +427,22 @@ class StateTransitionPerturbationModel(PerturbationModel):
         )
         recon_loss_all = -log_nb
         return torch.nanmean(recon_loss_all.reshape(recon_loss_all.shape[0], -1), dim=1)
+
+    @staticmethod
+    def _reduce_dispersion_for_inference(nb_dispersion: torch.Tensor, mode: str) -> torch.Tensor:
+        if mode == "set_median":
+            return nb_dispersion.median(dim=1, keepdim=True).values.expand_as(nb_dispersion)
+        return nb_dispersion
+
+    def _sample_nb_counts(self, nb_mean: torch.Tensor, nb_dispersion: torch.Tensor) -> torch.Tensor:
+        mu = nb_mean.clamp_min(self.nb_eps)
+        theta = nb_dispersion.clamp_min(self.nb_eps)
+        # PyTorch NB(mean) convention: mean = total_count * probs / (1 - probs).
+        # To sample counts with target mean=mu and inverse-dispersion=theta:
+        # probs = mu / (theta + mu).
+        probs = mu / (theta + mu + self.nb_eps)
+        nb_dist = torch.distributions.NegativeBinomial(total_count=theta, probs=probs)
+        return nb_dist.sample()
 
     def forward(
         self,
@@ -459,8 +544,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             px_scale_logits, nb_dispersion_logits = torch.chunk(nb_params, chunks=2, dim=-1)
             px_scale = F.softmax(px_scale_logits, dim=-1)
             ctrl_for_library = self._get_nb_control_tensor_for_library(batch, basal, padded)
-            set_library_sizes = self._compute_set_library_sizes_from_control(ctrl_for_library)
-            nb_mean = px_scale * set_library_sizes
+            library_sizes = self._compute_library_sizes_from_control(ctrl_for_library, self.nb_library_size_mode)
+            nb_mean = px_scale * library_sizes
             nb_dispersion = F.softplus(nb_dispersion_logits) + self.nb_eps
 
         output = out_pred.reshape(-1, self.output_dim)
@@ -641,8 +726,48 @@ class StateTransitionPerturbationModel(PerturbationModel):
         }
 
         if self.nb_loss:
-            output_dict["pert_cell_counts_preds"] = nb_mean_flat.reshape(-1, self.nb_target_dim)
-            output_dict["pert_cell_counts_dispersion"] = nb_dispersion_flat.reshape(-1, self.nb_target_dim)
+            if padded:
+                nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+                nb_dispersion = nb_dispersion_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            else:
+                nb_mean = nb_mean_flat.reshape(1, -1, self.nb_target_dim)
+                nb_dispersion = nb_dispersion_flat.reshape(1, -1, self.nb_target_dim)
+
+            nb_inference_library_mode = self.nb_inference_library_size_mode
+            if nb_inference_library_mode == "auto":
+                nb_inference_library_mode = self.nb_library_size_mode
+            if nb_inference_library_mode != self.nb_library_size_mode:
+                ctrl_for_library = self._get_nb_control_tensor_for_library(
+                    batch,
+                    batch["ctrl_cell_emb"],
+                    padded,
+                )
+                source_library_sizes = self._compute_library_sizes_from_control(
+                    ctrl_for_library,
+                    self.nb_library_size_mode,
+                ).to(nb_mean.dtype)
+                target_library_sizes = self._compute_library_sizes_from_control(
+                    ctrl_for_library,
+                    nb_inference_library_mode,
+                ).to(nb_mean.dtype)
+                nb_mean = self._rescale_nb_mean_between_library_modes(
+                    nb_mean,
+                    source_library_sizes,
+                    target_library_sizes,
+                    self.nb_eps,
+                )
+
+            nb_dispersion_for_pred = self._reduce_dispersion_for_inference(
+                nb_dispersion,
+                self.nb_inference_dispersion_mode,
+            )
+            if self.nb_inference_output_mode == "sample":
+                nb_pred_counts = self._sample_nb_counts(nb_mean, nb_dispersion_for_pred)
+            else:
+                nb_pred_counts = nb_mean
+
+            output_dict["pert_cell_counts_preds"] = nb_pred_counts.reshape(-1, self.nb_target_dim)
+            output_dict["pert_cell_counts_dispersion"] = nb_dispersion_for_pred.reshape(-1, self.nb_target_dim)
         elif self.gene_decoder is not None:
             pert_cell_counts_preds = self.gene_decoder(latent_output)
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds

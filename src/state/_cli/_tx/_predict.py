@@ -81,6 +81,48 @@ def add_arguments_predict(parser: ap.ArgumentParser):
             "Non-DE metrics still use pseudobulk. Default 0 disables."
         ),
     )
+    parser.add_argument(
+        "--nb-dispersion-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "per_cell", "set_median"],
+        help=(
+            "NB inference-time dispersion handling. "
+            "'auto' reads model.kwargs.nb_inference_dispersion_mode (default per_cell)."
+        ),
+    )
+    parser.add_argument(
+        "--nb-output-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "mean", "sample"],
+        help=(
+            "NB inference-time count output mode. "
+            "'auto' reads model.kwargs.nb_inference_output_mode (default mean)."
+        ),
+    )
+    parser.add_argument(
+        "--nb-library-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "set_median", "per_cell"],
+        help=(
+            "NB inference-time library-size mode for mean rescaling. "
+            "'auto' reads model.kwargs.nb_inference_library_size_mode and falls back "
+            "to model.kwargs.nb_library_size_mode (default set_median)."
+        ),
+    )
+    parser.add_argument(
+        "--nb-eval-scale-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "legacy", "log1p"],
+        help=(
+            "NB eval-scale behavior. "
+            "'legacy' keeps current count-space eval for NB; "
+            "'log1p' converts count outputs to log1p for cell-eval."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +421,7 @@ def _run_batched_de(
 
 
 def run_tx_predict(args: ap.ArgumentParser):
+    import json
     import logging
     import os
     import sys
@@ -425,6 +468,19 @@ def run_tx_predict(args: ap.ArgumentParser):
         else:
             np.clip(adata.X, min_value, max_value, out=adata.X)
 
+    def as_log1p_eval_view(adata: anndata.AnnData) -> anndata.AnnData:
+        """Return a copy with X transformed to log1p(max(x,0))."""
+        out = adata.copy()
+        if sp.issparse(out.X):
+            out.X = out.X.copy()
+            np.clip(out.X.data, 0.0, None, out=out.X.data)
+            np.log1p(out.X.data, out=out.X.data)
+        else:
+            arr = np.asarray(out.X)
+            arr = np.clip(arr, 0.0, None)
+            out.X = np.log1p(arr).astype(np.float32, copy=False)
+        return out
+
     def get_batch_labels(candidates, batch_size: int):
         batch_labels = None
         for candidate in candidates:
@@ -464,6 +520,84 @@ def run_tx_predict(args: ap.ArgumentParser):
             return values.tolist()
         return [values] * batch_size
 
+    def suspected_discrete_np(x: np.ndarray, n_rows: int = 128) -> bool:
+        if x.size == 0:
+            return False
+        if x.ndim == 1:
+            rows = x.reshape(1, -1)
+        else:
+            rows = x.reshape(-1, x.shape[-1])
+        rows = rows[: min(rows.shape[0], n_rows)]
+        row_sums = rows.sum(axis=1)
+        frac = row_sums - np.floor(row_sums)
+        return bool(np.all(np.abs(frac) < 1e-6))
+
+    def suspected_log_np(x: np.ndarray) -> bool:
+        if x.size == 0:
+            return False
+        finite = x[np.isfinite(x)]
+        if finite.size == 0:
+            return False
+        return bool(np.max(finite) < 15.0)
+
+    def summarize_array_np(x: np.ndarray, sample_size: int = 200000, seed: int = 42) -> dict:
+        arr = np.asarray(x)
+        if arr.size == 0:
+            return {"empty": True}
+        finite_mask = np.isfinite(arr)
+        finite = arr[finite_mask]
+        if finite.size == 0:
+            return {
+                "empty": False,
+                "non_finite_fraction": 1.0,
+                "sample_size": 0,
+            }
+
+        rng = np.random.default_rng(seed)
+        if finite.size > sample_size:
+            idx = rng.choice(finite.size, size=sample_size, replace=False)
+            sample = finite[idx]
+        else:
+            sample = finite
+
+        return {
+            "empty": False,
+            "shape": list(arr.shape),
+            "sample_size": int(sample.size),
+            "total_size": int(arr.size),
+            "non_finite_fraction": float(1.0 - (finite.size / arr.size)),
+            "suspected_discrete": suspected_discrete_np(sample),
+            "suspected_log1p": suspected_log_np(sample),
+            "min": float(np.min(sample)),
+            "max": float(np.max(sample)),
+            "mean": float(np.mean(sample)),
+            "var": float(np.var(sample)),
+            "sparsity_zero_fraction": float(np.mean(np.isclose(sample, 0.0, atol=1e-8))),
+            "negative_fraction": float(np.mean(sample < 0.0)),
+            "quantiles": {
+                "q01": float(np.quantile(sample, 0.01)),
+                "q05": float(np.quantile(sample, 0.05)),
+                "q50": float(np.quantile(sample, 0.50)),
+                "q95": float(np.quantile(sample, 0.95)),
+                "q99": float(np.quantile(sample, 0.99)),
+            },
+        }
+
+    def collect_sample_values(arr: np.ndarray, cap: int = 100000, take: int = 4096) -> np.ndarray:
+        arr = np.asarray(arr)
+        if arr.size == 0:
+            return np.empty((0,), dtype=np.float32)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return np.empty((0,), dtype=np.float32)
+        rng = np.random.default_rng(42)
+        sample_n = min(int(take), finite.size)
+        idx = rng.choice(finite.size, size=sample_n, replace=False)
+        sampled = finite[idx].astype(np.float32, copy=False)
+        if sampled.size > cap:
+            sampled = sampled[:cap]
+        return sampled
+
     # -----------------------------------------------------------------------
     # 1. Load the config
     # -----------------------------------------------------------------------
@@ -486,6 +620,10 @@ def run_tx_predict(args: ap.ArgumentParser):
             raise KeyError("The loaded config does not contain data.kwargs, unable to override toml_config_path.")
         cfg["data"]["kwargs"]["toml_config_path"] = args.toml
         logger.info("Overriding data.kwargs.toml_config_path to %s", args.toml)
+
+    eval_cfg = cfg.get("evaluation", {})
+    if not isinstance(eval_cfg, dict):
+        eval_cfg = {}
 
     # 2. Find run output directory & load data module
     run_output_dir = os.path.join(cfg["output_dir"], cfg["name"])
@@ -542,13 +680,56 @@ def run_tx_predict(args: ap.ArgumentParser):
         cfg["data"]["kwargs"]["is_log1p"] = resolved_is_log1p
         cfg["data"]["kwargs"]["exp_counts"] = expected_exp_counts
     resolved_exp_counts = bool(getattr(data_module, "exp_counts", cfg["data"]["kwargs"].get("exp_counts", False)))
-    metrics_is_log1p = not (nb_loss_enabled or resolved_exp_counts)
+    default_metrics_is_log1p = not (nb_loss_enabled or resolved_exp_counts)
+    if nb_loss_enabled:
+        cfg_nb_eval_scale_mode = str(eval_cfg.get("nb_eval_scale_mode", "legacy")).strip().lower()
+        if args.nb_eval_scale_mode != "auto":
+            nb_eval_scale_mode = args.nb_eval_scale_mode
+        else:
+            nb_eval_scale_mode = cfg_nb_eval_scale_mode
+        if nb_eval_scale_mode not in {"legacy", "log1p"}:
+            raise ValueError(
+                "nb_eval_scale_mode must be one of {'legacy', 'log1p'}; "
+                f"got {nb_eval_scale_mode!r}."
+            )
+        metrics_is_log1p = True if nb_eval_scale_mode == "log1p" else default_metrics_is_log1p
+    else:
+        nb_eval_scale_mode = "legacy"
+        metrics_is_log1p = default_metrics_is_log1p
+
+    cfg_nb_dispersion_mode = str(cfg.get("model", {}).get("kwargs", {}).get("nb_inference_dispersion_mode", "per_cell"))
+    cfg_nb_output_mode = str(cfg.get("model", {}).get("kwargs", {}).get("nb_inference_output_mode", "mean"))
+    cfg_nb_library_mode = str(
+        cfg.get("model", {})
+        .get("kwargs", {})
+        .get(
+            "nb_inference_library_size_mode",
+            cfg.get("model", {}).get("kwargs", {}).get("nb_library_size_mode", "set_median"),
+        )
+    )
+    nb_dispersion_mode = args.nb_dispersion_mode if args.nb_dispersion_mode != "auto" else cfg_nb_dispersion_mode
+    nb_output_mode = args.nb_output_mode if args.nb_output_mode != "auto" else cfg_nb_output_mode
+    nb_library_mode = args.nb_library_mode if args.nb_library_mode != "auto" else cfg_nb_library_mode
+    if nb_loss_enabled and nb_dispersion_mode not in {"per_cell", "set_median"}:
+        raise ValueError(f"Unsupported NB dispersion mode: {nb_dispersion_mode!r}")
+    if nb_loss_enabled and nb_output_mode not in {"mean", "sample"}:
+        raise ValueError(f"Unsupported NB output mode: {nb_output_mode!r}")
+    if nb_loss_enabled and nb_library_mode not in {"per_cell", "set_median"}:
+        raise ValueError(f"Unsupported NB library mode: {nb_library_mode!r}")
     logger.info(
-        "Metrics config: setting pdex is_log1p=%s (nb_loss=%s, exp_counts=%s)",
+        "Metrics config: setting pdex is_log1p=%s (nb_loss=%s, exp_counts=%s, nb_eval_scale_mode=%s)",
         metrics_is_log1p,
         nb_loss_enabled,
         resolved_exp_counts,
+        nb_eval_scale_mode,
     )
+    if nb_loss_enabled:
+        logger.info(
+            "NB inference config: dispersion_mode=%s output_mode=%s library_mode=%s",
+            nb_dispersion_mode,
+            nb_output_mode,
+            nb_library_mode,
+        )
     logger.info("Loaded data module from %s", data_module_path)
 
     # Seed everything
@@ -568,6 +749,11 @@ def run_tx_predict(args: ap.ArgumentParser):
     # Determine model class and load
     model_class_name = cfg["model"]["name"]
     model_kwargs = cfg["model"]["kwargs"]
+    if nb_loss_enabled:
+        model_kwargs = dict(model_kwargs)
+        model_kwargs["nb_inference_dispersion_mode"] = nb_dispersion_mode
+        model_kwargs["nb_inference_output_mode"] = nb_output_mode
+        model_kwargs["nb_inference_library_size_mode"] = nb_library_mode
 
     # Import the correct model class
     if model_class_name.lower() == "embedsum":
@@ -652,6 +838,9 @@ def run_tx_predict(args: ap.ArgumentParser):
             "store_raw_expression would otherwise be disabled."
         )
 
+    nb_dispersion_samples = []
+    nb_mean_samples = []
+
     results_dir = _build_results_dir(args.output_dir, args.checkpoint, args.eval_train_data)
     h5_path = None  # Set if h5py temp file is created for batched DE
 
@@ -675,7 +864,9 @@ def run_tx_predict(args: ap.ArgumentParser):
         aggregate_main_in_count_space = bool(
             (not use_count_outputs) and metrics_is_log1p and output_space != "embedding"
         )
-        aggregate_gene_in_count_space = bool(use_count_outputs and metrics_is_log1p)
+        aggregate_gene_in_count_space = bool(
+            use_count_outputs and metrics_is_log1p and (not resolved_exp_counts)
+        )
         if aggregate_main_in_count_space or aggregate_gene_in_count_space:
             logger.info(
                 "Pseudobulk scale handling: detected log1p outputs; accumulating sums in count space via expm1."
@@ -732,6 +923,23 @@ def run_tx_predict(args: ap.ArgumentParser):
             for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch", file=sys.stderr)):
                 batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
                 batch_preds = model.predict_step(batch, batch_idx, padded=False)
+
+                if nb_loss_enabled and batch_preds.get("pert_cell_counts_dispersion") is not None:
+                    nb_dispersion_samples.append(
+                        collect_sample_values(
+                            batch_preds["pert_cell_counts_dispersion"].detach().cpu().numpy(),
+                            cap=100000,
+                            take=4096,
+                        )
+                    )
+                if nb_loss_enabled and batch_preds.get("pert_cell_counts_preds") is not None:
+                    nb_mean_samples.append(
+                        collect_sample_values(
+                            batch_preds["pert_cell_counts_preds"].detach().cpu().numpy(),
+                            cap=100000,
+                            take=4096,
+                        )
+                    )
 
                 batch_size = batch_preds["preds"].shape[0]
                 total_cells_seen += batch_size
@@ -1028,6 +1236,23 @@ def run_tx_predict(args: ap.ArgumentParser):
                 # Get predictions
                 batch_preds = model.predict_step(batch, batch_idx, padded=False)
 
+                if nb_loss_enabled and batch_preds.get("pert_cell_counts_dispersion") is not None:
+                    nb_dispersion_samples.append(
+                        collect_sample_values(
+                            batch_preds["pert_cell_counts_dispersion"].detach().cpu().numpy(),
+                            cap=100000,
+                            take=4096,
+                        )
+                    )
+                if nb_loss_enabled and batch_preds.get("pert_cell_counts_preds") is not None:
+                    nb_mean_samples.append(
+                        collect_sample_values(
+                            batch_preds["pert_cell_counts_preds"].detach().cpu().numpy(),
+                            cap=100000,
+                            take=4096,
+                        )
+                    )
+
                 # Extract metadata and data directly from batch_preds
                 # Handle pert_name
                 if isinstance(batch_preds["pert_name"], list):
@@ -1120,23 +1345,27 @@ def run_tx_predict(args: ap.ArgumentParser):
             # Create adata for real - using the true gene expression values
             adata_real = anndata.AnnData(X=final_reals, obs=obs, var=_var)
 
-        # Cell-level: eval adatas are the same as save adatas
-        adata_pred_eval = adata_pred
-        adata_real_eval = adata_real
+        # Cell-level: eval adatas usually mirror persisted outputs.
+        if nb_loss_enabled and nb_eval_scale_mode == "log1p" and use_count_outputs:
+            logger.info("NB eval scale mode=log1p: converting cell-level count outputs to log1p for metrics.")
+            adata_pred_eval = as_log1p_eval_view(adata_pred)
+            adata_real_eval = as_log1p_eval_view(adata_real)
+        else:
+            adata_pred_eval = adata_pred
+            adata_real_eval = adata_real
 
     # ===================================================================
     # 5. Shared post-processing: clip, filter, save, evaluate
     # ===================================================================
 
     # --- Clip ---
-    if nb_loss_enabled:
-        logger.info(
-            "nb_loss=True in run config; keeping outputs unchanged and skipping metric clipping."
-        )
-    else:
+    should_clip_for_metrics = (not nb_loss_enabled) or (nb_loss_enabled and nb_eval_scale_mode == "log1p")
+    if should_clip_for_metrics:
         clip_anndata_values(adata_pred_eval, max_value=14.0)
         clip_anndata_values(adata_real_eval, max_value=14.0)
         logger.info("Clipped eval data X values to [0.0, 14.0] for cell-eval metrics.")
+    else:
+        logger.info("Skipping metric clipping for this eval configuration.")
 
     # --- Filter shared_only ---
     shared_perts_set = None
@@ -1171,16 +1400,61 @@ def run_tx_predict(args: ap.ArgumentParser):
         logger.info(f"Saved adata_pred to {adata_pred_path}")
         logger.info(f"Saved adata_real to {adata_real_path}")
 
+    # --- Diagnostics ---
+    diagnostics = {
+        "nb_loss_enabled": bool(nb_loss_enabled),
+        "nb_dispersion_mode": nb_dispersion_mode if nb_loss_enabled else None,
+        "nb_output_mode": nb_output_mode if nb_loss_enabled else None,
+        "nb_library_mode": nb_library_mode if nb_loss_enabled else None,
+        "nb_eval_scale_mode": nb_eval_scale_mode if nb_loss_enabled else None,
+        "metrics_is_log1p": bool(metrics_is_log1p),
+        "resolved_exp_counts": bool(resolved_exp_counts),
+        "use_count_outputs": bool(use_count_outputs),
+        "store_raw_expression": bool(store_raw_expression),
+        "clipping_applied": bool(should_clip_for_metrics),
+        "array_summaries": {},
+    }
+    try:
+        pred_eval_X = adata_pred_eval.X.toarray() if sp.issparse(adata_pred_eval.X) else np.asarray(adata_pred_eval.X)
+        real_eval_X = adata_real_eval.X.toarray() if sp.issparse(adata_real_eval.X) else np.asarray(adata_real_eval.X)
+        diagnostics["array_summaries"]["pred_eval_X"] = summarize_array_np(pred_eval_X)
+        diagnostics["array_summaries"]["real_eval_X"] = summarize_array_np(real_eval_X)
+
+        if nb_loss_enabled and nb_mean_samples:
+            nb_mean_concat = np.concatenate(nb_mean_samples, axis=0)
+            diagnostics["array_summaries"]["nb_mean_sample"] = summarize_array_np(nb_mean_concat)
+        if nb_loss_enabled and nb_dispersion_samples:
+            nb_disp_concat = np.concatenate(nb_dispersion_samples, axis=0)
+            diagnostics["array_summaries"]["nb_dispersion_sample"] = summarize_array_np(nb_disp_concat)
+
+        diag_path = os.path.join(results_dir, "nb_diagnostics.json")
+        with open(diag_path, "w") as f:
+            json.dump(diagnostics, f, indent=2)
+        logger.info("Wrote NB diagnostics to %s", diag_path)
+    except Exception as exc:
+        logger.warning("Failed to write diagnostics summary: %s", exc)
+
     # --- Evaluate ---
     if not args.predict_only:
         logger.info("Computing metrics using cell-eval...")
 
-        pdex_kwargs = dict(exp_post_agg=True, is_log1p=metrics_is_log1p)
+        slurm_cpus_per_task = os.environ.get("SLURM_CPUS_PER_TASK")
+        pdex_num_workers: int
+        if slurm_cpus_per_task:
+            try:
+                pdex_num_workers = max(1, int(slurm_cpus_per_task))
+            except ValueError:
+                pdex_num_workers = max(1, os.cpu_count() or 1)
+        else:
+            pdex_num_workers = max(1, os.cpu_count() or 1)
+
+        pdex_kwargs = dict(exp_post_agg=True, is_log1p=metrics_is_log1p, num_workers=pdex_num_workers)
         allow_discrete_eval = not metrics_is_log1p
         logger.info(
-            "Cell-eval config: allow_discrete=%s (pdex is_log1p=%s)",
+            "Cell-eval config: allow_discrete=%s (pdex is_log1p=%s, num_workers=%d)",
             allow_discrete_eval,
             metrics_is_log1p,
+            pdex_num_workers,
         )
 
         if args.pseudobulk and args.eval_batch_size > 0 and not args.skip_de and h5_path is not None:
