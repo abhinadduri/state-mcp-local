@@ -121,6 +121,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             raise ValueError(f"Unknown loss function: {loss_name}")
 
         self.use_basal_projection = kwargs.get("use_basal_projection", True)
+        self.bottleneck_ratio = int(kwargs.get("bottleneck_ratio", 8))
 
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
@@ -244,10 +245,15 @@ class StateTransitionPerturbationModel(PerturbationModel):
         )
 
         if self.output_space == "all":
+            bottleneck_dim = max(self.output_dim // self.bottleneck_ratio, 64)
+            logger.info(
+                "output_space='all': bottleneck %d → %d → %d (ratio=%d)",
+                self.output_dim, bottleneck_dim, self.output_dim, self.bottleneck_ratio,
+            )
             self.final_down_then_up = nn.Sequential(
-                nn.Linear(self.output_dim, self.output_dim // 8),
+                nn.Linear(self.output_dim, bottleneck_dim),
                 nn.GELU(),
-                nn.Linear(self.output_dim // 8, self.output_dim),
+                nn.Linear(bottleneck_dim, self.output_dim),
             )
 
     def encode_perturbation(self, pert: torch.Tensor) -> torch.Tensor:

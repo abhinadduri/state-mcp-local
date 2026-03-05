@@ -946,16 +946,18 @@ def run_tx_predict(args: ap.ArgumentParser):
         obs = pd.DataFrame(obs_dict)
         gene_var_df = pd.DataFrame(index=gene_var_names) if gene_var_names is not None else None
         if use_count_outputs:
+            # Guard: gene_var_df may have more entries than output columns
+            _var = gene_var_df if (gene_var_df is not None and len(gene_var_df) == pred_x_sum.shape[1]) else None
             # Persisted outputs: summed pseudobulks.
-            adata_pred = anndata.AnnData(X=pred_x_sum, obs=obs, var=gene_var_df)
-            adata_real = anndata.AnnData(X=real_x_sum, obs=obs, var=gene_var_df)
+            adata_pred = anndata.AnnData(X=pred_x_sum, obs=obs, var=_var)
+            adata_real = anndata.AnnData(X=real_x_sum, obs=obs, var=_var)
             if data_module.embed_key is not None:
                 adata_pred.obsm[data_module.embed_key] = pred_bulk_sum
                 adata_real.obsm[data_module.embed_key] = real_bulk_sum
 
             # Metric inputs: mean(log1p) pseudobulks for log1p outputs, mean otherwise.
-            adata_pred_eval = anndata.AnnData(X=pred_x_eval, obs=obs.copy(), var=gene_var_df)
-            adata_real_eval = anndata.AnnData(X=real_x_eval, obs=obs.copy(), var=gene_var_df)
+            adata_pred_eval = anndata.AnnData(X=pred_x_eval, obs=obs.copy(), var=_var)
+            adata_real_eval = anndata.AnnData(X=real_x_eval, obs=obs.copy(), var=_var)
             if data_module.embed_key is not None:
                 adata_pred_eval.obsm[data_module.embed_key] = pred_bulk_eval
                 adata_real_eval.obsm[data_module.embed_key] = real_bulk_eval
@@ -1093,10 +1095,14 @@ def run_tx_predict(args: ap.ArgumentParser):
 
         gene_var_df = pd.DataFrame(index=gene_var_names) if gene_var_names is not None else None
         if final_X_hvg is not None:
+            # Guard: gene_var_df may have more entries than HVG output columns
+            # (e.g. when h5ad lacks highly_variable metadata and get_gene_names
+            # returns all gene names instead of just HVGs)
+            _hvg_var = gene_var_df if (gene_var_df is not None and len(gene_var_df) == final_pert_cell_counts_preds.shape[1]) else None
             # Create adata for predictions - using the decoded gene expression values
-            adata_pred = anndata.AnnData(X=final_pert_cell_counts_preds, obs=obs, var=gene_var_df)
+            adata_pred = anndata.AnnData(X=final_pert_cell_counts_preds, obs=obs, var=_hvg_var)
             # Create adata for real - using the true gene expression values
-            adata_real = anndata.AnnData(X=final_X_hvg, obs=obs, var=gene_var_df)
+            adata_real = anndata.AnnData(X=final_X_hvg, obs=obs, var=_hvg_var)
 
             # add the embedding predictions
             if data_module.embed_key is not None:
