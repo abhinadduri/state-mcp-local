@@ -102,10 +102,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.nb_inference_output_mode = str(kwargs.get("nb_inference_output_mode", "mean")).strip().lower()
         self.nb_library_size_mode = str(kwargs.get("nb_library_size_mode", "set_median")).strip().lower()
         self.nb_inference_library_size_mode = str(kwargs.get("nb_inference_library_size_mode", "auto")).strip().lower()
+        self.nb_px_scale_activation = str(kwargs.get("nb_px_scale_activation", "softmax")).strip().lower()
         valid_dispersion_modes = {"per_cell", "set_median"}
         valid_output_modes = {"mean", "sample"}
         valid_library_modes = {"per_cell", "set_median"}
         valid_inference_library_modes = {"auto", *valid_library_modes}
+        valid_px_scale_activations = {"softmax", "sparsemax"}
         if self.nb_inference_dispersion_mode not in valid_dispersion_modes:
             raise ValueError(
                 "nb_inference_dispersion_mode must be one of "
@@ -125,6 +127,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
             raise ValueError(
                 "nb_inference_library_size_mode must be one of "
                 f"{sorted(valid_inference_library_modes)}; got {self.nb_inference_library_size_mode!r}."
+            )
+        if self.nb_px_scale_activation not in valid_px_scale_activations:
+            raise ValueError(
+                "nb_px_scale_activation must be one of "
+                f"{sorted(valid_px_scale_activations)}; got {self.nb_px_scale_activation!r}."
             )
         if self.nb_loss and self.output_space == "embedding":
             raise ValueError(
@@ -195,9 +202,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 activation=self.activation_class,
             )
             logger.info(
-                "NB loss enabled for state transition model (nb_target_dim=%d, nb_embed_loss_weight=%.3f).",
+                "NB loss enabled for state transition model "
+                "(nb_target_dim=%d, nb_embed_loss_weight=%.3f, nb_px_scale_activation=%s).",
                 self.nb_target_dim,
                 self.nb_embed_loss_weight,
+                self.nb_px_scale_activation,
             )
 
         # Add an optional encoder that introduces a batch variable
@@ -434,6 +443,29 @@ class StateTransitionPerturbationModel(PerturbationModel):
             return nb_dispersion.median(dim=1, keepdim=True).values.expand_as(nb_dispersion)
         return nb_dispersion
 
+    @staticmethod
+    def _sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Sparsemax projection (Martins & Astudillo, 2016)."""
+        z = logits - logits.max(dim=dim, keepdim=True).values
+        z_sorted, _ = torch.sort(z, descending=True, dim=dim)
+
+        d = z.size(dim)
+        rhos = torch.arange(1, d + 1, device=z.device, dtype=z.dtype)
+        view = [1] * z.dim()
+        view[dim] = d
+        rhos = rhos.view(view)
+
+        z_cumsum = torch.cumsum(z_sorted, dim=dim)
+        support = (1 + rhos * z_sorted) > z_cumsum
+        support_size = support.to(z.dtype).sum(dim=dim, keepdim=True).clamp_min(1.0)
+        tau = (z_cumsum.gather(dim, (support_size.long() - 1)) - 1.0) / support_size
+        return torch.clamp(z - tau, min=0.0)
+
+    def _apply_nb_scale_activation(self, px_scale_logits: torch.Tensor) -> torch.Tensor:
+        if self.nb_px_scale_activation == "sparsemax":
+            return self._sparsemax(px_scale_logits, dim=-1)
+        return F.softmax(px_scale_logits, dim=-1)
+
     def _sample_nb_counts(self, nb_mean: torch.Tensor, nb_dispersion: torch.Tensor) -> torch.Tensor:
         mu = nb_mean.clamp_min(self.nb_eps)
         theta = nb_dispersion.clamp_min(self.nb_eps)
@@ -542,7 +574,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 raise RuntimeError("nb_loss=True but nb_parameter_head was not initialized.")
             nb_params = self.nb_parameter_head(out_pred)
             px_scale_logits, nb_dispersion_logits = torch.chunk(nb_params, chunks=2, dim=-1)
-            px_scale = F.softmax(px_scale_logits, dim=-1)
+            px_scale = self._apply_nb_scale_activation(px_scale_logits)
             ctrl_for_library = self._get_nb_control_tensor_for_library(batch, basal, padded)
             library_sizes = self._compute_library_sizes_from_control(ctrl_for_library, self.nb_library_size_mode)
             nb_mean = px_scale * library_sizes

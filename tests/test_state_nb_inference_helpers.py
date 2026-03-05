@@ -127,3 +127,22 @@ def test_resolve_nb_embed_loss_weight_explicit_override():
     )
     assert used_default is False
     assert weight == 0.25
+
+
+def test_sparsemax_produces_valid_simplex_with_zeros():
+    logits = torch.tensor([[3.0, 1.0, -2.0], [0.1, 0.1, 0.1]], dtype=torch.float32)
+    out = StateTransitionPerturbationModel._sparsemax(logits, dim=-1)
+    assert torch.all(out >= 0.0)
+    assert torch.allclose(out.sum(dim=-1), torch.ones(out.shape[0]), atol=1e-6)
+    # First row should be sparse (at least one exact zero).
+    assert torch.any(out[0] == 0.0)
+
+
+def test_apply_nb_scale_activation_sparsemax_branch():
+    model = object.__new__(StateTransitionPerturbationModel)
+    model.nb_px_scale_activation = "sparsemax"
+    logits = torch.tensor([[2.0, 0.0, -1.0]], dtype=torch.float32)
+    out = model._apply_nb_scale_activation(logits)
+    assert torch.all(out >= 0.0)
+    assert torch.allclose(out.sum(dim=-1), torch.ones(1), atol=1e-6)
+    assert torch.any(out == 0.0)
