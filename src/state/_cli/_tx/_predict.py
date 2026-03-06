@@ -578,17 +578,31 @@ def run_tx_predict(args: ap.ArgumentParser):
         )
     if nb_loss_enabled:
         resolved_is_log1p = bool(getattr(data_module, "is_log1p", cfg["data"]["kwargs"].get("is_log1p", False)))
-        expected_exp_counts = resolved_is_log1p
+        nb_force_exp_counts = bool(cfg.get("model", {}).get("kwargs", {}).get("nb_force_exp_counts", False))
         current_exp_counts = bool(getattr(data_module, "exp_counts", False))
-        if current_exp_counts != expected_exp_counts:
-            logger.warning(
-                "nb_loss=True requires exp_counts to follow is_log1p. "
-                "Resolved is_log1p=%s, overriding exp_counts %s -> %s.",
-                resolved_is_log1p,
+        if nb_force_exp_counts:
+            expected_exp_counts = resolved_is_log1p
+            if current_exp_counts != expected_exp_counts:
+                logger.warning(
+                    "nb_loss=True with nb_force_exp_counts=True requires exp_counts to follow is_log1p. "
+                    "Resolved is_log1p=%s, overriding exp_counts %s -> %s.",
+                    resolved_is_log1p,
+                    current_exp_counts,
+                    expected_exp_counts,
+                )
+                data_module.exp_counts = expected_exp_counts
+            else:
+                logger.info(
+                    "nb_loss=True with nb_force_exp_counts=True resolved is_log1p=%s and exp_counts=%s.",
+                    resolved_is_log1p,
+                    current_exp_counts,
+                )
+        else:
+            logger.info(
+                "nb_loss=True with nb_force_exp_counts=False preserves exp_counts=%s (resolved is_log1p=%s).",
                 current_exp_counts,
-                expected_exp_counts,
+                resolved_is_log1p,
             )
-            data_module.exp_counts = expected_exp_counts
         if data_module.embed_key not in {None, "X_hvg"} and not bool(getattr(data_module, "store_raw_basal", False)):
             logger.warning(
                 "nb_loss=True with embed_key=%r and store_raw_basal=False. "
@@ -596,7 +610,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 data_module.embed_key,
             )
         cfg["data"]["kwargs"]["is_log1p"] = resolved_is_log1p
-        cfg["data"]["kwargs"]["exp_counts"] = expected_exp_counts
+        cfg["data"]["kwargs"]["exp_counts"] = bool(getattr(data_module, "exp_counts", current_exp_counts))
     cfg_nb_dispersion_mode = str(cfg.get("model", {}).get("kwargs", {}).get("nb_inference_dispersion_mode", "per_cell"))
     cfg_nb_output_mode = str(cfg.get("model", {}).get("kwargs", {}).get("nb_inference_output_mode", "mean"))
     cfg_nb_library_mode = str(

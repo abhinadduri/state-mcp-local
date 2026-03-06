@@ -82,6 +82,26 @@ def test_compute_library_sizes_from_control_modes():
     assert torch.allclose(set_median, expected_set_median)
 
 
+def test_to_count_space_auto_keeps_continuous_transformed_log1p_values():
+    model = object.__new__(StateTransitionPerturbationModel)
+    model.nb_count_round_mode = "auto"
+
+    x = torch.log1p(torch.tensor([[0.0, 2.2, 0.4]], dtype=torch.float32))
+    out = model._to_count_space(x)
+    expected = torch.tensor([[0.0, 2.2, 0.4]], dtype=torch.float32)
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
+def test_to_count_space_always_rounds_transformed_log1p_values():
+    model = object.__new__(StateTransitionPerturbationModel)
+    model.nb_count_round_mode = "always"
+
+    x = torch.log1p(torch.tensor([[0.0, 2.2, 0.4]], dtype=torch.float32))
+    out = model._to_count_space(x)
+    expected = torch.tensor([[0.0, 2.0, 0.0]], dtype=torch.float32)
+    assert torch.allclose(out, expected, atol=1e-6)
+
+
 def test_blend_nb_library_sizes_interpolates_between_modes():
     set_median = torch.tensor([[[4.0]]])
     per_cell = torch.tensor([[[3.0], [4.0], [6.0]]])

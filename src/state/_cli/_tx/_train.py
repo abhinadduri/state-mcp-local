@@ -100,6 +100,12 @@ def run_tx_train(cfg: DictConfig):
     else:
         checkpoint_monitor_metric = "val/expression_loss"
 
+    # bf16-mixed has limited mantissa — enforce float32 collation, rely on GPU autocast only
+    precision_val = cfg["training"].get("precision")
+    if precision_val == "bf16-mixed":
+        cfg["data"]["kwargs"]["collate_dtype"] = "float32"
+        logger.info("bf16-mixed precision: enforcing collate_dtype=float32")
+
     data_module: PerturbationDataModule = get_datamodule(
         cfg["data"]["name"],
         cfg["data"]["kwargs"],
@@ -110,25 +116,33 @@ def run_tx_train(cfg: DictConfig):
     data_module.setup(stage="fit")
     if nb_loss_enabled:
         resolved_is_log1p = bool(getattr(data_module, "is_log1p", cfg["data"]["kwargs"].get("is_log1p", False)))
-        expected_exp_counts = resolved_is_log1p
+        nb_force_exp_counts = bool(cfg["model"]["kwargs"].get("nb_force_exp_counts", False))
         current_exp_counts = bool(getattr(data_module, "exp_counts", False))
-        if current_exp_counts != expected_exp_counts:
-            logger.warning(
-                "nb_loss=True requires exp_counts to follow is_log1p. "
-                "Resolved is_log1p=%s, overriding exp_counts %s -> %s.",
-                resolved_is_log1p,
-                current_exp_counts,
-                expected_exp_counts,
-            )
-            data_module.exp_counts = expected_exp_counts
+        if nb_force_exp_counts:
+            expected_exp_counts = resolved_is_log1p
+            if current_exp_counts != expected_exp_counts:
+                logger.warning(
+                    "nb_loss=True with nb_force_exp_counts=True requires exp_counts to follow is_log1p. "
+                    "Resolved is_log1p=%s, overriding exp_counts %s -> %s.",
+                    resolved_is_log1p,
+                    current_exp_counts,
+                    expected_exp_counts,
+                )
+                data_module.exp_counts = expected_exp_counts
+            else:
+                logger.info(
+                    "nb_loss=True with nb_force_exp_counts=True resolved is_log1p=%s and exp_counts=%s.",
+                    resolved_is_log1p,
+                    current_exp_counts,
+                )
         else:
             logger.info(
-                "nb_loss=True with resolved is_log1p=%s and exp_counts=%s.",
-                resolved_is_log1p,
+                "nb_loss=True with nb_force_exp_counts=False preserves exp_counts=%s (resolved is_log1p=%s).",
                 current_exp_counts,
+                resolved_is_log1p,
             )
         cfg["data"]["kwargs"]["is_log1p"] = resolved_is_log1p
-        cfg["data"]["kwargs"]["exp_counts"] = expected_exp_counts
+        cfg["data"]["kwargs"]["exp_counts"] = bool(getattr(data_module, "exp_counts", current_exp_counts))
 
     with open(join(run_output_dir, "data_module.torch"), "wb") as f:
         # TODO-Abhi: only save necessary data

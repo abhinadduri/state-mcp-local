@@ -106,11 +106,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.nb_inference_library_size_mode = str(kwargs.get("nb_inference_library_size_mode", "auto")).strip().lower()
         self.nb_inference_library_blend_alpha = float(kwargs.get("nb_inference_library_blend_alpha", 0.5))
         self.nb_px_scale_activation = str(kwargs.get("nb_px_scale_activation", "softmax")).strip().lower()
+        self.nb_count_round_mode = str(kwargs.get("nb_count_round_mode", "auto")).strip().lower()
         valid_dispersion_modes = {"per_cell", "set_median"}
         valid_output_modes = {"mean", "sample"}
         valid_library_modes = {"per_cell", "set_median", "predicted"}
         valid_inference_library_modes = {"auto", "target_oracle", "per_cell", "set_median", "predicted", "blend"}
         valid_px_scale_activations = {"softmax", "sparsemax"}
+        valid_count_round_modes = {"auto", "always", "never"}
         if self.nb_inference_dispersion_mode not in valid_dispersion_modes:
             raise ValueError(
                 "nb_inference_dispersion_mode must be one of "
@@ -141,6 +143,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 "nb_px_scale_activation must be one of "
                 f"{sorted(valid_px_scale_activations)}; got {self.nb_px_scale_activation!r}."
             )
+        if self.nb_count_round_mode not in valid_count_round_modes:
+            raise ValueError(
+                "nb_count_round_mode must be one of "
+                f"{sorted(valid_count_round_modes)}; got {self.nb_count_round_mode!r}."
+            )
         if self.nb_loss and self.output_space == "embedding":
             raise ValueError(
                 "nb_loss=True is incompatible with output_space='embedding'. "
@@ -168,6 +175,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
             logger.warning(
                 "nb_loss=True with nb_library_mse_weight=%.3f enables auxiliary library-size calibration.",
                 self.nb_library_mse_weight,
+            )
+        if self.nb_loss and self.nb_count_round_mode != "always":
+            logger.warning(
+                "nb_loss=True with nb_count_round_mode=%s uses non-integer transformed targets for log1p inputs.",
+                self.nb_count_round_mode,
             )
         if self.nb_loss:
             if self.gene_decoder is not None:
@@ -376,17 +388,28 @@ class StateTransitionPerturbationModel(PerturbationModel):
         return bool(x.max().item() < 15.0)
 
     def _to_count_space(self, x: torch.Tensor) -> torch.Tensor:
+        round_mode = str(getattr(self, "nb_count_round_mode", "auto")).strip().lower()
         x_float = x.float()
         is_discrete = self._suspected_discrete_torch(x_float)
         is_log = self._suspected_log_torch(x_float)
 
-        if (not is_discrete) and is_log:
+        transformed_from_log = (not is_discrete) and is_log
+        if transformed_from_log:
             counts = torch.expm1(x_float)
         else:
             counts = x_float
 
         counts = torch.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
-        return counts.clamp_min(0.0).round()
+        counts = counts.clamp_min(0.0)
+
+        if round_mode == "always":
+            return counts.round()
+        if round_mode == "never":
+            return counts
+        # auto: preserve continuity for transformed log1p inputs, keep raw-count paths integer-like.
+        if transformed_from_log:
+            return counts
+        return counts.round()
 
     def _compute_per_cell_library_sizes_from_control(self, ctrl_cells: torch.Tensor) -> torch.Tensor:
         ctrl_counts = self._to_count_space(ctrl_cells)
