@@ -98,6 +98,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             self.embed_key,
             kwargs,
         )
+        self.nb_log1p_mse_weight = float(kwargs.get("nb_log1p_mse_weight", 0.0))
         self.nb_inference_dispersion_mode = str(kwargs.get("nb_inference_dispersion_mode", "per_cell")).strip().lower()
         self.nb_inference_output_mode = str(kwargs.get("nb_inference_output_mode", "mean")).strip().lower()
         self.nb_library_size_mode = str(kwargs.get("nb_library_size_mode", "set_median")).strip().lower()
@@ -150,6 +151,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 "nb_loss=True with nb_embed_loss_weight=%.3f enables an auxiliary embedding-space loss "
                 "that can dominate NB optimization for full-transcriptome objectives.",
                 self.nb_embed_loss_weight,
+            )
+        if self.nb_loss and self.nb_log1p_mse_weight > 0.0:
+            logger.warning(
+                "nb_loss=True with nb_log1p_mse_weight=%.3f enables auxiliary log1p-mean calibration.",
+                self.nb_log1p_mse_weight,
             )
         if self.nb_loss:
             if self.gene_decoder is not None:
@@ -437,6 +443,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
         recon_loss_all = -log_nb
         return torch.nanmean(recon_loss_all.reshape(recon_loss_all.shape[0], -1), dim=1)
 
+    def _compute_nb_log1p_mse_per_set(
+        self,
+        nb_mean: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        target_counts = self._to_count_space(target).to(nb_mean.dtype)
+        pred_log = torch.log1p(nb_mean.clamp_min(0.0))
+        target_log = torch.log1p(target_counts.clamp_min(0.0))
+        sq_err = (pred_log - target_log) ** 2
+        return torch.nanmean(sq_err.reshape(sq_err.shape[0], -1), dim=1)
+
     @staticmethod
     def _reduce_dispersion_for_inference(nb_dispersion: torch.Tensor, mode: str) -> torch.Tensor:
         if mode == "set_median":
@@ -610,6 +627,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             target = target.reshape(1, -1, self.output_dim)
 
         embedding_aux_loss = None
+        nb_log1p_mse_aux_loss = None
         if self.nb_loss:
             if padded:
                 nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
@@ -624,6 +642,10 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 embedding_aux_losses = self._compute_distribution_loss(pred, target)
                 embedding_aux_loss = torch.nanmean(embedding_aux_losses)
                 self.log("train/embedding_loss", embedding_aux_loss)
+            if self.nb_log1p_mse_weight > 0.0:
+                nb_log1p_mse_per_set = self._compute_nb_log1p_mse_per_set(nb_mean, nb_target)
+                nb_log1p_mse_aux_loss = torch.nanmean(nb_log1p_mse_per_set)
+                self.log("train/nb_log1p_mse_loss", nb_log1p_mse_aux_loss)
         else:
             per_set_main_losses = self._compute_distribution_loss(pred, target)
         main_loss = torch.nanmean(per_set_main_losses)
@@ -634,6 +656,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         total_loss = main_loss
         if embedding_aux_loss is not None:
             total_loss = total_loss + self.nb_embed_loss_weight * embedding_aux_loss
+        if nb_log1p_mse_aux_loss is not None:
+            total_loss = total_loss + self.nb_log1p_mse_weight * nb_log1p_mse_aux_loss
 
         # Decoder loss in gene space, if a decoder is configured.
         if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
@@ -677,6 +701,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
         embedding_aux_loss = None
+        nb_log1p_mse_aux_loss = None
         if self.nb_loss:
             nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
             nb_dispersion = nb_dispersion_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
@@ -686,11 +711,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 embedding_aux_losses = self._compute_distribution_loss(pred, target)
                 embedding_aux_loss = torch.nanmean(embedding_aux_losses)
                 self.log("val/embedding_loss", embedding_aux_loss)
+            if self.nb_log1p_mse_weight > 0.0:
+                nb_log1p_mse_per_set = self._compute_nb_log1p_mse_per_set(nb_mean, nb_target)
+                nb_log1p_mse_aux_loss = torch.nanmean(nb_log1p_mse_per_set)
+                self.log("val/nb_log1p_mse_loss", nb_log1p_mse_aux_loss)
         else:
             per_set_main_losses = self._compute_distribution_loss(pred, target)
         loss = torch.nanmean(per_set_main_losses)
         if embedding_aux_loss is not None:
             loss = loss + self.nb_embed_loss_weight * embedding_aux_loss
+        if nb_log1p_mse_aux_loss is not None:
+            loss = loss + self.nb_log1p_mse_weight * nb_log1p_mse_aux_loss
         self.log(self._val_main_loss_key(), loss)
 
         if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
@@ -727,6 +758,9 @@ class StateTransitionPerturbationModel(PerturbationModel):
             if self.nb_embed_loss_weight > 0.0:
                 embedding_aux_losses = self._compute_distribution_loss(pred, target)
                 loss = loss + self.nb_embed_loss_weight * torch.nanmean(embedding_aux_losses)
+            if self.nb_log1p_mse_weight > 0.0:
+                nb_log1p_mse_per_set = self._compute_nb_log1p_mse_per_set(nb_mean, nb_target)
+                loss = loss + self.nb_log1p_mse_weight * torch.nanmean(nb_log1p_mse_per_set)
             self.log("test_loss", loss)
             return
         _ = self.forward(batch, padded=False)

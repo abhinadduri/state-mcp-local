@@ -146,3 +146,37 @@ def test_apply_nb_scale_activation_sparsemax_branch():
     assert torch.all(out >= 0.0)
     assert torch.allclose(out.sum(dim=-1), torch.ones(1), atol=1e-6)
     assert torch.any(out == 0.0)
+
+
+def test_compute_nb_log1p_mse_per_set_zero_when_matching_counts():
+    model = object.__new__(StateTransitionPerturbationModel)
+    model.nb_eps = 1e-8
+
+    target_counts = torch.tensor(
+        [
+            [[0.0, 1.0, 3.0], [2.0, 0.0, 4.0]],
+            [[5.0, 2.0, 0.0], [1.0, 1.0, 1.0]],
+        ]
+    )
+    nb_mean = target_counts.clone()
+
+    per_set = model._compute_nb_log1p_mse_per_set(nb_mean, target_counts)
+    assert per_set.shape == torch.Size([2])
+    assert torch.allclose(per_set, torch.zeros_like(per_set), atol=1e-7)
+
+
+def test_compute_nb_log1p_mse_per_set_increases_with_mismatch():
+    model = object.__new__(StateTransitionPerturbationModel)
+    model.nb_eps = 1e-8
+
+    target_counts = torch.tensor(
+        [
+            [[0.0, 1.0, 3.0], [2.0, 0.0, 4.0]],
+        ]
+    )
+    nb_mean_small_error = target_counts + 0.1
+    nb_mean_large_error = target_counts + 2.0
+
+    loss_small = model._compute_nb_log1p_mse_per_set(nb_mean_small_error, target_counts).item()
+    loss_large = model._compute_nb_log1p_mse_per_set(nb_mean_large_error, target_counts).item()
+    assert loss_large > loss_small
