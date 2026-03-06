@@ -72,16 +72,6 @@ def add_arguments_predict(parser: ap.ArgumentParser):
     )
 
     parser.add_argument(
-        "--eval-batch-size",
-        type=int,
-        default=0,
-        help=(
-            "Number of perturbations per DE batch. When >0 with --pseudobulk, "
-            "computes cell-level DE in batches via temporary disk storage. "
-            "Non-DE metrics still use pseudobulk. Default 0 disables."
-        ),
-    )
-    parser.add_argument(
         "--nb-dispersion-mode",
         type=str,
         default="auto",
@@ -105,7 +95,7 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         "--nb-library-mode",
         type=str,
         default="auto",
-        choices=["auto", "set_median", "per_cell"],
+        choices=["auto", "set_median", "per_cell", "predicted", "target_oracle"],
         help=(
             "NB inference-time library-size mode for mean rescaling. "
             "'auto' reads model.kwargs.nb_inference_library_size_mode and falls back "
@@ -237,14 +227,26 @@ def _run_cell_eval(
     skip_de=False,
     write_csv=True,
     allow_discrete=False,
+    deseq2_de_results=None,
 ):
     """
     Run MetricsEvaluator per cell type.
 
+    When deseq2_de_results is provided, DE metrics come from precomputed DESeq2
+    results instead of pdex/Wilcoxon. Non-DE metrics still use the pseudobulk
+    anndata. The skip_de flag should be True when deseq2_de_results is provided
+    (non-DE eval runs with skip_de=True, then a second evaluator runs DE-only
+    with the precomputed DataFrames).
+
     Returns dict of {celltype: (results_df, agg_df)}.
     """
+    import logging
+
+    import polars as pl
     from cell_eval import MetricsEvaluator
     from cell_eval.utils import split_anndata_on_celltype
+
+    logger = logging.getLogger(__name__)
 
     control_pert = data_module.get_control_pert()
     ct_split_real = split_anndata_on_celltype(adata=adata_real, celltype_col=data_module.cell_type_key)
@@ -261,6 +263,7 @@ def _run_cell_eval(
         real_ct = ct_split_real[ct]
         pred_ct = ct_split_pred[ct]
 
+        # First: compute non-DE metrics (always)
         evaluator = MetricsEvaluator(
             adata_pred=pred_ct,
             adata_real=real_ct,
@@ -270,181 +273,68 @@ def _run_cell_eval(
             prefix=ct,
             pdex_kwargs=pdex_kwargs,
             batch_size=2048,
-            skip_de=skip_de,
+            skip_de=True if deseq2_de_results else skip_de,
             allow_discrete=allow_discrete,
         )
         results_df, agg_df = evaluator.compute(
             profile=profile,
             metric_configs=metric_configs,
             skip_metrics=["pearson_edistance", "clustering_agreement"],
-            write_csv=write_csv,
+            write_csv=False if deseq2_de_results else write_csv,
         )
-        all_results[ct] = (results_df, agg_df)
 
-    return all_results
-
-
-def _run_batched_de(
-    h5_path,
-    results_dir,
-    data_module,
-    eval_batch_size,
-    pdex_kwargs,
-    non_de_results,
-    shared_perts,
-    logger,
-    allow_discrete=False,
-):
-    """
-    Run cell-level DE in batches from temporary h5py storage.
-
-    non_de_results: dict of {celltype: (results_df, agg_df)} from non-DE evaluation.
-    shared_perts: set of perturbation names to restrict to, or None for no filtering.
-    Writes merged CSVs to results_dir.
-    """
-    import gc
-    import os
-
-    import anndata
-    import h5py
-    import numpy as np
-    import pandas as pd
-    import polars as pl
-    from cell_eval import MetricsEvaluator
-
-    # locking=False avoids POSIX file-lock issues on NFS / parallel filesystems
-    h5f = h5py.File(h5_path, "r", locking=False)
-    try:
-        all_perts = h5f["pert_name"][:].astype(str)
-        all_celltypes = h5f["cell_type"][:].astype(str)
-        control = data_module.get_control_pert()
-
-        unique_celltypes = sorted(set(all_celltypes))
-        logger.info("Running batched cell-level DE for %d cell types.", len(unique_celltypes))
-
-        for ct in unique_celltypes:
-            ct_mask = all_celltypes == ct
-            ct_perts = all_perts[ct_mask]
-            unique_perts = sorted(set(ct_perts) - {control})
-
-            if shared_perts is not None:
-                unique_perts = [p for p in unique_perts if p in shared_perts]
-
-            ct_safe = ct.replace("/", "-")
-
-            if len(unique_perts) == 0:
-                logger.info("Cell type '%s': no non-control perturbations, skipping DE.", ct)
-                if ct in non_de_results:
-                    results_df, agg_df = non_de_results[ct]
-                    results_df.write_csv(os.path.join(results_dir, f"{ct_safe}_results.csv"))
-                    agg_df.write_csv(os.path.join(results_dir, f"{ct_safe}_agg_results.csv"))
-                continue
-
-            n_batches = (len(unique_perts) + eval_batch_size - 1) // eval_batch_size
-            all_de_results = []
-
-            for batch_start in range(0, len(unique_perts), eval_batch_size):
-                batch_perts = unique_perts[batch_start : batch_start + eval_batch_size]
-                keep = set(batch_perts) | {control}
-                sel = ct_mask & np.isin(all_perts, list(keep))
-                indices = np.sort(np.where(sel)[0])
-
-                batch_pred_X = h5f["X_pred"][indices]
-                batch_real_X = h5f["X_real"][indices]
-                batch_obs = pd.DataFrame(
-                    {
-                        data_module.pert_col: all_perts[indices],
-                        data_module.cell_type_key: all_celltypes[indices],
-                    }
-                )
-
-                adata_pred_batch = anndata.AnnData(X=batch_pred_X, obs=batch_obs)
-                adata_real_batch = anndata.AnnData(X=batch_real_X, obs=batch_obs)
-
-                evaluator = MetricsEvaluator(
-                    adata_pred=adata_pred_batch,
-                    adata_real=adata_real_batch,
-                    control_pert=control,
+        # Second: if DESeq2 results available, run DE-only evaluation and merge
+        if deseq2_de_results and ct in deseq2_de_results:
+            de_data = deseq2_de_results[ct]
+            try:
+                de_evaluator = MetricsEvaluator(
+                    adata_pred=pred_ct,
+                    adata_real=real_ct,
+                    de_pred=de_data["pred"],
+                    de_real=de_data["real"],
+                    control_pert=control_pert,
                     pert_col=data_module.pert_col,
                     outdir=results_dir,
-                    prefix=f"_debatch_{ct_safe}_{batch_start}",
+                    prefix=ct,
                     pdex_kwargs=pdex_kwargs,
                     batch_size=2048,
                     skip_de=False,
                     allow_discrete=allow_discrete,
                 )
-                de_results_df, _ = evaluator.compute(
+                de_results_df, de_agg_df = de_evaluator.compute(
                     profile="de",
+                    metric_configs=metric_configs,
+                    skip_metrics=["pearson_edistance", "clustering_agreement"],
                     write_csv=False,
                 )
-                all_de_results.append(de_results_df)
 
-                # Clean up intermediate DE CSV files written by MetricsEvaluator
-                batch_prefix = f"_debatch_{ct_safe}_{batch_start}"
-                for suffix in ("_pred_de.csv", "_real_de.csv", "_results.csv", "_agg_results.csv"):
-                    tmp_csv = os.path.join(results_dir, f"{batch_prefix}{suffix}")
-                    if os.path.exists(tmp_csv):
-                        os.remove(tmp_csv)
+                # Merge: join DE columns into non-DE results
+                join_col = "perturbation"
+                if join_col not in results_df.columns:
+                    join_col = data_module.pert_col
+                if join_col in results_df.columns and join_col in de_results_df.columns:
+                    de_unique_cols = [c for c in de_results_df.columns if c not in results_df.columns or c == join_col]
+                    if len(de_unique_cols) > 1:
+                        results_df = results_df.join(de_results_df.select(de_unique_cols), on=join_col, how="left")
+                    # Merge agg: combine non-DE and DE agg results
+                    de_agg_cols = [c for c in de_agg_df.columns if c not in agg_df.columns]
+                    if de_agg_cols:
+                        agg_df = pl.concat([agg_df, de_agg_df.select(de_agg_cols)], how="horizontal")
+                logger.info("Cell type '%s': merged DESeq2 DE metrics with non-DE metrics.", ct)
+            except Exception as exc:
+                logger.warning("Cell type '%s': DESeq2 DE evaluation failed: %s. Writing non-DE only.", ct, exc)
 
-                del batch_pred_X, batch_real_X, evaluator, adata_pred_batch, adata_real_batch
-                gc.collect()
+            # Write merged results
+            if write_csv:
+                import os
+                ct_safe = ct.replace("/", "-")
+                results_df.write_csv(os.path.join(results_dir, f"{ct_safe}_results.csv"))
+                agg_df.write_csv(os.path.join(results_dir, f"{ct_safe}_agg_results.csv"))
 
-                logger.info(
-                    "Cell type '%s': processed DE batch %d/%d (%d perturbations).",
-                    ct,
-                    batch_start // eval_batch_size + 1,
-                    n_batches,
-                    len(batch_perts),
-                )
+        all_results[ct] = (results_df, agg_df)
 
-            # Merge DE results with non-DE results for this cell type
-            if all_de_results:
-                merged_de = pl.concat(all_de_results)
+    return all_results
 
-                if ct in non_de_results:
-                    non_de_df, non_de_agg = non_de_results[ct]
-
-                    # Find the perturbation join key
-                    de_cols = set(merged_de.columns)
-                    non_de_cols = set(non_de_df.columns)
-                    join_col = "perturbation"
-                    if join_col not in de_cols:
-                        join_col = data_module.pert_col
-                    if join_col not in de_cols or join_col not in non_de_cols:
-                        logger.warning(
-                            "Cell type '%s': could not find join column for DE merge. "
-                            "Writing DE and non-DE results separately.",
-                            ct,
-                        )
-                        non_de_df.write_csv(os.path.join(results_dir, f"{ct_safe}_results.csv"))
-                        non_de_agg.write_csv(os.path.join(results_dir, f"{ct_safe}_agg_results.csv"))
-                        merged_de.write_csv(os.path.join(results_dir, f"{ct_safe}_de_results.csv"))
-                        continue
-
-                    # Drop duplicate columns from DE (except join column)
-                    de_unique_cols = [c for c in merged_de.columns if c not in non_de_cols or c == join_col]
-                    merged_de_unique = merged_de.select(de_unique_cols)
-
-                    combined = non_de_df.join(merged_de_unique, on=join_col, how="left")
-                    combined.write_csv(os.path.join(results_dir, f"{ct_safe}_results.csv"))
-                    non_de_agg.write_csv(os.path.join(results_dir, f"{ct_safe}_agg_results.csv"))
-                    logger.info(
-                        "Cell type '%s': merged %d DE results with non-DE metrics.",
-                        ct,
-                        len(merged_de),
-                    )
-                else:
-                    merged_de.write_csv(os.path.join(results_dir, f"{ct_safe}_de_results.csv"))
-                    logger.info(
-                        "Cell type '%s': wrote %d DE results (no non-DE results to merge).",
-                        ct,
-                        len(merged_de),
-                    )
-    finally:
-        h5f.close()
-        if os.path.exists(h5_path):
-            os.remove(h5_path)
-            logger.info("Removed temporary h5py file: %s", h5_path)
 
 
 # ---------------------------------------------------------------------------
@@ -483,10 +373,6 @@ def run_tx_predict(args: ap.ArgumentParser):
             "--profile anndata does not disable DE computation by itself. "
             "Add --skip-de to skip DE and reduce memory/runtime."
         )
-    if args.eval_batch_size > 0 and not args.pseudobulk:
-        logger.warning("--eval-batch-size is only supported with --pseudobulk. Ignoring.")
-        args.eval_batch_size = 0
-
     # --- Nested utility functions ---
 
     def clip_anndata_values(adata: anndata.AnnData, max_value: float, min_value: float = 0.0) -> None:
@@ -728,7 +614,12 @@ def run_tx_predict(args: ap.ArgumentParser):
         raise ValueError(f"Unsupported NB dispersion mode: {nb_dispersion_mode!r}")
     if nb_loss_enabled and nb_output_mode not in {"mean", "sample"}:
         raise ValueError(f"Unsupported NB output mode: {nb_output_mode!r}")
-    if nb_loss_enabled and nb_library_mode not in {"per_cell", "set_median"}:
+    if nb_loss_enabled and nb_library_mode not in {
+        "per_cell",
+        "set_median",
+        "predicted",
+        "target_oracle",
+    }:
         raise ValueError(f"Unsupported NB library mode: {nb_library_mode!r}")
 
     resolved_exp_counts = bool(getattr(data_module, "exp_counts", cfg["data"]["kwargs"].get("exp_counts", False)))
@@ -793,6 +684,12 @@ def run_tx_predict(args: ap.ArgumentParser):
             nb_library_mode,
             nb_log1p_mode,
         )
+        if nb_library_mode == "target_oracle":
+            logger.warning(
+                "nb_library_mode=target_oracle uses pert_cell_counts from evaluation batches "
+                "to set per-cell library sizes. This is diagnostic-only and should not be used "
+                "for deployment inference."
+            )
         if args.pseudobulk and nb_log1p_mode != "mean":
             logger.warning(
                 "nb_log1p_mode=%s currently applies only to cell-level path; "
@@ -912,7 +809,6 @@ def run_tx_predict(args: ap.ArgumentParser):
     nb_mean_samples = []
 
     results_dir = _build_results_dir(args.output_dir, args.checkpoint, args.eval_train_data)
-    h5_path = None  # Set if h5py temp file is created for batched DE
 
     # -----------------------------------------------------------------------
     # 4a. Pseudobulk inference path
@@ -944,46 +840,8 @@ def run_tx_predict(args: ap.ArgumentParser):
         else:
             logger.info("Pseudobulk scale handling: using direct summation (no expm1 conversion before aggregation).")
 
-        # --- h5py setup for batched cell-level DE ---
-        write_h5 = args.eval_batch_size > 0 and not args.predict_only and not args.skip_de
-        h5f_writer = None
-        h5_idx = 0
-
-        if write_h5:
-            import h5py
-
-            # Determine gene dimension for h5py storage
-            if use_count_outputs:
-                h5_gene_dim = pseudo_x_dim
-            elif output_space != "embedding":
-                h5_gene_dim = output_dim
-            else:
-                logger.warning(
-                    "--eval-batch-size with output_space='embedding' and no gene-level outputs: "
-                    "cell-level DE requires gene expression data. Disabling batched DE."
-                )
-                write_h5 = False
-
-        if write_h5:
-            h5_path = os.path.join(results_dir, "_tmp_celllevel.h5")
-            h5f_writer = h5py.File(h5_path, "w", locking=False)
-            str_dt = h5py.string_dtype()
-            chunk_rows = min(1024, num_cells)
-            h5f_writer.create_dataset(
-                "X_pred", shape=(num_cells, h5_gene_dim), dtype="float32",
-                chunks=(chunk_rows, h5_gene_dim), compression="lzf",
-            )
-            h5f_writer.create_dataset(
-                "X_real", shape=(num_cells, h5_gene_dim), dtype="float32",
-                chunks=(chunk_rows, h5_gene_dim), compression="lzf",
-            )
-            h5f_writer.create_dataset("pert_name", shape=(num_cells,), dtype=str_dt)
-            h5f_writer.create_dataset("cell_type", shape=(num_cells,), dtype=str_dt)
-            h5f_writer.create_dataset("batch", shape=(num_cells,), dtype=str_dt)
-            logger.info(
-                "Created temporary h5py file for batched DE: %s (cells=%d, genes=%d)",
-                h5_path, num_cells, h5_gene_dim,
-            )
+        # --- DESeq2 replicate configuration ---
+        deseq2_n_reps = 2
 
         pb_groups: dict[tuple[str, str], dict] = {}
         context_mode = None
@@ -1071,19 +929,6 @@ def run_tx_predict(args: ap.ArgumentParser):
                         batch_real_gene_pb_np = batch_real_gene_np
                         batch_gene_pred_pb_np = batch_gene_pred_np
 
-                # --- Write cell-level data to h5py for batched DE ---
-                if write_h5 and h5f_writer is not None:
-                    if use_count_outputs:
-                        h5f_writer["X_pred"][h5_idx : h5_idx + batch_size] = batch_gene_pred_np
-                        h5f_writer["X_real"][h5_idx : h5_idx + batch_size] = batch_real_gene_np
-                    else:
-                        h5f_writer["X_pred"][h5_idx : h5_idx + batch_size] = batch_pred_np
-                        h5f_writer["X_real"][h5_idx : h5_idx + batch_size] = batch_real_np
-                    h5f_writer["pert_name"][h5_idx : h5_idx + batch_size] = pert_names
-                    h5f_writer["cell_type"][h5_idx : h5_idx + batch_size] = celltypes
-                    h5f_writer["batch"][h5_idx : h5_idx + batch_size] = batch_labels
-                    h5_idx += batch_size
-
                 # --- Accumulate pseudobulk sums ---
                 group_to_indices: dict[tuple[str, str], list[int]] = {}
                 for idx in range(batch_size):
@@ -1100,6 +945,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                     if entry is None:
                         _need_gene_logsum = use_count_outputs and aggregate_gene_in_count_space
                         _need_main_logsum = aggregate_main_in_count_space
+                        _deseq2_gene_dim = pseudo_x_dim if use_count_outputs else output_dim
                         entry = {
                             "context": context_label,
                             "pert_name": pert_name,
@@ -1114,6 +960,10 @@ def run_tx_predict(args: ap.ArgumentParser):
                             "gene_real_logsum": np.zeros(pseudo_x_dim, dtype=np.float64) if _need_gene_logsum else None,
                             "main_pred_logsum": np.zeros(output_dim, dtype=np.float64) if _need_main_logsum else None,
                             "main_real_logsum": np.zeros(output_dim, dtype=np.float64) if _need_main_logsum else None,
+                            # Per-replicate count sums for DESeq2 (integer counts)
+                            "pred_rep_sums": [np.zeros(_deseq2_gene_dim, dtype=np.float64) for _ in range(deseq2_n_reps)],
+                            "real_rep_sums": [np.zeros(_deseq2_gene_dim, dtype=np.float64) for _ in range(deseq2_n_reps)],
+                            "rep_counts": [0] * deseq2_n_reps,
                         }
                         pb_groups[(context_label, pert_name)] = entry
                     elif entry["celltype_name"] != current_celltype:
@@ -1122,7 +972,8 @@ def run_tx_predict(args: ap.ArgumentParser):
                             f"saw '{current_celltype}' after '{entry['celltype_name']}'."
                         )
 
-                    entry["count"] += int(idx_arr.size)
+                    n_cells_this = int(idx_arr.size)
+                    entry["count"] += n_cells_this
                     entry["pred_sum"] += batch_pred_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
                     entry["real_sum"] += batch_real_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
                     if entry["main_pred_logsum"] is not None:
@@ -1136,17 +987,26 @@ def run_tx_predict(args: ap.ArgumentParser):
                             entry["gene_pred_logsum"] += batch_gene_pred_np[idx_arr].sum(axis=0, dtype=np.float64)
                             entry["gene_real_logsum"] += batch_real_gene_np[idx_arr].sum(axis=0, dtype=np.float64)
 
-        # Close h5py writer
-        if h5f_writer is not None:
-            h5f_writer.flush()
-            h5f_writer.close()
-            h5f_writer = None
-            logger.info("Closed h5py writer (%d cells written).", h5_idx)
+                    # --- Per-replicate accumulation for DESeq2 ---
+                    # Convert to integer counts via expm1 + round + clip
+                    if use_count_outputs:
+                        _pred_count = np.round(np.clip(np.expm1(batch_gene_pred_np[idx_arr].astype(np.float64)), 0, None))
+                        _real_count = np.round(np.clip(np.expm1(batch_real_gene_np[idx_arr].astype(np.float64)), 0, None))
+                    else:
+                        _pred_count = np.round(np.clip(np.expm1(batch_pred_np[idx_arr].astype(np.float64)), 0, None))
+                        _real_count = np.round(np.clip(np.expm1(batch_real_np[idx_arr].astype(np.float64)), 0, None))
+                    # Round-robin assign cells to replicates
+                    prev_count = entry["count"] - n_cells_this
+                    rep_assignments = np.arange(prev_count, prev_count + n_cells_this) % deseq2_n_reps
+                    for rep in range(deseq2_n_reps):
+                        mask = rep_assignments == rep
+                        if mask.any():
+                            entry["pred_rep_sums"][rep] += _pred_count[mask].sum(axis=0)
+                            entry["real_rep_sums"][rep] += _real_count[mask].sum(axis=0)
+                            entry["rep_counts"][rep] += int(mask.sum())
 
         if len(pb_groups) == 0:
             logger.warning("No pseudobulk groups were generated. Exiting.")
-            if h5_path and os.path.exists(h5_path):
-                os.remove(h5_path)
             sys.exit(0)
 
         logger.info(
@@ -1471,7 +1331,6 @@ def run_tx_predict(args: ap.ArgumentParser):
         logger.info("Skipping metric clipping for this eval configuration.")
 
     # --- Filter shared_only ---
-    shared_perts_set = None
     if args.shared_only:
         if args.pseudobulk:
             adata_pred, adata_real, extra = _filter_shared_only(
@@ -1480,11 +1339,6 @@ def run_tx_predict(args: ap.ArgumentParser):
             )
             if extra is not None:
                 adata_pred_eval, adata_real_eval = extra[0]
-            # Capture shared_perts for batched DE filtering
-            try:
-                shared_perts_set = set(data_module.get_shared_perturbations())
-            except Exception:
-                pass
         else:
             adata_pred, adata_real, _ = _filter_shared_only(
                 adata_pred, adata_real, data_module, logger,
@@ -1561,34 +1415,114 @@ def run_tx_predict(args: ap.ArgumentParser):
             pdex_num_workers,
         )
 
-        if args.pseudobulk and args.eval_batch_size > 0 and not args.skip_de and h5_path is not None:
-            # Batched DE mode:
-            # 1. Non-DE metrics from pseudobulk (skip_de=True, no CSV yet)
-            logger.info("Batched DE mode: computing non-DE metrics from pseudobulk first...")
-            non_de_results = _run_cell_eval(
+        # --- Inline DESeq2 for pseudobulk DE ---
+        deseq2_de_results = {}
+        if args.pseudobulk and not args.skip_de:
+            try:
+                from deseq2_pipeline import run_from_precomputed
+                _has_deseq2 = True
+            except ImportError:
+                logger.warning(
+                    "deseq2-pipeline not installed. Falling back to skip_de=True for pseudobulk. "
+                    "Install with: pip install deseq2-pipeline"
+                )
+                _has_deseq2 = False
+
+            if _has_deseq2:
+                import polars as pl
+
+                control_pert = data_module.get_control_pert()
+                # Determine gene names for DESeq2 output
+                _deseq2_var = gene_var_names
+                if _deseq2_var is None:
+                    _deseq2_var = [f"gene_{i}" for i in range(
+                        pseudo_x_dim if use_count_outputs else output_dim
+                    )]
+
+                # Group pb_groups entries by cell type
+                ct_groups: dict[str, dict[str, dict]] = {}
+                ct_ctrl: dict[str, dict] = {}
+                for (ctx, pname), entry in pb_groups.items():
+                    ct = entry["celltype_name"]
+                    if ct not in ct_groups:
+                        ct_groups[ct] = {}
+                        ct_ctrl[ct] = None
+                    if pname == control_pert:
+                        ct_ctrl[ct] = entry
+                    else:
+                        ct_groups[ct][pname] = entry
+
+                for ct in sorted(ct_groups.keys()):
+                    ctrl_entry = ct_ctrl.get(ct)
+                    if ctrl_entry is None:
+                        logger.warning("Cell type '%s': no control entry found, skipping DESeq2.", ct)
+                        continue
+
+                    pert_entries = ct_groups[ct]
+                    if not pert_entries:
+                        continue
+
+                    ctrl_rep_counts = np.stack(ctrl_entry["real_rep_sums"]).astype(np.int64)
+                    ct_safe = ct.replace("/", "-")
+
+                    # Run DESeq2 for predicted
+                    pred_pert_counts = {
+                        p: np.stack(e["pred_rep_sums"]).astype(np.int64)
+                        for p, e in pert_entries.items()
+                    }
+                    pred_ctrl = np.stack(ctrl_entry["pred_rep_sums"]).astype(np.int64)
+                    pred_outdir = os.path.join(results_dir, f"deseq2_{ct_safe}_pred")
+                    logger.info("Running DESeq2 for cell type '%s' (pred, %d perts)...", ct, len(pred_pert_counts))
+                    pred_de_df = run_from_precomputed(
+                        pred_pert_counts, pred_ctrl, _deseq2_var,
+                        outdir=pred_outdir, n_workers_r=pdex_num_workers,
+                    )
+
+                    # Run DESeq2 for real
+                    real_pert_counts = {
+                        p: np.stack(e["real_rep_sums"]).astype(np.int64)
+                        for p, e in pert_entries.items()
+                    }
+                    real_outdir = os.path.join(results_dir, f"deseq2_{ct_safe}_real")
+                    logger.info("Running DESeq2 for cell type '%s' (real, %d perts)...", ct, len(real_pert_counts))
+                    real_de_df = run_from_precomputed(
+                        real_pert_counts, ctrl_rep_counts, _deseq2_var,
+                        outdir=real_outdir, n_workers_r=pdex_num_workers,
+                    )
+
+                    # Convert to cell-eval format: target, feature, fold_change, p_value, fdr
+                    def _deseq2_to_celleval(df: pd.DataFrame) -> pl.DataFrame:
+                        renamed = df.rename(columns={
+                            "perturbation": "target",
+                            "gene": "feature",
+                            "pvalue": "p_value",
+                        })
+                        # Select only the columns cell-eval needs
+                        keep = ["target", "feature", "fold_change", "p_value", "fdr"]
+                        keep = [c for c in keep if c in renamed.columns]
+                        return pl.from_pandas(renamed[keep])
+
+                    deseq2_de_results[ct] = {
+                        "pred": _deseq2_to_celleval(pred_de_df),
+                        "real": _deseq2_to_celleval(real_de_df),
+                    }
+                    logger.info("DESeq2 complete for cell type '%s'.", ct)
+
+        # --- Run cell-eval ---
+        if args.pseudobulk and deseq2_de_results:
+            # DESeq2 mode: non-DE metrics from pseudobulk, DE metrics from precomputed DESeq2
+            _run_cell_eval(
                 adata_real_eval, adata_pred_eval, data_module, results_dir,
                 args.profile, pdex_kwargs, data_module.embed_key,
-                skip_de=True, write_csv=False,
+                skip_de=True,
                 allow_discrete=allow_discrete_eval,
+                deseq2_de_results=deseq2_de_results,
             )
-            # 2. Batched cell-level DE from h5py
-            logger.info("Running batched cell-level DE with batch_size=%d...", args.eval_batch_size)
-            _run_batched_de(
-                h5_path, results_dir, data_module, args.eval_batch_size,
-                pdex_kwargs, non_de_results, shared_perts_set, logger,
-                allow_discrete=allow_discrete_eval,
-            )
-            h5_path = None  # Already cleaned up by _run_batched_de
         else:
-            # Standard evaluation (all metrics together)
+            # Standard evaluation (all metrics together, or skip_de)
             _run_cell_eval(
                 adata_real_eval, adata_pred_eval, data_module, results_dir,
                 args.profile, pdex_kwargs, data_module.embed_key,
                 skip_de=args.skip_de,
                 allow_discrete=allow_discrete_eval,
             )
-
-    # Clean up h5py temp file if it wasn't used (e.g., predict_only or skip_de)
-    if h5_path is not None and os.path.exists(h5_path):
-        os.remove(h5_path)
-        logger.info("Cleaned up unused temporary h5py file: %s", h5_path)

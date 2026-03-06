@@ -180,3 +180,65 @@ def test_compute_nb_log1p_mse_per_set_increases_with_mismatch():
     loss_small = model._compute_nb_log1p_mse_per_set(nb_mean_small_error, target_counts).item()
     loss_large = model._compute_nb_log1p_mse_per_set(nb_mean_large_error, target_counts).item()
     assert loss_large > loss_small
+
+
+def test_get_nb_target_library_sizes_for_inference_uses_pert_counts_per_cell():
+    model = object.__new__(StateTransitionPerturbationModel)
+    model.nb_eps = 1e-8
+    model.cell_sentence_len = 3
+
+    batch = {
+        "pert_cell_counts": torch.tensor(
+            [
+                [1.0, 2.0, 0.0],
+                [3.0, 1.0, 0.0],
+                [2.0, 2.0, 2.0],
+            ]
+        )
+    }
+
+    out = model._get_nb_target_library_sizes_for_inference(batch, padded=False)
+    expected = torch.tensor([[[3.0], [4.0], [6.0]]])
+    assert torch.allclose(out, expected)
+
+
+def test_get_nb_target_library_sizes_for_inference_requires_targets():
+    model = object.__new__(StateTransitionPerturbationModel)
+    model.nb_eps = 1e-8
+    model.cell_sentence_len = 2
+    try:
+        _ = model._get_nb_target_library_sizes_for_inference({}, padded=False)
+    except RuntimeError as exc:
+        assert "target_oracle" in str(exc)
+    else:
+        raise AssertionError("Expected RuntimeError when pert_cell_counts is missing.")
+
+
+def test_compute_nb_library_sizes_from_mean_sums_last_dim():
+    nb_mean = torch.tensor(
+        [
+            [
+                [1.0, 2.0, 0.0],
+                [3.0, 1.0, 0.0],
+            ]
+        ]
+    )
+    libs = StateTransitionPerturbationModel._compute_nb_library_sizes_from_mean(nb_mean)
+    expected = torch.tensor([[[3.0], [4.0]]])
+    assert torch.allclose(libs, expected)
+
+
+def test_compute_nb_library_mse_per_set_zero_for_matching_libraries():
+    model = object.__new__(StateTransitionPerturbationModel)
+    model.nb_eps = 1e-8
+
+    target_counts = torch.tensor(
+        [
+            [[2.0, 1.0], [3.0, 0.0]],
+            [[1.0, 1.0], [1.0, 1.0]],
+        ]
+    )
+    nb_mean = target_counts.clone()
+    per_set = model._compute_nb_library_mse_per_set(nb_mean, target_counts)
+    assert per_set.shape == torch.Size([2])
+    assert torch.allclose(per_set, torch.zeros_like(per_set), atol=1e-7)

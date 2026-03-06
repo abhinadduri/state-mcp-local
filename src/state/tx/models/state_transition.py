@@ -99,6 +99,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             kwargs,
         )
         self.nb_log1p_mse_weight = float(kwargs.get("nb_log1p_mse_weight", 0.0))
+        self.nb_library_mse_weight = float(kwargs.get("nb_library_mse_weight", 0.0))
         self.nb_inference_dispersion_mode = str(kwargs.get("nb_inference_dispersion_mode", "per_cell")).strip().lower()
         self.nb_inference_output_mode = str(kwargs.get("nb_inference_output_mode", "mean")).strip().lower()
         self.nb_library_size_mode = str(kwargs.get("nb_library_size_mode", "set_median")).strip().lower()
@@ -106,8 +107,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.nb_px_scale_activation = str(kwargs.get("nb_px_scale_activation", "softmax")).strip().lower()
         valid_dispersion_modes = {"per_cell", "set_median"}
         valid_output_modes = {"mean", "sample"}
-        valid_library_modes = {"per_cell", "set_median"}
-        valid_inference_library_modes = {"auto", *valid_library_modes}
+        valid_library_modes = {"per_cell", "set_median", "predicted"}
+        valid_inference_library_modes = {"auto", "target_oracle", "per_cell", "set_median"}
         valid_px_scale_activations = {"softmax", "sparsemax"}
         if self.nb_inference_dispersion_mode not in valid_dispersion_modes:
             raise ValueError(
@@ -157,6 +158,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 "nb_loss=True with nb_log1p_mse_weight=%.3f enables auxiliary log1p-mean calibration.",
                 self.nb_log1p_mse_weight,
             )
+        if self.nb_loss and self.nb_library_mse_weight > 0.0:
+            logger.warning(
+                "nb_loss=True with nb_library_mse_weight=%.3f enables auxiliary library-size calibration.",
+                self.nb_library_mse_weight,
+            )
         if self.nb_loss:
             if self.gene_decoder is not None:
                 logger.info("nb_loss=True: disabling gene_decoder and decoder loss branches.")
@@ -192,6 +198,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
         self.nb_parameter_head: Optional[nn.Module] = None
+        self.nb_library_head: Optional[nn.Module] = None
         self.nb_target_dim = int(self.output_dim)
         if self.nb_loss:
             if self.output_space == "all":
@@ -207,6 +214,15 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 dropout=self.dropout,
                 activation=self.activation_class,
             )
+            if self.nb_library_size_mode == "predicted":
+                self.nb_library_head = build_mlp(
+                    in_dim=self.output_dim,
+                    out_dim=1,
+                    hidden_dim=self.hidden_dim,
+                    n_layers=self.n_decoder_layers,
+                    dropout=self.dropout,
+                    activation=self.activation_class,
+                )
             logger.info(
                 "NB loss enabled for state transition model "
                 "(nb_target_dim=%d, nb_embed_loss_weight=%.3f, nb_px_scale_activation=%s).",
@@ -376,7 +392,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
         per_cell_library_sizes = self._compute_per_cell_library_sizes_from_control(ctrl_cells)
         if mode == "set_median":
             return per_cell_library_sizes.median(dim=1, keepdim=True).values
-        return per_cell_library_sizes
+        if mode == "per_cell":
+            return per_cell_library_sizes
+        raise ValueError(f"Unsupported control-derived NB library mode: {mode!r}")
+
+    @staticmethod
+    def _compute_nb_library_sizes_from_mean(nb_mean: torch.Tensor) -> torch.Tensor:
+        return nb_mean.sum(dim=-1, keepdim=True).clamp_min(1.0)
 
     @staticmethod
     def _rescale_nb_mean_between_library_modes(
@@ -412,6 +434,34 @@ class StateTransitionPerturbationModel(PerturbationModel):
         if ctrl_counts is not None:
             return self._reshape_sequence_tensor(ctrl_counts.to(fallback_ctrl.device), padded)
         return fallback_ctrl
+
+    def _get_nb_target_library_sizes_for_inference(self, batch: Dict[str, torch.Tensor], padded: bool) -> torch.Tensor:
+        """Return per-cell target library sizes from perturbation counts (diagnostic-only mode)."""
+        pert_counts = batch.get("pert_cell_counts", None)
+        if pert_counts is None:
+            raise RuntimeError(
+                "nb_inference_library_size_mode='target_oracle' requires pert_cell_counts in predict batches."
+            )
+        target_counts = self._reshape_sequence_tensor(pert_counts, padded)
+        return self._compute_library_sizes_from_control(target_counts, mode="per_cell")
+
+    def _get_nb_source_library_sizes_for_inference(
+        self,
+        batch: Dict[str, torch.Tensor],
+        nb_mean: torch.Tensor,
+        padded: bool,
+    ) -> torch.Tensor:
+        if self.nb_library_size_mode == "predicted":
+            return self._compute_nb_library_sizes_from_mean(nb_mean)
+        ctrl_for_library = self._get_nb_control_tensor_for_library(
+            batch,
+            batch["ctrl_cell_emb"],
+            padded,
+        )
+        return self._compute_library_sizes_from_control(
+            ctrl_for_library,
+            self.nb_library_size_mode,
+        )
 
     def _compute_nb_nll_loss(
         self,
@@ -452,6 +502,17 @@ class StateTransitionPerturbationModel(PerturbationModel):
         pred_log = torch.log1p(nb_mean.clamp_min(0.0))
         target_log = torch.log1p(target_counts.clamp_min(0.0))
         sq_err = (pred_log - target_log) ** 2
+        return torch.nanmean(sq_err.reshape(sq_err.shape[0], -1), dim=1)
+
+    def _compute_nb_library_mse_per_set(
+        self,
+        nb_mean: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        target_counts = self._to_count_space(target).to(nb_mean.dtype)
+        pred_library = self._compute_nb_library_sizes_from_mean(nb_mean)
+        target_library = target_counts.sum(dim=-1, keepdim=True).clamp_min(0.0)
+        sq_err = (pred_library - target_library) ** 2
         return torch.nanmean(sq_err.reshape(sq_err.shape[0], -1), dim=1)
 
     @staticmethod
@@ -592,8 +653,15 @@ class StateTransitionPerturbationModel(PerturbationModel):
             nb_params = self.nb_parameter_head(out_pred)
             px_scale_logits, nb_dispersion_logits = torch.chunk(nb_params, chunks=2, dim=-1)
             px_scale = self._apply_nb_scale_activation(px_scale_logits)
-            ctrl_for_library = self._get_nb_control_tensor_for_library(batch, basal, padded)
-            library_sizes = self._compute_library_sizes_from_control(ctrl_for_library, self.nb_library_size_mode)
+            if self.nb_library_size_mode == "predicted":
+                if self.nb_library_head is None:
+                    raise RuntimeError(
+                        "nb_library_size_mode='predicted' requires nb_library_head to be initialized."
+                    )
+                library_sizes = F.softplus(self.nb_library_head(out_pred)) + 1.0
+            else:
+                ctrl_for_library = self._get_nb_control_tensor_for_library(batch, basal, padded)
+                library_sizes = self._compute_library_sizes_from_control(ctrl_for_library, self.nb_library_size_mode)
             nb_mean = px_scale * library_sizes
             nb_dispersion = F.softplus(nb_dispersion_logits) + self.nb_eps
 
@@ -628,6 +696,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         embedding_aux_loss = None
         nb_log1p_mse_aux_loss = None
+        nb_library_mse_aux_loss = None
         if self.nb_loss:
             if padded:
                 nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
@@ -646,6 +715,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nb_log1p_mse_per_set = self._compute_nb_log1p_mse_per_set(nb_mean, nb_target)
                 nb_log1p_mse_aux_loss = torch.nanmean(nb_log1p_mse_per_set)
                 self.log("train/nb_log1p_mse_loss", nb_log1p_mse_aux_loss)
+            nb_library_mse_per_set = self._compute_nb_library_mse_per_set(nb_mean, nb_target)
+            nb_library_mse_metric = torch.nanmean(nb_library_mse_per_set)
+            self.log("train/nb_library_mse", nb_library_mse_metric)
+            if self.nb_library_mse_weight > 0.0:
+                nb_library_mse_aux_loss = nb_library_mse_metric
         else:
             per_set_main_losses = self._compute_distribution_loss(pred, target)
         main_loss = torch.nanmean(per_set_main_losses)
@@ -658,6 +732,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             total_loss = total_loss + self.nb_embed_loss_weight * embedding_aux_loss
         if nb_log1p_mse_aux_loss is not None:
             total_loss = total_loss + self.nb_log1p_mse_weight * nb_log1p_mse_aux_loss
+        if nb_library_mse_aux_loss is not None:
+            total_loss = total_loss + self.nb_library_mse_weight * nb_library_mse_aux_loss
 
         # Decoder loss in gene space, if a decoder is configured.
         if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
@@ -702,6 +778,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         embedding_aux_loss = None
         nb_log1p_mse_aux_loss = None
+        nb_library_mse_aux_loss = None
         if self.nb_loss:
             nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
             nb_dispersion = nb_dispersion_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
@@ -715,6 +792,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 nb_log1p_mse_per_set = self._compute_nb_log1p_mse_per_set(nb_mean, nb_target)
                 nb_log1p_mse_aux_loss = torch.nanmean(nb_log1p_mse_per_set)
                 self.log("val/nb_log1p_mse_loss", nb_log1p_mse_aux_loss)
+            nb_library_mse_per_set = self._compute_nb_library_mse_per_set(nb_mean, nb_target)
+            nb_library_mse_metric = torch.nanmean(nb_library_mse_per_set)
+            self.log("val/nb_library_mse", nb_library_mse_metric)
+            if self.nb_library_mse_weight > 0.0:
+                nb_library_mse_aux_loss = nb_library_mse_metric
         else:
             per_set_main_losses = self._compute_distribution_loss(pred, target)
         loss = torch.nanmean(per_set_main_losses)
@@ -722,6 +804,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
             loss = loss + self.nb_embed_loss_weight * embedding_aux_loss
         if nb_log1p_mse_aux_loss is not None:
             loss = loss + self.nb_log1p_mse_weight * nb_log1p_mse_aux_loss
+        if nb_library_mse_aux_loss is not None:
+            loss = loss + self.nb_library_mse_weight * nb_library_mse_aux_loss
         self.log(self._val_main_loss_key(), loss)
 
         if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
@@ -761,6 +845,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
             if self.nb_log1p_mse_weight > 0.0:
                 nb_log1p_mse_per_set = self._compute_nb_log1p_mse_per_set(nb_mean, nb_target)
                 loss = loss + self.nb_log1p_mse_weight * torch.nanmean(nb_log1p_mse_per_set)
+            nb_library_mse_per_set = self._compute_nb_library_mse_per_set(nb_mean, nb_target)
+            nb_library_mse_metric = torch.nanmean(nb_library_mse_per_set)
+            self.log("test/nb_library_mse", nb_library_mse_metric)
+            if self.nb_library_mse_weight > 0.0:
+                loss = loss + self.nb_library_mse_weight * nb_library_mse_metric
             self.log("test_loss", loss)
             return
         _ = self.forward(batch, padded=False)
@@ -802,20 +891,40 @@ class StateTransitionPerturbationModel(PerturbationModel):
             nb_inference_library_mode = self.nb_inference_library_size_mode
             if nb_inference_library_mode == "auto":
                 nb_inference_library_mode = self.nb_library_size_mode
-            if nb_inference_library_mode != self.nb_library_size_mode:
-                ctrl_for_library = self._get_nb_control_tensor_for_library(
+            if nb_inference_library_mode == "target_oracle":
+                source_library_sizes = self._get_nb_source_library_sizes_for_inference(
                     batch,
-                    batch["ctrl_cell_emb"],
+                    nb_mean,
                     padded,
+                ).to(nb_mean.dtype)
+                target_library_sizes = self._get_nb_target_library_sizes_for_inference(
+                    batch,
+                    padded,
+                ).to(nb_mean.dtype)
+                nb_mean = self._rescale_nb_mean_between_library_modes(
+                    nb_mean,
+                    source_library_sizes,
+                    target_library_sizes,
+                    self.nb_eps,
                 )
-                source_library_sizes = self._compute_library_sizes_from_control(
-                    ctrl_for_library,
-                    self.nb_library_size_mode,
+            elif nb_inference_library_mode != self.nb_library_size_mode:
+                source_library_sizes = self._get_nb_source_library_sizes_for_inference(
+                    batch,
+                    nb_mean,
+                    padded,
                 ).to(nb_mean.dtype)
-                target_library_sizes = self._compute_library_sizes_from_control(
-                    ctrl_for_library,
-                    nb_inference_library_mode,
-                ).to(nb_mean.dtype)
+                if nb_inference_library_mode == "predicted":
+                    target_library_sizes = self._compute_nb_library_sizes_from_mean(nb_mean).to(nb_mean.dtype)
+                else:
+                    ctrl_for_library = self._get_nb_control_tensor_for_library(
+                        batch,
+                        batch["ctrl_cell_emb"],
+                        padded,
+                    )
+                    target_library_sizes = self._compute_library_sizes_from_control(
+                        ctrl_for_library,
+                        nb_inference_library_mode,
+                    ).to(nb_mean.dtype)
                 nb_mean = self._rescale_nb_mean_between_library_modes(
                     nb_mean,
                     source_library_sizes,
