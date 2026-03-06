@@ -34,7 +34,6 @@ def run_tx_train(cfg: DictConfig):
     logger = logging.getLogger(__name__)
     torch.set_float32_matmul_precision("medium")
 
-    cfg_yaml = OmegaConf.to_yaml(cfg, resolve=True)
     cfg = OmegaConf.to_container(cfg, resolve=True)
 
     # Setup output directory
@@ -47,9 +46,6 @@ def run_tx_train(cfg: DictConfig):
     # Set up wandb directory if needed
     if cfg["use_wandb"]:
         os.makedirs(cfg["wandb"]["local_wandb_dir"], exist_ok=True)
-
-    with open(join(run_output_dir, "config.yaml"), "w") as f:
-        f.write(cfg_yaml)
 
     # Set random seeds
     pl.seed_everything(cfg["training"]["train_seed"])
@@ -173,6 +169,11 @@ def run_tx_train(cfg: DictConfig):
     else:
         cfg["model"]["kwargs"].pop("decoder_cfg", None)
         cfg["model"]["kwargs"]["gene_decoder_bool"] = False
+
+    # Persist the effective resolved config after runtime adjustments (e.g. NB data guards).
+    resolved_cfg_yaml = OmegaConf.to_yaml(OmegaConf.create(cfg), resolve=True)
+    with open(join(run_output_dir, "config.yaml"), "w") as f:
+        f.write(resolved_cfg_yaml)
 
     # Save one-hot maps as artifacts instead of storing them in config
     cell_type_onehot_map_path = join(run_output_dir, "cell_type_onehot_map.torch")
