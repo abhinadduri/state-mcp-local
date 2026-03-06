@@ -162,6 +162,22 @@ def _nb_log1p_eval_tensor(nb_mean, nb_dispersion, mode: str, eps: float = 1e-8):
     return torch.clamp(out, min=0.0)
 
 
+def _to_deseq2_counts_np(x, from_log1p: bool):
+    """Convert array-like values to non-negative rounded counts for DESeq2."""
+    import numpy as np
+
+    arr = np.asarray(x, dtype=np.float64)
+    if from_log1p:
+        arr = np.expm1(arr)
+    arr = np.clip(arr, a_min=0.0, a_max=None)
+    return np.round(arr)
+
+
+def _nb_real_eval_needs_log1p_transform(resolved_exp_counts: bool, resolved_is_log1p: bool) -> bool:
+    """Whether real-expression eval matrices still need a log1p transform."""
+    return bool(resolved_exp_counts or (not resolved_is_log1p))
+
+
 def _build_metric_configs(embed_key) -> dict:
     """Build metric_configs dict for MetricsEvaluator.compute()."""
     if embed_key and embed_key != "X_hvg":
@@ -940,8 +956,13 @@ def run_tx_predict(args: ap.ArgumentParser):
                     batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().numpy().astype(np.float32)
                     batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().numpy().astype(np.float32)
                     if aggregate_gene_in_count_space:
+                        # Real values are log1p-scaled when exp_counts=False; convert to count space.
                         batch_real_gene_pb_np = np.expm1(batch_real_gene_np.astype(np.float64, copy=False))
-                        batch_gene_pred_pb_np = np.expm1(batch_gene_pred_np.astype(np.float64, copy=False))
+                        # NB predictions are already in count space; non-NB decoder outputs may be log1p.
+                        if nb_loss_enabled:
+                            batch_gene_pred_pb_np = batch_gene_pred_np.astype(np.float64, copy=False)
+                        else:
+                            batch_gene_pred_pb_np = np.expm1(batch_gene_pred_np.astype(np.float64, copy=False))
                         np.clip(batch_real_gene_pb_np, a_min=0.0, a_max=None, out=batch_real_gene_pb_np)
                         np.clip(batch_gene_pred_pb_np, a_min=0.0, a_max=None, out=batch_gene_pred_pb_np)
                     else:
@@ -1007,13 +1028,22 @@ def run_tx_predict(args: ap.ArgumentParser):
                             entry["gene_real_logsum"] += batch_real_gene_np[idx_arr].sum(axis=0, dtype=np.float64)
 
                     # --- Per-replicate accumulation for DESeq2 ---
-                    # Convert to integer counts via expm1 + round + clip
+                    # Convert to integer counts with scale-aware handling.
                     if use_count_outputs:
-                        _pred_count = np.round(np.clip(np.expm1(batch_gene_pred_np[idx_arr].astype(np.float64)), 0, None))
-                        _real_count = np.round(np.clip(np.expm1(batch_real_gene_np[idx_arr].astype(np.float64)), 0, None))
+                        # Prediction scale:
+                        # - NB outputs are count-space means/samples.
+                        # - Non-NB decoder outputs may be log1p when aggregate_gene_in_count_space is true.
+                        _pred_from_log1p = (not nb_loss_enabled) and aggregate_gene_in_count_space
+                        _pred_count = _to_deseq2_counts_np(batch_gene_pred_np[idx_arr], from_log1p=_pred_from_log1p)
+
+                        # Real scale:
+                        # - exp_counts=True -> already count-space
+                        # - exp_counts=False with log1p inputs -> convert via expm1
+                        _real_from_log1p = not resolved_exp_counts
+                        _real_count = _to_deseq2_counts_np(batch_real_gene_np[idx_arr], from_log1p=_real_from_log1p)
                     else:
-                        _pred_count = np.round(np.clip(np.expm1(batch_pred_np[idx_arr].astype(np.float64)), 0, None))
-                        _real_count = np.round(np.clip(np.expm1(batch_real_np[idx_arr].astype(np.float64)), 0, None))
+                        _pred_count = _to_deseq2_counts_np(batch_pred_np[idx_arr], from_log1p=True)
+                        _real_count = _to_deseq2_counts_np(batch_real_np[idx_arr], from_log1p=True)
                     # Round-robin assign cells to replicates
                     prev_count = entry["count"] - n_cells_this
                     rep_assignments = np.arange(prev_count, prev_count + n_cells_this) % deseq2_n_reps
@@ -1331,7 +1361,22 @@ def run_tx_predict(args: ap.ArgumentParser):
             else:
                 logger.info("NB eval scale mode=log1p: converting cell-level count outputs to log1p for metrics.")
                 adata_pred_eval = as_log1p_eval_view(adata_pred)
-            adata_real_eval = as_log1p_eval_view(adata_real)
+            if _nb_real_eval_needs_log1p_transform(resolved_exp_counts, resolved_is_log1p):
+                logger.info(
+                    "NB eval scale mode=log1p: converting real cell-level outputs to log1p for metrics "
+                    "(exp_counts=%s, is_log1p=%s).",
+                    resolved_exp_counts,
+                    resolved_is_log1p,
+                )
+                adata_real_eval = as_log1p_eval_view(adata_real)
+            else:
+                logger.info(
+                    "NB eval scale mode=log1p: real cell-level outputs are already log1p-scaled "
+                    "(exp_counts=%s, is_log1p=%s); skipping additional transform.",
+                    resolved_exp_counts,
+                    resolved_is_log1p,
+                )
+                adata_real_eval = adata_real.copy()
         else:
             adata_pred_eval = adata_pred
             adata_real_eval = adata_real
