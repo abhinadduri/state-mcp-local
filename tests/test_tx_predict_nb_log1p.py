@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from state._cli._tx._predict import (
@@ -35,6 +36,39 @@ def test_nb_log1p_eval_tensor_delta_stronger_with_lower_dispersion():
     out_low_theta = _nb_log1p_eval_tensor(mu, theta_low, mode="delta")
 
     assert torch.all(out_low_theta <= out_high_theta + 1e-6)
+
+
+def test_nb_log1p_eval_tensor_mc_is_nonnegative_and_below_mean():
+    torch.manual_seed(0)
+    mu = torch.tensor([[0.2, 1.0, 4.0, 10.0]], dtype=torch.float32)
+    theta = torch.tensor([[0.6, 1.2, 2.0, 4.0]], dtype=torch.float32)
+
+    out_mc = _nb_log1p_eval_tensor(mu, theta, mode="mc", mc_samples=64)
+    out_mean = _nb_log1p_eval_tensor(mu, theta, mode="mean")
+
+    assert torch.all(out_mc >= 0.0)
+    assert torch.all(out_mc <= out_mean + 1e-6)
+
+
+def test_nb_log1p_eval_tensor_mc_reflects_dispersion_strength():
+    torch.manual_seed(0)
+    mu = torch.tensor([[0.5, 2.0, 8.0]], dtype=torch.float32)
+    theta_high = torch.tensor([[50.0, 50.0, 50.0]], dtype=torch.float32)
+    theta_low = torch.tensor([[0.5, 0.5, 0.5]], dtype=torch.float32)
+
+    torch.manual_seed(0)
+    out_high_theta = _nb_log1p_eval_tensor(mu, theta_high, mode="mc", mc_samples=1024)
+    torch.manual_seed(0)
+    out_low_theta = _nb_log1p_eval_tensor(mu, theta_low, mode="mc", mc_samples=1024)
+
+    assert torch.all(out_low_theta <= out_high_theta + 1e-5)
+
+
+def test_nb_log1p_eval_tensor_mc_requires_positive_samples():
+    mu = torch.tensor([[1.0]], dtype=torch.float32)
+    theta = torch.tensor([[1.0]], dtype=torch.float32)
+    with pytest.raises(ValueError):
+        _nb_log1p_eval_tensor(mu, theta, mode="mc", mc_samples=0)
 
 
 def test_nb_real_eval_needs_log1p_transform_scale_logic():

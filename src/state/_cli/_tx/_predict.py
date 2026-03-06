@@ -117,11 +117,12 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         "--nb-log1p-mode",
         type=str,
         default="auto",
-        choices=["auto", "mean", "delta"],
+        choices=["auto", "mean", "delta", "mc"],
         help=(
             "When NB eval scale is log1p, choose how predicted log1p values are derived. "
             "'mean' uses log1p(mu). "
             "'delta' uses a second-order NB expectation correction to reduce Jensen bias. "
+            "'mc' uses Monte Carlo E[log1p(X)] with X~NB(mu,theta). "
             "'auto' reads evaluation.nb_log1p_mode and defaults to 'mean'."
         ),
     )
@@ -142,12 +143,19 @@ def _build_results_dir(output_dir: str, checkpoint: str, eval_train_data: bool) 
     return results_dir
 
 
-def _nb_log1p_eval_tensor(nb_mean, nb_dispersion, mode: str, eps: float = 1e-8):
+def _nb_log1p_eval_tensor(
+    nb_mean,
+    nb_dispersion,
+    mode: str,
+    eps: float = 1e-8,
+    mc_samples: int = 8,
+):
     """Map NB parameters to log1p-space evaluation targets.
 
     mode='mean': log1p(E[X]) = log1p(mu)
     mode='delta': E[log1p(X)] approx via second-order delta method:
       log1p(mu) - 0.5 * Var(X) / (1 + mu)^2, Var(X)=mu+mu^2/theta
+    mode='mc': Monte Carlo estimate of E[log1p(X)] using NB sampling.
     """
     import torch
 
@@ -156,6 +164,15 @@ def _nb_log1p_eval_tensor(nb_mean, nb_dispersion, mode: str, eps: float = 1e-8):
         return torch.log1p(mu)
 
     theta = torch.clamp(nb_dispersion, min=eps)
+    if mode == "mc":
+        draws = int(mc_samples)
+        if draws <= 0:
+            raise ValueError(f"mc_samples must be > 0; got {draws!r}.")
+        probs = mu / (theta + mu + eps)
+        nb_dist = torch.distributions.NegativeBinomial(total_count=theta, probs=probs)
+        sampled = nb_dist.sample((draws,))
+        return torch.log1p(sampled).mean(dim=0)
+
     var = mu + (mu * mu) / theta
     denom = torch.clamp((1.0 + mu) ** 2, min=eps)
     out = torch.log1p(mu) - 0.5 * (var / denom)
@@ -656,6 +673,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     resolved_exp_counts = bool(getattr(data_module, "exp_counts", cfg["data"]["kwargs"].get("exp_counts", False)))
     default_metrics_is_log1p = not (nb_loss_enabled or resolved_exp_counts)
     nb_log1p_mode = "mean"
+    nb_log1p_mc_samples = 8
     if nb_loss_enabled:
         cfg_nb_eval_scale_mode = str(eval_cfg.get("nb_eval_scale_mode", "auto")).strip().lower()
         if cfg_nb_eval_scale_mode not in {"auto", "legacy", "log1p"}:
@@ -678,9 +696,9 @@ def run_tx_predict(args: ap.ArgumentParser):
             )
         metrics_is_log1p = True if nb_eval_scale_mode == "log1p" else default_metrics_is_log1p
         cfg_nb_log1p_mode = str(eval_cfg.get("nb_log1p_mode", "auto")).strip().lower()
-        if cfg_nb_log1p_mode not in {"auto", "mean", "delta"}:
+        if cfg_nb_log1p_mode not in {"auto", "mean", "delta", "mc"}:
             raise ValueError(
-                "evaluation.nb_log1p_mode must be one of {'auto', 'mean', 'delta'}; "
+                "evaluation.nb_log1p_mode must be one of {'auto', 'mean', 'delta', 'mc'}; "
                 f"got {cfg_nb_log1p_mode!r}."
             )
         if args.nb_log1p_mode != "auto":
@@ -691,15 +709,21 @@ def run_tx_predict(args: ap.ArgumentParser):
             nb_log1p_mode = "mean"
         if nb_eval_scale_mode != "log1p":
             nb_log1p_mode = "mean"
-        if nb_log1p_mode not in {"mean", "delta"}:
+        if nb_log1p_mode not in {"mean", "delta", "mc"}:
             raise ValueError(
-                "nb_log1p_mode must be one of {'mean', 'delta'}; "
+                "nb_log1p_mode must be one of {'mean', 'delta', 'mc'}; "
                 f"got {nb_log1p_mode!r}."
+            )
+        nb_log1p_mc_samples = int(eval_cfg.get("nb_log1p_mc_samples", 8))
+        if nb_log1p_mc_samples <= 0:
+            raise ValueError(
+                f"evaluation.nb_log1p_mc_samples must be > 0; got {nb_log1p_mc_samples!r}."
             )
     else:
         nb_eval_scale_mode = "legacy"
         metrics_is_log1p = default_metrics_is_log1p
         nb_log1p_mode = "mean"
+        nb_log1p_mc_samples = 8
     logger.info(
         "Metrics config: setting pdex is_log1p=%s (nb_loss=%s, exp_counts=%s, nb_eval_scale_mode=%s)",
         metrics_is_log1p,
@@ -712,12 +736,13 @@ def run_tx_predict(args: ap.ArgumentParser):
             cfg.get("model", {}).get("kwargs", {}).get("nb_inference_library_blend_alpha", 0.5)
         )
         logger.info(
-            "NB inference config: dispersion_mode=%s output_mode=%s library_mode=%s blend_alpha=%.3f log1p_mode=%s",
+            "NB inference config: dispersion_mode=%s output_mode=%s library_mode=%s blend_alpha=%.3f log1p_mode=%s mc_samples=%d",
             nb_dispersion_mode,
             nb_output_mode,
             nb_library_mode,
             cfg_nb_library_blend_alpha,
             nb_log1p_mode,
+            nb_log1p_mc_samples,
         )
         if nb_library_mode == "target_oracle":
             logger.warning(
@@ -896,9 +921,10 @@ def run_tx_predict(args: ap.ArgumentParser):
                         )
                     )
                 if nb_loss_enabled and batch_preds.get("pert_cell_counts_preds") is not None:
+                    batch_nb_mean = batch_preds.get("pert_cell_counts_mean", batch_preds["pert_cell_counts_preds"])
                     nb_mean_samples.append(
                         collect_sample_values(
-                            batch_preds["pert_cell_counts_preds"].detach().cpu().numpy(),
+                            batch_nb_mean.detach().cpu().numpy(),
                             cap=100000,
                             take=4096,
                         )
@@ -1229,9 +1255,10 @@ def run_tx_predict(args: ap.ArgumentParser):
                         )
                     )
                 if nb_loss_enabled and batch_preds.get("pert_cell_counts_preds") is not None:
+                    batch_nb_mean = batch_preds.get("pert_cell_counts_mean", batch_preds["pert_cell_counts_preds"])
                     nb_mean_samples.append(
                         collect_sample_values(
-                            batch_preds["pert_cell_counts_preds"].detach().cpu().numpy(),
+                            batch_nb_mean.detach().cpu().numpy(),
                             cap=100000,
                             take=4096,
                         )
@@ -1292,10 +1319,15 @@ def run_tx_predict(args: ap.ArgumentParser):
                             raise RuntimeError(
                                 "nb_log1p_mode requires pert_cell_counts_dispersion in predict_step outputs."
                             )
-                        batch_log1p_eval = _nb_log1p_eval_tensor(
+                        batch_nb_mean_for_eval = batch_preds.get(
+                            "pert_cell_counts_mean",
                             batch_preds["pert_cell_counts_preds"],
+                        )
+                        batch_log1p_eval = _nb_log1p_eval_tensor(
+                            batch_nb_mean_for_eval,
                             batch_dispersion,
                             mode=nb_log1p_mode,
+                            mc_samples=nb_log1p_mc_samples,
                         )
                         final_pert_cell_log1p_eval_preds[
                             current_idx - batch_size : current_idx, :

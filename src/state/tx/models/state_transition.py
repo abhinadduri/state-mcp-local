@@ -994,6 +994,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             else:
                 nb_pred_counts = nb_mean
 
+            output_dict["pert_cell_counts_mean"] = nb_mean.reshape(-1, self.nb_target_dim)
             output_dict["pert_cell_counts_preds"] = nb_pred_counts.reshape(-1, self.nb_target_dim)
             output_dict["pert_cell_counts_dispersion"] = nb_dispersion_for_pred.reshape(-1, self.nb_target_dim)
         elif self.gene_decoder is not None:
