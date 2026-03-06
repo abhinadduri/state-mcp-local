@@ -82,6 +82,19 @@ def test_compute_library_sizes_from_control_modes():
     assert torch.allclose(set_median, expected_set_median)
 
 
+def test_blend_nb_library_sizes_interpolates_between_modes():
+    set_median = torch.tensor([[[4.0]]])
+    per_cell = torch.tensor([[[3.0], [4.0], [6.0]]])
+
+    out_alpha0 = StateTransitionPerturbationModel._blend_nb_library_sizes(set_median, per_cell, alpha=0.0)
+    out_alpha05 = StateTransitionPerturbationModel._blend_nb_library_sizes(set_median, per_cell, alpha=0.5)
+    out_alpha1 = StateTransitionPerturbationModel._blend_nb_library_sizes(set_median, per_cell, alpha=1.0)
+
+    assert torch.allclose(out_alpha0, torch.tensor([[[4.0], [4.0], [4.0]]]))
+    assert torch.allclose(out_alpha05, torch.tensor([[[3.5], [4.0], [5.0]]]))
+    assert torch.allclose(out_alpha1, per_cell)
+
+
 def test_rescale_nb_mean_between_library_modes():
     nb_mean = torch.tensor(
         [

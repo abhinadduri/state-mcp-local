@@ -95,7 +95,7 @@ def add_arguments_predict(parser: ap.ArgumentParser):
         "--nb-library-mode",
         type=str,
         default="auto",
-        choices=["auto", "set_median", "per_cell", "predicted", "target_oracle"],
+        choices=["auto", "set_median", "per_cell", "predicted", "blend", "target_oracle"],
         help=(
             "NB inference-time library-size mode for mean rescaling. "
             "'auto' reads model.kwargs.nb_inference_library_size_mode and falls back "
@@ -618,6 +618,7 @@ def run_tx_predict(args: ap.ArgumentParser):
         "per_cell",
         "set_median",
         "predicted",
+        "blend",
         "target_oracle",
     }:
         raise ValueError(f"Unsupported NB library mode: {nb_library_mode!r}")
@@ -677,11 +678,15 @@ def run_tx_predict(args: ap.ArgumentParser):
         nb_eval_scale_mode,
     )
     if nb_loss_enabled:
+        cfg_nb_library_blend_alpha = float(
+            cfg.get("model", {}).get("kwargs", {}).get("nb_inference_library_blend_alpha", 0.5)
+        )
         logger.info(
-            "NB inference config: dispersion_mode=%s output_mode=%s library_mode=%s log1p_mode=%s",
+            "NB inference config: dispersion_mode=%s output_mode=%s library_mode=%s blend_alpha=%.3f log1p_mode=%s",
             nb_dispersion_mode,
             nb_output_mode,
             nb_library_mode,
+            cfg_nb_library_blend_alpha,
             nb_log1p_mode,
         )
         if nb_library_mode == "target_oracle":

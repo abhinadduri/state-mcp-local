@@ -104,11 +104,12 @@ class StateTransitionPerturbationModel(PerturbationModel):
         self.nb_inference_output_mode = str(kwargs.get("nb_inference_output_mode", "mean")).strip().lower()
         self.nb_library_size_mode = str(kwargs.get("nb_library_size_mode", "set_median")).strip().lower()
         self.nb_inference_library_size_mode = str(kwargs.get("nb_inference_library_size_mode", "auto")).strip().lower()
+        self.nb_inference_library_blend_alpha = float(kwargs.get("nb_inference_library_blend_alpha", 0.5))
         self.nb_px_scale_activation = str(kwargs.get("nb_px_scale_activation", "softmax")).strip().lower()
         valid_dispersion_modes = {"per_cell", "set_median"}
         valid_output_modes = {"mean", "sample"}
         valid_library_modes = {"per_cell", "set_median", "predicted"}
-        valid_inference_library_modes = {"auto", "target_oracle", "per_cell", "set_median"}
+        valid_inference_library_modes = {"auto", "target_oracle", "per_cell", "set_median", "predicted", "blend"}
         valid_px_scale_activations = {"softmax", "sparsemax"}
         if self.nb_inference_dispersion_mode not in valid_dispersion_modes:
             raise ValueError(
@@ -129,6 +130,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
             raise ValueError(
                 "nb_inference_library_size_mode must be one of "
                 f"{sorted(valid_inference_library_modes)}; got {self.nb_inference_library_size_mode!r}."
+            )
+        if not (0.0 <= self.nb_inference_library_blend_alpha <= 1.0):
+            raise ValueError(
+                "nb_inference_library_blend_alpha must be in [0, 1]; "
+                f"got {self.nb_inference_library_blend_alpha!r}."
             )
         if self.nb_px_scale_activation not in valid_px_scale_activations:
             raise ValueError(
@@ -399,6 +405,15 @@ class StateTransitionPerturbationModel(PerturbationModel):
     @staticmethod
     def _compute_nb_library_sizes_from_mean(nb_mean: torch.Tensor) -> torch.Tensor:
         return nb_mean.sum(dim=-1, keepdim=True).clamp_min(1.0)
+
+    @staticmethod
+    def _blend_nb_library_sizes(
+        set_median_library_sizes: torch.Tensor,
+        per_cell_library_sizes: torch.Tensor,
+        alpha: float,
+    ) -> torch.Tensor:
+        alpha_f = float(alpha)
+        return (1.0 - alpha_f) * set_median_library_sizes + alpha_f * per_cell_library_sizes
 
     @staticmethod
     def _rescale_nb_mean_between_library_modes(
@@ -921,10 +936,25 @@ class StateTransitionPerturbationModel(PerturbationModel):
                         batch["ctrl_cell_emb"],
                         padded,
                     )
-                    target_library_sizes = self._compute_library_sizes_from_control(
-                        ctrl_for_library,
-                        nb_inference_library_mode,
-                    ).to(nb_mean.dtype)
+                    if nb_inference_library_mode == "blend":
+                        per_cell_library_sizes = self._compute_library_sizes_from_control(
+                            ctrl_for_library,
+                            mode="per_cell",
+                        )
+                        set_median_library_sizes = self._compute_library_sizes_from_control(
+                            ctrl_for_library,
+                            mode="set_median",
+                        )
+                        target_library_sizes = self._blend_nb_library_sizes(
+                            set_median_library_sizes,
+                            per_cell_library_sizes,
+                            self.nb_inference_library_blend_alpha,
+                        ).to(nb_mean.dtype)
+                    else:
+                        target_library_sizes = self._compute_library_sizes_from_control(
+                            ctrl_for_library,
+                            nb_inference_library_mode,
+                        ).to(nb_mean.dtype)
                 nb_mean = self._rescale_nb_mean_between_library_modes(
                     nb_mean,
                     source_library_sizes,
