@@ -74,6 +74,222 @@ class LatentToGeneDecoder(nn.Module):
         return self.decoder(x)
 
 
+class PretrainedBinaryDecoder(nn.Module):
+    """
+    Decoder that uses the pretrained SE binary decoder to map cell embeddings to gene expression.
+
+    The SE binary decoder was trained on 100M+ cells and knows rich gene-cell relationships.
+    This decoder feeds TX model outputs (predicted cell embeddings) through the pretrained
+    binary decoder to predict per-gene expression.
+
+    Input: [B, latent_dim] where latent_dim = cell_emb_dim(2048) + ds_emb_dim(10) = 2058
+    Output: [B, gene_dim] gene expression predictions
+
+    Args:
+        latent_dim: Input dimension (should be 2058 for X_state)
+        gene_dim: Number of output genes
+        gene_names: List of gene names matching the gene_dim
+        se_checkpoint: Path to SE model checkpoint
+        se_config: Path to SE model config
+        cell_batch_size: Batch size for cell processing (to avoid OOM with large gene sets)
+        freeze_binary_decoder: Whether to freeze the binary decoder weights
+        read_depth: Initial read-depth scalar for RDA
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        gene_dim: int,
+        gene_names: Optional[List[str]] = None,
+        se_checkpoint: str = "/home/aadduri/SE-600M/se600m_epoch16.ckpt",
+        se_config: str = "/home/aadduri/SE-600M/config.yaml",
+        cell_batch_size: int = 16,
+        freeze_binary_decoder: bool = True,
+        read_depth: float = 4.0,
+    ):
+        super().__init__()
+        from omegaconf import OmegaConf
+        from pathlib import Path
+
+        self._gene_dim = gene_dim
+        self._cell_batch_size = cell_batch_size
+        self._gene_names = gene_names or []
+        self._cell_emb_dim = 2048  # SE output_dim
+        self._ds_emb_dim = latent_dim - self._cell_emb_dim  # typically 10
+
+        # Learnable read-depth scalar
+        self.read_depth = nn.Parameter(torch.tensor(read_depth), requires_grad=True)
+
+        # Load SE model weights from safetensors (avoids pickle/vci import issues)
+        cfg = OmegaConf.load(se_config)
+        se_dir = Path(se_checkpoint).parent
+        safetensors_path = se_dir / "model.safetensors"
+
+        from ...emb.nn.model import StateEmbeddingModel
+
+        se_model = StateEmbeddingModel(
+            token_dim=cfg.tokenizer.token_dim,
+            d_model=cfg.model.emsize,
+            nhead=cfg.model.nhead,
+            d_hid=cfg.model.d_hid,
+            nlayers=cfg.model.nlayers,
+            output_dim=cfg.model.output_dim,
+            dropout=0.0,
+            cfg=cfg,
+        )
+
+        if safetensors_path.exists():
+            from safetensors.torch import load_file
+            state_dict = load_file(str(safetensors_path))
+            se_model.load_state_dict(state_dict, strict=False)
+        else:
+            # Fallback to .ckpt with legacy module shims
+            import sys, types
+            for m in ("vci", "vci.nn", "vci.nn.model", "vci.nn.loss",
+                       "vci.nn.flash_transformer", "vci.train", "vci.train.trainer", "vci.utils"):
+                if m not in sys.modules:
+                    sys.modules[m] = types.ModuleType(m)
+            ckpt = torch.load(se_checkpoint, map_location="cpu", weights_only=False)
+            se_model.load_state_dict(ckpt["state_dict"], strict=False)
+
+        # Extract and register binary decoder as a submodule
+        self.binary_decoder = se_model.binary_decoder
+        if freeze_binary_decoder:
+            for p in self.binary_decoder.parameters():
+                p.requires_grad = False
+
+        # Extract gene_embedding_layer (the encoder: Linear(5120, 2048) + LayerNorm + SiLU)
+        self.gene_embedding_layer = se_model.gene_embedding_layer
+        for p in self.gene_embedding_layer.parameters():
+            p.requires_grad = False
+
+        # Load protein embeddings
+        pe_path = se_dir / "protein_embeddings.pt"
+        if not pe_path.exists():
+            try:
+                pe_path_cfg = cfg.embeddings[cfg.embeddings.current].all_embeddings
+                if Path(pe_path_cfg).exists():
+                    pe_path = Path(pe_path_cfg)
+            except Exception:
+                pass
+        protein_embeds = torch.load(str(pe_path), weights_only=False)
+
+        # Build gene embedding matrix for the requested genes
+        self._build_gene_embeddings(protein_embeds, se_model)
+
+        # Don't keep the full SE model in memory
+        del se_model
+
+        logger.info(
+            "PretrainedBinaryDecoder: gene_dim=%d, cell_batch_size=%d, "
+            "freeze=%s, matched_genes=%d/%d",
+            gene_dim, cell_batch_size, freeze_binary_decoder,
+            self._n_matched, len(self._gene_names),
+        )
+
+    def _build_gene_embeddings(self, protein_embeds, se_model):
+        """Pre-compute gene embeddings for all requested genes."""
+        embed_size = next(iter(protein_embeds.values())).shape[-1]  # 5120
+
+        raw_embeds = []
+        present = []
+        for g in self._gene_names:
+            if g in protein_embeds:
+                raw_embeds.append(protein_embeds[g])
+                present.append(True)
+            else:
+                raw_embeds.append(torch.zeros(embed_size))
+                present.append(False)
+
+        self._n_matched = sum(present)
+
+        if len(raw_embeds) > 0:
+            raw_tensor = torch.stack(raw_embeds)
+            with torch.no_grad():
+                gene_embeds = se_model.gene_embedding_layer(raw_tensor)  # [G, d_model]
+        else:
+            gene_embeds = torch.zeros(0, 2048)
+
+        # Register as buffer (non-trainable, moves with device)
+        self.register_buffer("_gene_embeds", gene_embeds)
+
+    def gene_dim(self):
+        return self._gene_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass: cell embeddings -> gene expression via pretrained binary decoder.
+
+        Args:
+            x: [B, latent_dim] or [B, S, latent_dim]
+        Returns:
+            [B, gene_dim] or [B, S, gene_dim]
+        """
+        orig_shape = x.shape
+        if x.dim() == 3:
+            B, S, D = x.shape
+            x = x.reshape(B * S, D)
+        elif x.dim() == 2:
+            pass
+        else:
+            raise ValueError(f"Expected 2D or 3D input, got {x.dim()}D")
+
+        n_cells = x.shape[0]
+
+        # Split cell embedding and dataset embedding
+        cell_embs = x[:, :self._cell_emb_dim]
+        ds_emb = x[:, self._cell_emb_dim:] if self._ds_emb_dim > 0 else None
+
+        gene_embeds = self._gene_embeds  # [G, d_model]
+
+        # Process in batches with no_grad (binary decoder is frozen, no backprop needed)
+        outputs = []
+        with torch.no_grad():
+            for i in range(0, n_cells, self._cell_batch_size):
+                end = min(i + self._cell_batch_size, n_cells)
+                cell_batch = cell_embs[i:end]  # [b, 2048]
+                bs = cell_batch.shape[0]
+                n_genes = gene_embeds.shape[0]
+
+                rda = self.read_depth.expand(bs)
+
+                ds_batch = ds_emb[i:end] if ds_emb is not None else None
+
+                # Build [b, G, d_model+output_dim+z_dim] pairwise features
+                A = gene_embeds.unsqueeze(0).expand(bs, -1, -1)  # [b, G, d_model]
+                B_cell = cell_batch.unsqueeze(1).expand(-1, n_genes, -1)  # [b, G, output_dim]
+
+                # RDA
+                rda_expanded = rda.unsqueeze(1).unsqueeze(2).expand(-1, n_genes, 1)  # [b, G, 1]
+                combined = torch.cat([A, B_cell, rda_expanded], dim=2)
+
+                # Dataset embedding
+                if ds_batch is not None:
+                    ds_expanded = ds_batch.unsqueeze(1).expand(-1, n_genes, -1)
+                    combined = torch.cat([combined, ds_expanded], dim=2)
+
+                # Run binary decoder in bf16
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=cell_batch.is_cuda):
+                    logits = self.binary_decoder(combined).squeeze(-1)  # [b, G]
+
+                outputs.append(logits)
+                del combined  # free memory immediately
+
+        result = torch.cat(outputs, dim=0)  # [n_cells, G]
+
+        # Apply ReLU for non-negative outputs
+        result = torch.relu(result)
+
+        # Match input dtype (important for bf16-mixed precision compatibility)
+        result = result.to(x.dtype)
+
+        # Reshape back if input was 3D
+        if len(orig_shape) == 3:
+            result = result.reshape(orig_shape[0], orig_shape[1], -1)
+
+        return result
+
+
 class PerturbationModel(ABC, LightningModule):
     """
     Base class for perturbation models that can operate on either raw counts or embeddings.
@@ -187,7 +403,20 @@ class PerturbationModel(ABC, LightningModule):
         if self.decoder_cfg is None:
             self.gene_decoder = None
             return
-        self.gene_decoder = LatentToGeneDecoder(**self.decoder_cfg)
+
+        cfg = dict(self.decoder_cfg)
+        use_pretrained = cfg.pop("pretrained_binary_decoder", False)
+        if use_pretrained:
+            pretrained_kwargs = cfg.pop("pretrained_kwargs", {})
+            self.gene_decoder = PretrainedBinaryDecoder(
+                latent_dim=cfg["latent_dim"],
+                gene_dim=cfg["gene_dim"],
+                gene_names=self.gene_names,
+                **pretrained_kwargs,
+            )
+        else:
+            cfg.pop("pretrained_kwargs", None)
+            self.gene_decoder = LatentToGeneDecoder(**cfg)
 
     def _main_loss_is_expression(self) -> bool:
         """
