@@ -150,10 +150,10 @@ def run_tx_train(cfg: DictConfig):
 
     var_dims = data_module.get_var_dims()  # {"gene_dim": …, "hvg_dim": …}
     if output_space == "gene":
-        gene_dim = var_dims.get("hvg_dim", 2000)  # fallback if key missing
+        gene_dim = int(var_dims.get("hvg_dim", 2000))  # fallback if key missing
     else:
-        gene_dim = var_dims.get("gene_dim", 2000)  # fallback if key missing
-    latent_dim = var_dims["output_dim"]  # same as model.output_dim
+        gene_dim = int(var_dims.get("gene_dim", 2000))  # fallback if key missing
+    latent_dim = int(var_dims["output_dim"])  # same as model.output_dim
     hidden_dims = cfg["model"]["kwargs"].get("decoder_hidden_dims", [1024, 1024, 512])
 
     if output_space in {"gene", "all"}:

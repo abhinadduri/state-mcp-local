@@ -37,10 +37,14 @@ dependencies = [
 
 [tool.uv.sources]
 cell-load = {path = "/home/aadduri/cell-load"}
+deseq2-pipeline = {path = "/home/aadduri/deseq2_pipeline", editable = true}
 
 [project.optional-dependencies]
 vectordb = [
     "lancedb>=0.24.0"
+]
+deseq2 = [
+    "deseq2-pipeline"
 ]
 
 [dependency-groups]

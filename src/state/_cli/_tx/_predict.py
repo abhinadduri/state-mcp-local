@@ -1529,11 +1529,10 @@ def run_tx_predict(args: ap.ArgumentParser):
 
                 control_pert = data_module.get_control_pert()
                 # Determine gene names for DESeq2 output
+                _deseq2_dim = pseudo_x_dim if use_count_outputs else output_dim
                 _deseq2_var = gene_var_names
-                if _deseq2_var is None:
-                    _deseq2_var = [f"gene_{i}" for i in range(
-                        pseudo_x_dim if use_count_outputs else output_dim
-                    )]
+                if _deseq2_var is None or len(_deseq2_var) != _deseq2_dim:
+                    _deseq2_var = [f"gene_{i}" for i in range(_deseq2_dim)]
 
                 # Group pb_groups entries by cell type
                 ct_groups: dict[str, dict[str, dict]] = {}
