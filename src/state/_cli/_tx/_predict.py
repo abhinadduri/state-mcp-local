@@ -835,7 +835,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     else:
         test_loader = data_module.test_dataloader()
 
-    if test_loader is None:
+    if test_loader is None or (isinstance(test_loader, list) and len(test_loader) == 0):
         logger.warning("No test dataloader found. Exiting.")
         sys.exit(0)
 
