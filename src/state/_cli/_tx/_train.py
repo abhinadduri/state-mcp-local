@@ -164,20 +164,6 @@ def run_tx_train(cfg: DictConfig):
             dropout=cfg["model"]["kwargs"].get("decoder_dropout", 0.1),
         )
 
-        # Support pretrained binary decoder
-        if cfg["model"]["kwargs"].get("pretrained_binary_decoder", False):
-            decoder_cfg["pretrained_binary_decoder"] = True
-            pretrained_kwargs = {}
-            for key in ("se_checkpoint", "se_config", "cell_batch_size", "freeze_binary_decoder", "read_depth"):
-                val = cfg["model"]["kwargs"].get(f"pretrained_{key}", None)
-                if val is not None:
-                    pretrained_kwargs[key] = val
-            if pretrained_kwargs:
-                decoder_cfg["pretrained_kwargs"] = pretrained_kwargs
-
-        # Support decoder initialization from a distilled checkpoint
-        init_decoder_from = cfg["model"]["kwargs"].get("init_decoder_from", None)
-
         # tuck it into the kwargs that will reach the LightningModule
         cfg["model"]["kwargs"]["decoder_cfg"] = decoder_cfg
     else:
@@ -209,17 +195,6 @@ def run_tx_train(cfg: DictConfig):
         cfg["training"],
         data_module.get_var_dims(),
     )
-
-    # Load distilled decoder weights if specified
-    if init_decoder_from and model.gene_decoder is not None:
-        try:
-            from ...tx.models.base import LatentToGeneDecoder
-            if isinstance(model.gene_decoder, LatentToGeneDecoder):
-                distilled = torch.load(init_decoder_from, map_location="cpu", weights_only=False)
-                model.gene_decoder.load_state_dict(distilled["state_dict"], strict=True)
-                logger.info("Loaded distilled decoder weights from %s", init_decoder_from)
-        except Exception as e:
-            logger.warning("Failed to load distilled decoder from %s: %s", init_decoder_from, e)
 
     logger.info(
         "Model created. Estimated params size: %.2f GB",
@@ -259,7 +234,7 @@ def run_tx_train(cfg: DictConfig):
 
     # Track gradient norm only for state transition model
     if cfg["model"]["name"] == "state":
-        callbacks.append(GradNormCallback())
+        callbacks.append(GradNormCallback(log_interval=int(cfg["training"].get("gradnorm_log_interval", 50))))
 
     # Add ModelFLOPSUtilizationCallback to track and log MFU. currently only works for state transition model
     if cfg["training"]["use_mfu"] and cfg["model"]["name"] == "state":

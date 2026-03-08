@@ -9,11 +9,79 @@ import torch.nn.functional as F
 from geomloss import SamplesLoss
 from typing import Dict, Optional, Tuple
 
+from ..optim import MuonWithAuxAdamW
 from .base import PerturbationModel
 from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
 
 
 logger = logging.getLogger(__name__)
+
+
+_MUON_EXCLUDED_MODULE_TYPES = (
+    nn.Embedding,
+    nn.LayerNorm,
+    nn.BatchNorm1d,
+    nn.BatchNorm2d,
+    nn.BatchNorm3d,
+    nn.GroupNorm,
+    nn.InstanceNorm1d,
+    nn.InstanceNorm2d,
+    nn.InstanceNorm3d,
+)
+
+
+def _extract_transformer_hidden(output: object) -> Optional[torch.Tensor]:
+    hidden = getattr(output, "last_hidden_state", output)
+    return hidden if torch.is_tensor(hidden) else None
+
+
+def _sample_residual_tokens(hidden_states: torch.Tensor, max_tokens: int) -> torch.Tensor:
+    flat = hidden_states.detach().reshape(-1, hidden_states.shape[-1])
+    sample_size = min(flat.shape[0], max(1, int(max_tokens)))
+    return flat[:sample_size]
+
+
+def _summarize_residual_sample(
+    input_sample: torch.Tensor,
+    output_sample: torch.Tensor,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    input32 = input_sample.float()
+    output32 = output_sample.float()
+    delta32 = output32 - input32
+    input_rms = input32.square().mean().sqrt()
+    output_rms = output32.square().mean().sqrt()
+    delta_rms = delta32.square().mean().sqrt()
+    denom = input_rms.clamp_min(eps)
+    return {
+        "train/residual_input_rms": input_rms,
+        "train/residual_output_rms": output_rms,
+        "train/residual_delta_rms": delta_rms,
+        "train/residual_output_gain": output_rms / denom,
+        "train/residual_delta_ratio": delta_rms / denom,
+    }
+
+
+def _split_muon_parameters(module: nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    excluded_prefixes: set[str] = set()
+    for module_name, child in module.named_modules():
+        if isinstance(child, _MUON_EXCLUDED_MODULE_TYPES):
+            prefix = f"{module_name}." if module_name else ""
+            excluded_prefixes.add(prefix)
+
+    muon_params: list[torch.nn.Parameter] = []
+    adamw_params: list[torch.nn.Parameter] = []
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim < 2 or name.endswith(".bias"):
+            adamw_params.append(param)
+            continue
+        if any(name.startswith(prefix) for prefix in excluded_prefixes):
+            adamw_params.append(param)
+            continue
+        muon_params.append(param)
+    return muon_params, adamw_params
 
 
 class StateTransitionPerturbationModel(PerturbationModel):
@@ -47,7 +115,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         basal_mapping_strategy: str = "random",
         predict_residual: bool = True,
         distributional_loss: str = "energy",
-        transformer_backbone_key: str = "GPT2",
+        transformer_backbone_key: str = "llama",
         transformer_backbone_kwargs: dict = None,
         output_space: str = "gene",
         gene_dim: Optional[int] = None,
@@ -59,7 +127,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             hidden_dim: not necessarily used, but required by PerturbationModel signature.
             output_dim: dimension of the output space (genes or latent).
             pert_dim: dimension of perturbation embedding.
-            gpt: e.g. "TranslationTransformerSamplesModel".
+            transformer_backbone_key: transformer family key; defaults to Llama.
             model_kwargs: dictionary passed to that model's constructor.
             loss: choice of distributional metric ("sinkhorn", "energy", etc.).
             **kwargs: anything else to pass up to PerturbationModel or not used.
@@ -296,11 +364,19 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 "model.kwargs.finetune_vci_decoder is no longer supported. "
                 "Ignoring it and using the standard latent-to-gene decoder path."
             )
+        self._residual_monitor_interval = max(int(kwargs.get("residual_monitor_interval", 50)), 0)
+        self._residual_monitor_max_tokens = max(int(kwargs.get("residual_monitor_max_tokens", 1024)), 1)
+        self._residual_pending_input: Optional[torch.Tensor] = None
+        self._residual_pending_step: Optional[int] = None
+        self._residual_last_captured_step: Optional[int] = None
+        self._residual_last_logged_step: Optional[int] = None
+        self._residual_metrics: Optional[dict[str, torch.Tensor]] = None
+        self._install_residual_monitor_hooks()
         logger.debug("%s", self)
 
     def _build_networks(self, lora_cfg=None):
         """
-        Here we instantiate the actual GPT2-based model.
+        Here we instantiate the configured transformer backbone.
         """
         self.pert_encoder = build_mlp(
             in_dim=self.pert_dim,
@@ -365,6 +441,96 @@ class StateTransitionPerturbationModel(PerturbationModel):
     def encode_basal_expression(self, expr: torch.Tensor) -> torch.Tensor:
         """Define how we embed basal state input, if needed."""
         return self.basal_encoder(expr)
+
+    def _should_capture_residual_metrics(self) -> tuple[bool, int]:
+        step = int(getattr(self, "global_step", 0))
+        if not self.training or self._residual_monitor_interval <= 0:
+            return False, step
+        if step % self._residual_monitor_interval != 0:
+            return False, step
+        if self._residual_last_captured_step == step:
+            return False, step
+        return True, step
+
+    def _clear_pending_residual_capture(self) -> None:
+        self._residual_pending_input = None
+        self._residual_pending_step = None
+
+    def _install_residual_monitor_hooks(self) -> None:
+        if self._residual_monitor_interval <= 0:
+            return
+        try:
+            self.transformer_backbone.register_forward_pre_hook(
+                self._capture_transformer_input_sample,
+                with_kwargs=True,
+            )
+            self.transformer_backbone.register_forward_hook(
+                self._capture_transformer_output_sample,
+                with_kwargs=True,
+            )
+        except TypeError:
+            self.transformer_backbone.register_forward_pre_hook(
+                lambda module, args: self._capture_transformer_input_sample(module, args, None)
+            )
+            self.transformer_backbone.register_forward_hook(
+                lambda module, args, output: self._capture_transformer_output_sample(module, args, None, output)
+            )
+
+    def _capture_transformer_input_sample(
+        self,
+        module: nn.Module,
+        args: tuple[object, ...],
+        kwargs: Optional[dict[str, object]] = None,
+    ) -> None:
+        should_capture, step = self._should_capture_residual_metrics()
+        if not should_capture:
+            return
+
+        inputs_embeds = None
+        if kwargs is not None:
+            inputs_embeds = kwargs.get("inputs_embeds")
+        if inputs_embeds is None and args:
+            inputs_embeds = args[0]
+        if not torch.is_tensor(inputs_embeds):
+            return
+
+        with torch.no_grad():
+            self._residual_pending_input = _sample_residual_tokens(inputs_embeds, self._residual_monitor_max_tokens)
+        self._residual_pending_step = step
+        self._residual_last_captured_step = step
+
+    def _capture_transformer_output_sample(
+        self,
+        module: nn.Module,
+        args: tuple[object, ...],
+        kwargs: Optional[dict[str, object]],
+        output: object,
+    ) -> None:
+        if self._residual_pending_input is None or self._residual_pending_step is None:
+            return
+
+        hidden = _extract_transformer_hidden(output)
+        if hidden is None:
+            self._clear_pending_residual_capture()
+            return
+
+        with torch.no_grad():
+            output_sample = _sample_residual_tokens(hidden, self._residual_monitor_max_tokens)
+            if output_sample.shape != self._residual_pending_input.shape:
+                self._clear_pending_residual_capture()
+                return
+            self._residual_metrics = _summarize_residual_sample(self._residual_pending_input, output_sample)
+        self._clear_pending_residual_capture()
+
+    def _log_residual_metrics_if_ready(self) -> None:
+        if not isinstance(self._residual_metrics, dict):
+            return
+        step = int(getattr(self, "global_step", 0))
+        if self._residual_last_logged_step == step:
+            return
+        for metric_name, metric_value in self._residual_metrics.items():
+            self.log(metric_name, metric_value, on_step=True, on_epoch=False)
+        self._residual_last_logged_step = step
 
     def _main_loss_is_expression(self) -> bool:
         if self.nb_loss:
@@ -722,6 +888,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             pred, nb_mean_flat, nb_dispersion_flat = self.forward(batch, padded=padded, return_nb_params=True)
         else:
             pred = self.forward(batch, padded=padded)
+        self._log_residual_metrics_if_ready()
 
         target = batch["pert_cell_emb"]
 
@@ -1017,8 +1184,43 @@ class StateTransitionPerturbationModel(PerturbationModel):
             optimizer = torch.optim.AdamW(self.parameters(), lr=base_lr, weight_decay=weight_decay)
         elif optimizer_name == "adam":
             optimizer = torch.optim.Adam(self.parameters(), lr=base_lr, weight_decay=weight_decay)
+        elif optimizer_name == "muon":
+            muon_params, adamw_params = _split_muon_parameters(self)
+            muon_param_count = sum(param.numel() for param in muon_params)
+            adamw_param_count = sum(param.numel() for param in adamw_params)
+            if not muon_params:
+                logger.warning(
+                    "optimizer=muon requested but no eligible matrix parameters were found; falling back to AdamW."
+                )
+                optimizer = torch.optim.AdamW(self.parameters(), lr=base_lr, weight_decay=weight_decay)
+            else:
+                optimizer = MuonWithAuxAdamW(
+                    muon_params,
+                    adamw_params,
+                    lr=base_lr,
+                    weight_decay=weight_decay,
+                    momentum=float(self.hparams.get("muon_momentum", 0.95)),
+                    nesterov=bool(self.hparams.get("muon_nesterov", True)),
+                    ns_steps=int(self.hparams.get("muon_ns_steps", 5)),
+                    muon_eps=float(self.hparams.get("muon_eps", 1e-7)),
+                    adamw_lr=(
+                        None
+                        if self.hparams.get("muon_adamw_lr", None) is None
+                        else float(self.hparams.get("muon_adamw_lr"))
+                    ),
+                    adamw_betas=(
+                        float(self.hparams.get("muon_adamw_beta1", 0.9)),
+                        float(self.hparams.get("muon_adamw_beta2", 0.95)),
+                    ),
+                    adamw_eps=float(self.hparams.get("muon_adamw_eps", 1e-8)),
+                )
+                logger.info(
+                    "Using MuonWithAuxAdamW with %d Muon params and %d AdamW params.",
+                    muon_param_count,
+                    adamw_param_count,
+                )
         else:
-            raise ValueError(f"Unsupported optimizer '{optimizer_name}'. Expected one of: adam, adamw.")
+            raise ValueError(f"Unsupported optimizer '{optimizer_name}'. Expected one of: adam, adamw, muon.")
 
         if not bool(self.hparams.get("use_cosine_decay", False)):
             return optimizer
@@ -1045,7 +1247,8 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         min_lr = max_lr * max_lr_fraction
         for param_group in optimizer.param_groups:
-            param_group["lr"] = max_lr
+            group_lr = float(param_group.get("lr", base_lr))
+            param_group["lr"] = group_lr * (max_lr / base_lr)
 
         def _lr_lambda(step: int) -> float:
             if step >= decay_steps:

@@ -4,9 +4,11 @@
 
 Can the pretrained binary decoder from the SE-600M (State Embedding) model improve perturbation response prediction in the STATE TX pipeline?
 
+**Answer: No.** The decoder is not the bottleneck. The SE-600M embeddings are essential (~53% pearson_delta boost), but the decoder initialization is irrelevant at convergence. Code changes have been reverted; this document preserves the experimental findings.
+
 ## Background
 
-The SE-600M model contains a **binary decoder** trained on 100M+ cells that maps cell embeddings to per-gene expression predictions. The TX model uses a simple MLP decoder (`LatentToGeneDecoder`) initialized randomly. The hypothesis is that leveraging the SE binary decoder's learned gene-cell relationships could improve prediction quality.
+The SE-600M model contains a **binary decoder** trained on 100M+ cells that maps cell embeddings to per-gene expression predictions. The TX model uses a simple MLP decoder (`LatentToGeneDecoder`) initialized randomly. The hypothesis was that leveraging the SE binary decoder's learned gene-cell relationships could improve prediction quality.
 
 ### Architecture Details
 
@@ -24,8 +26,6 @@ The SE-600M model contains a **binary decoder** trained on 100M+ cells that maps
 
 ## Phase 1: Representation Gap Analysis
 
-### Diagnostic Script Results (`scripts/diagnose_representation_gap.py`)
-
 Compared TX model outputs vs original SE embeddings on K562 test data:
 
 | Metric | Value |
@@ -35,41 +35,17 @@ Compared TX model outputs vs original SE embeddings on K562 test data:
 | Binary decoder correlation (per-cell) | r=0.78 |
 | L2 normalization effect | Negligible (TX outputs already near-unit) |
 
-**Conclusion**: TX outputs live in approximately the same space as SE embeddings. The binary decoder produces reasonable gene expression predictions (r=0.78 per-cell) from TX outputs. The representation gap is moderate (cosine sim 0.59) but not the primary obstacle.
-
-### Why the Previous Attempt Failed
-
-The previous `FinetuneVCICountsDecoder` had three competing paths:
-1. Binary decoder output
-2. Gene decoder projection
-3. Latent decoder MLP
-
-This architecture allowed the MLP to dominate, making the binary decoder path redundant. The fix is to use the binary decoder as the **sole** decoder path.
+**Conclusion**: TX outputs live in approximately the same space as SE embeddings. The representation gap is moderate (cosine sim 0.59) but not the primary obstacle.
 
 ## Phase 2: Integration Approaches
 
 ### Approach A: Direct Binary Decoder (PretrainedBinaryDecoder)
 
-Use the frozen SE binary decoder directly as the TX model's gene decoder:
-- Load binary decoder weights + gene protein embeddings from SE-600M
-- Pre-compute gene embeddings (matched 6369/6546 genes)
-- Process cells in mini-batches (batch_size=8) to manage memory
-- `torch.no_grad()` wrapper since decoder is frozen
-- Cast output to input dtype for bf16-mixed compatibility
-
-**Implementation**: `PretrainedBinaryDecoder` class in `state/tx/models/base.py`
+Use the frozen SE binary decoder directly as the TX model's gene decoder.
 
 ### Approach B: Knowledge Distillation
 
-Train the standard MLP decoder to mimic the SE binary decoder, then use those weights as initialization:
-1. Sample 50K cells from dataset
-2. Run SE binary decoder to get target gene expression
-3. Train `LatentToGeneDecoder` MLP (2058 -> [1024, 1024, 512] -> 6546) with MSE loss
-4. Save distilled weights, use as initialization for TX training
-
-**Distillation quality**: After 50 epochs on 50K cells, the MLP achieves **r=0.9498** correlation with the binary decoder's output (MSE loss=0.137). The 7M-param MLP captures 95% of the 145M-param binary decoder's behavior.
-
-**Implementation**: `scripts/distill_binary_decoder.py`
+Train the standard MLP decoder to mimic the SE binary decoder (r=0.9498 after 50 epochs on 50K cells), then use those weights as initialization for TX training.
 
 ### Approach C: Baseline (Random MLP Decoder)
 
@@ -77,100 +53,107 @@ Standard TX training with randomly initialized `LatentToGeneDecoder` for compari
 
 ## Phase 3: Experimental Results
 
-### Training Configuration
+### 10K-Step Results
 
-All runs: K562, `embed_key=X_state`, `output_space=all`, `model_preset=state`, `precision=bf16-mixed`, `pin_memory=true`, `use_consecutive_loading=true`, `max_steps=10000`, `val_freq=2000`, `batch_size=16`.
+All runs: K562, `embed_key=X_state`, `output_space=all`, `model_preset=state`, `precision=bf16-mixed`, `batch_size=16`.
 
-### Training Metrics
+| Approach | b/s | val/expr_loss | pearson_delta | Trainable Params |
+|----------|-----|--------------|--------------|-----------------|
+| A: Direct Binary Decoder | 0.05 | 48.0 | — (cancelled) | 41.2M + 157M frozen |
+| B: Distilled Init | ~24 | 3.75 | 0.289 | 53.8M |
+| C: Baseline (random) | ~24 | 3.07 | 0.241 | 53.8M |
 
-| Approach | Steps | Time | b/s | val/emb_loss | val/expr_loss | Trainable Params |
-|----------|-------|------|-----|-------------|--------------|-----------------|
-| A: Direct Binary Decoder | 99 (cancelled) | ~32 min | 0.05 | — | 48.0 | 41.2M + 157M frozen |
-| B: Distilled Init | 10,000 | ~14 min | ~24 | 0.050 | 3.75 | 53.8M |
-| C: Baseline (random MLP) | 10,000 | ~15 min | ~24 | 0.046 | 3.07 | 53.8M |
+### 50K-Step Results (Definitive)
 
-### Evaluation Results (best.ckpt, K562 test set)
+Extended training to determine if the distilled init advantage persists.
 
-| Approach | pearson_delta | mse_delta | discrimination_l2 | de_spearman | overlap_at_N | de_sig_recall |
-|----------|--------------|-----------|-------------------|-------------|-------------|--------------|
-| A: Direct Binary Decoder | — | — | — | — | — | — |
-| B: Distilled Init | **0.289** | 0.0044 | 0.740 | 1.0* | 0 | 0 |
-| C: Baseline (random) | 0.241 | 0.0043 | 0.668 | 0.695 | 0.112 | 0.178 |
-| Reference (prev work) | 0.348 | — | — | — | — | — |
+#### val/expression_loss convergence
 
-*No significant DE genes detected in predictions, making DE metrics unreliable.
+| Step | Distilled (B) | Baseline (C) |
+|------|--------------|-------------|
+| 5K   | 6.81         | 4.50        |
+| 10K  | 3.78         | 3.06        |
+| 20K  | 2.09         | 1.55        |
+| 30K  | 1.29         | 1.20        |
+| 40K  | **1.20**     | **1.18**    |
+| 50K  | 1.20         | 1.19        |
 
-### Key Findings
+**Baseline leads at every checkpoint.** Both converge to ~1.19-1.20, but baseline gets there ~10K steps earlier.
 
-#### Approach A: Direct Binary Decoder — IMPRACTICAL
+#### Evaluation Results (50K steps, best.ckpt)
 
-1. **460x slower** than MLP decoder: 0.05 b/s vs 24 b/s. Each training step processes 6546 genes × cells through a 3-layer MLP individually, creating massive intermediate tensors.
-2. **Expression loss ~30x higher** (48-51 vs 1.7) due to different output scales between binary decoder (raw logits) and expected gene expression.
-3. **Memory challenges**: Required `torch.no_grad()` wrapper to avoid OOM (intermediate tensor: batch × 6546 × 4107 × 2 bytes).
-4. **FLOPS callback timeout**: The Lightning FLOPS measurement alone took ~6 minutes due to the per-gene computation pattern.
-5. **bf16 dtype mismatch**: Required explicit dtype casting since `torch.no_grad()` exits the autocast context.
+| Approach | pearson_delta | mse_delta | discrimination_cosine |
+|----------|--------------|-----------|----------------------|
+| B: Distilled Init (50K) | 0.311 | 0.00340 | 0.746 |
+| C: Baseline (50K) | **0.315** | **0.00339** | 0.738 |
 
-**Verdict**: Direct integration of the SE binary decoder into the TX training loop is computationally infeasible. The per-gene architecture that makes the binary decoder powerful (gene-specific protein embeddings) is exactly what makes it 460x too slow for iterative training.
+**No benefit from distilled init at convergence.** The early advantage (0.289 vs 0.241 at 10K) is a convergence artifact that disappears with sufficient training.
 
-#### Approach B: Knowledge Distillation — PROMISING BUT INCOMPLETE
+## Phase 4: Embedding-Only Scaling Experiment
 
-1. **+20% pearson_delta** over random init at the same step count (0.289 vs 0.241), suggesting the distilled weights provide a better starting point for the decoder.
-2. **Faster convergence in embedding space**: val/embedding_loss comparable to baseline.
-3. **DE metrics broken**: 0 significant genes detected, likely because distilled decoder learns a different output distribution that doesn't produce realistic DE patterns. The decoder captures mean expression well (better pearson_delta) but not the variance structure needed for DE testing.
-4. **Higher val/expression_loss** (3.75 vs 3.07): The distilled initialization may create an optimization landscape that's harder to fine-tune jointly with the OT Energy loss.
+Tested whether the TX model's embedding prediction is the bottleneck by training at different scales with `output_space=embedding` (no decoder, OT Energy loss only).
 
-**Verdict**: Distilled initialization shows promise for improving pearson_delta (faster convergence), but hurts DE analysis. Needs investigation into why variance structure is lost.
+| Model | params | val/emb_loss (10K) | Notes |
+|-------|--------|-------------------|-------|
+| tiny (128d, 2L) | ~1M | **0.241** | Best performance |
+| default (384d, 8L) | ~41M | 0.265 | Overfits at 10K |
 
-#### Both approaches undertrained
+**Key finding**: Model capacity is NOT the bottleneck. A 1M-param model matches/beats a 41M-param model. There is a fundamental OT Energy loss floor at ~0.24 that more parameters cannot break through.
 
-Both B and C (0.289, 0.241) are below the reference baseline (0.348). This reference likely used more than 10K steps. The val/expression_loss was still decreasing at 10K steps for both runs, confirming they need more training.
+### Compute vs Data-Loading
 
-## Phase 4: Analysis & Recommendations
+- `output_space=all` (with decoder): **compute-bound** at ~14.5 b/s on H100
+- `output_space=embedding` (no decoder): **data-loading-bound**, GPU util 4-29%
 
-### Why the Binary Decoder Doesn't Help More
+## Phase 5: Embedding Effectiveness
 
-1. **Architecture mismatch**: The SE binary decoder processes genes independently with protein embeddings. This is powerful for learning gene-specific expression patterns from 100M cells but creates a computational bottleneck (O(genes × cells) vs O(cells)) that prevents practical use in training.
+To test whether SE-600M embeddings help or hurt, trained models **without any embeddings** (`embed_key=null`).
 
-2. **Distribution shift**: TX model outputs differ from SE training data. Even though cosine similarity is 0.59 and norms match, the fine-grained structure differs enough that binary decoder outputs have higher loss and different variance properties.
+| Run | embed_key | output_space | **pearson_delta** | discrim_cosine | mse_delta |
+|-----|-----------|-------------|-----------------|----------------|-----------|
+| Baseline (50K) | X_state | all | **0.315** | **0.738** | **0.0034** |
+| No-emb all (50K) | null | all | 0.206 | 0.499 | 0.0047 |
+| No-emb gene (50K) | null | gene | 0.199 | 0.544 | 0.0042 |
 
-3. **The decoder is not the bottleneck**: With pearson_delta=0.348 from a random MLP decoder, the limiting factor is the TX model's ability to predict correct cell embeddings (the OT Energy loss), not the decoder's ability to translate embeddings to genes. Improving the decoder helps marginally.
+**Embeddings provide a ~53% boost in pearson_delta** (0.315 vs 0.206). They are essential, not a bottleneck.
 
-4. **Distillation loses variance**: Knowledge distillation with MSE loss captures mean predictions but smooths out the variance structure needed for DE analysis. A better distillation objective (e.g., distributional matching) might help.
+Without embeddings, `output_space=gene` vs `all` produces nearly identical pearson_delta (0.199 vs 0.206), confirming the decoder adds little when the upstream representation is weak.
 
-### Recommendations
+## Conclusions
 
-1. **Don't use direct binary decoder** (Approach A): 460x slowdown makes it impractical.
+### Why the Pretrained Decoder Doesn't Help
 
-2. **Distilled init is worth exploring further** with:
-   - Longer training (>10K steps) to see if the initial advantage persists
-   - Modified distillation loss that preserves variance (e.g., add noise, use distributional loss)
-   - Two-stage training: distilled init for decoder, then freeze decoder and train TX model
+1. **End-to-end training overwrites initialization**: With `detach_decoder=false`, decoder gradients flow back into the TX model. The decoder weights are fully retrained, so any initialization advantage is temporary. Distilled and random init converge to the same performance at 50K steps.
 
-3. **Focus on the embedding model**: The biggest lever is improving the TX model's embedding prediction (the main OT Energy loss). The decoder is a secondary concern.
+2. **The MLP decoder is sufficient**: A 7M-param randomly-initialized MLP reaches the same final performance as one initialized from a 145M-param binary decoder.
 
-4. **Consider hybrid approaches**:
-   - Use binary decoder for evaluation/interpretation only (not training)
-   - Gene-specific features from protein embeddings as auxiliary input to MLP decoder
-   - Factored decoder: low-rank approximation of the binary decoder's gene-specific computation
+3. **The decoder is not the bottleneck**: The bottleneck is the TX model's ability to predict the correct perturbation response direction in embedding space (OT Energy loss floor ~0.24).
 
-## Code Changes
+### What Actually Matters
 
-### New files
-- `scripts/distill_binary_decoder.py` — Knowledge distillation script
-- `scripts/diagnose_representation_gap.py` — Diagnostic analysis
+1. **SE-600M embeddings are critical**: ~53% boost in pearson_delta. The embedding space captures cellular state information that raw gene expression alone cannot provide efficiently.
 
-### Modified files
-- `src/state/tx/models/base.py` — Added `PretrainedBinaryDecoder` class, modified `_build_decoder()`
-- `src/state/_cli/_tx/_train.py` — Added `pretrained_binary_decoder` and `init_decoder_from` config support
+2. **Model capacity doesn't help**: Tiny (1M params) matches default (41M params) in embedding-only mode. The K562 dataset (~134K cells) is insufficient for larger models.
 
-### Output artifacts
+3. **The OT Energy loss has a floor (~0.24)**: This is the real limit on performance. Future work should investigate:
+   - Alternative losses (per-cell contrastive, MMD)
+   - Better regularization (default model overfits at 10K steps)
+   - More training data (larger Perturb-seq datasets)
+   - Auxiliary losses that constrain individual cell predictions
+
+### Code Status
+
+All decoder-related code changes (`PretrainedBinaryDecoder`, `init_decoder_from`, distillation scripts) have been **reverted** from the codebase. This document and the training artifacts below are the only remaining outputs.
+
+## Output Artifacts
+
 - `/data/replogle_llm/distilled_decoder.pt` — Distilled decoder weights (28MB)
-- `/data/replogle_llm/tx_runs/k562_distilled_decoder_init/` — Approach B run
-- `/data/replogle_llm/tx_runs/k562_baseline_decoder/` — Approach C run
-- `/data/replogle_llm/tx_runs/k562_pretrained_decoder_direct/` — Approach A run (cancelled at step 99)
-
-## Appendix: Wandb Run Links
-
-- Approach A: https://wandb.ai/arcinstitute/vci1 (tag: pretrained_decoder, approach_a)
-- Approach B: https://wandb.ai/arcinstitute/vci1 (tag: distilled_decoder, approach_b)
-- Approach C: https://wandb.ai/arcinstitute/vci1 (tag: baseline, approach_c)
+- `/data/replogle_llm/tx_runs/k562_pretrained_decoder_direct/` — Approach A (cancelled at step 99)
+- `/data/replogle_llm/tx_runs/k562_distilled_decoder_init/` — Approach B (10K steps)
+- `/data/replogle_llm/tx_runs/k562_baseline_decoder/` — Approach C (10K steps)
+- `/data/replogle_llm/tx_runs/k562_distilled_50k/` — Approach B (50K steps, definitive)
+- `/data/replogle_llm/tx_runs/k562_baseline_50k/` — Approach C (50K steps, definitive)
+- `/data/replogle_llm/tx_runs/k562_emb_only_tiny/` — Embedding-only: tiny model
+- `/data/replogle_llm/tx_runs/k562_emb_only_default/` — Embedding-only: default model
+- `/data/replogle_llm/tx_runs/k562_no_emb_all_50k/` — No-embedding: output_space=all
+- `/data/replogle_llm/tx_runs/k562_no_emb_gene_50k/` — No-embedding: output_space=gene

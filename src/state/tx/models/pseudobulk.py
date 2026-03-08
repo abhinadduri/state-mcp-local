@@ -31,7 +31,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
         batch_dim: int = None,
         predict_residual: bool = True,
         distributional_loss: str = "energy",
-        transformer_backbone_key: str = "GPT2",
+        transformer_backbone_key: str = "llama",
         transformer_backbone_kwargs: dict = None,
         output_space: str = "gene",
         gene_dim: Optional[int] = None,
@@ -43,7 +43,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
             hidden_dim: not necessarily used, but required by PerturbationModel signature.
             output_dim: dimension of the output space (genes or latent).
             pert_dim: dimension of perturbation embedding.
-            gpt: e.g. "TranslationTransformerSamplesModel".
+            transformer_backbone_key: transformer family key; defaults to Llama.
             model_kwargs: dictionary passed to that model's constructor.
             loss: choice of distributional metric ("sinkhorn", "energy", etc.).
             **kwargs: anything else to pass up to PerturbationModel or not used.
@@ -181,7 +181,7 @@ class PseudobulkPerturbationModel(PerturbationModel):
 
     def _build_networks(self):
         """
-        Here we instantiate the actual GPT2-based model.
+        Here we instantiate the configured transformer backbone.
         """
         self.pert_encoder = build_mlp(
             in_dim=self.pert_dim,

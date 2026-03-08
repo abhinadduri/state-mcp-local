@@ -3,6 +3,17 @@ weight_decay: 0.0005
 batch_size: 16
 lr: 1e-4
 optimizer: adam
+gradnorm_log_interval: 50
+residual_monitor_interval: 50
+residual_monitor_max_tokens: 1024
+muon_momentum: 0.95
+muon_nesterov: true
+muon_ns_steps: 5
+muon_eps: 1e-7
+muon_adamw_lr: null
+muon_adamw_beta1: 0.9
+muon_adamw_beta2: 0.95
+muon_adamw_eps: 1e-8
 use_cosine_decay: false
 max_lr: null
 lr_decay_steps: null

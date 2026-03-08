@@ -31,8 +31,8 @@ class GradNormCallback(Callback):
 
 
 def gradient_norm(model):
-    grads = [p.grad.detach().flatten() for p in model.parameters() if p.grad is not None]
+    grads = [torch.linalg.vector_norm(p.grad.detach().float()) for p in model.parameters() if p.grad is not None]
     if not grads:
         return 0.0
-    total_norm = torch.cat(grads).norm(2)
+    total_norm = torch.linalg.vector_norm(torch.stack(grads), ord=2)
     return total_norm.item()
