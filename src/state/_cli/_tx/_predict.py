@@ -1246,7 +1246,16 @@ def run_tx_predict(args: ap.ArgumentParser):
         all_pert_barcodes = []
         all_ctrl_barcodes = []
 
-        with torch.no_grad():
+        # Match training precision for inference autocast (prevents CUBLAS errors with bf16-trained models)
+        training_precision = cfg.get("training", {}).get("precision", "32-true")
+        if "bf16" in training_precision:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+        elif "16" in training_precision:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.float16)
+        else:
+            autocast_ctx = contextlib.nullcontext()
+
+        with torch.no_grad(), autocast_ctx:
             for batch_idx, batch in enumerate(
                 tqdm(test_loader, desc="Predicting", unit="batch", file=sys.stderr)
             ):

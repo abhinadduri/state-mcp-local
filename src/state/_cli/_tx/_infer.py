@@ -551,6 +551,7 @@ def run_tx_infer(args: argparse.Namespace):
             model = StateTransitionPerturbationModel.load_from_checkpoint(
                 checkpoint_path,
                 map_location=preferred_device,
+                weights_only=False,
             )
             model = model.to(preferred_device)
         except Exception as e:
@@ -559,12 +560,14 @@ def run_tx_infer(args: argparse.Namespace):
             model = StateTransitionPerturbationModel.load_from_checkpoint(
                 checkpoint_path,
                 map_location=preferred_device,
+                weights_only=False,
             )
             model = model.to(preferred_device)
     else:
         model = StateTransitionPerturbationModel.load_from_checkpoint(
             checkpoint_path,
             map_location=preferred_device,
+            weights_only=False,
         )
         model = model.to(preferred_device)
 
@@ -1040,7 +1043,19 @@ def run_tx_infer(args: argparse.Namespace):
     )
 
     model_device = next(model.parameters()).device
-    with torch.no_grad():
+
+    # Match training precision for inference autocast (prevents CUBLAS errors with bf16-trained models)
+    import contextlib
+
+    training_precision = cfg.get("training", {}).get("precision", "32-true")
+    if "bf16" in training_precision:
+        autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+    elif "16" in training_precision:
+        autocast_ctx = torch.autocast("cuda", dtype=torch.float16)
+    else:
+        autocast_ctx = contextlib.nullcontext()
+
+    with torch.no_grad(), autocast_ctx:
         for group_index, g in enumerate(unique_groups, start=1):
             ensure_not_cancelled()
             grp_idx = np.where(group_labels == g)[0]
