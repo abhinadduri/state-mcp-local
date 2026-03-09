@@ -382,6 +382,7 @@ def run_tx_predict(args: ap.ArgumentParser):
     import sys
 
     import anndata
+    import contextlib
     import lightning.pytorch as pl
     import numpy as np
     import pandas as pd
@@ -464,7 +465,7 @@ def run_tx_predict(args: ap.ArgumentParser):
         if isinstance(values, tuple):
             return list(values)
         if isinstance(values, torch.Tensor):
-            values = values.detach().cpu().numpy()
+            values = values.detach().cpu().float().numpy()
         if isinstance(values, np.ndarray):
             if values.ndim == 0:
                 return [values.item()] * batch_size
@@ -907,7 +908,16 @@ def run_tx_predict(args: ap.ArgumentParser):
         context_mode = None
         total_cells_seen = 0
 
-        with torch.no_grad():
+        # Match training precision for inference autocast (prevents CUBLAS errors with bf16-trained models)
+        training_precision = cfg.get("training", {}).get("precision", "32-true")
+        if "bf16" in training_precision:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+        elif "16" in training_precision:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.float16)
+        else:
+            autocast_ctx = contextlib.nullcontext()
+
+        with torch.no_grad(), autocast_ctx:
             for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch", file=sys.stderr)):
                 batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
                 batch_preds = model.predict_step(batch, batch_idx, padded=False)
@@ -915,7 +925,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 if nb_loss_enabled and batch_preds.get("pert_cell_counts_dispersion") is not None:
                     nb_dispersion_samples.append(
                         collect_sample_values(
-                            batch_preds["pert_cell_counts_dispersion"].detach().cpu().numpy(),
+                            batch_preds["pert_cell_counts_dispersion"].detach().cpu().float().numpy(),
                             cap=100000,
                             take=4096,
                         )
@@ -924,7 +934,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                     batch_nb_mean = batch_preds.get("pert_cell_counts_mean", batch_preds["pert_cell_counts_preds"])
                     nb_mean_samples.append(
                         collect_sample_values(
-                            batch_nb_mean.detach().cpu().numpy(),
+                            batch_nb_mean.detach().cpu().float().numpy(),
                             cap=100000,
                             take=4096,
                         )
@@ -962,8 +972,8 @@ def run_tx_predict(args: ap.ArgumentParser):
                         f"Inconsistent context source during prediction: saw '{detected_mode}' after '{context_mode}'."
                     )
 
-                batch_pred_np = batch_preds["preds"].cpu().numpy().astype(np.float32)
-                batch_real_np = batch_preds["pert_cell_emb"].cpu().numpy().astype(np.float32)
+                batch_pred_np = batch_preds["preds"].cpu().float().numpy()
+                batch_real_np = batch_preds["pert_cell_emb"].cpu().float().numpy()
 
                 if aggregate_main_in_count_space:
                     batch_pred_pb_np = np.expm1(batch_pred_np.astype(np.float64, copy=False))
@@ -979,8 +989,8 @@ def run_tx_predict(args: ap.ArgumentParser):
                 batch_real_gene_pb_np = None
                 batch_gene_pred_pb_np = None
                 if use_count_outputs:
-                    batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().numpy().astype(np.float32)
-                    batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().numpy().astype(np.float32)
+                    batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().float().numpy()
+                    batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().float().numpy()
                     if aggregate_gene_in_count_space:
                         # Real values are log1p-scaled when exp_counts=False; convert to count space.
                         batch_real_gene_pb_np = np.expm1(batch_real_gene_np.astype(np.float64, copy=False))
@@ -1249,7 +1259,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                 if nb_loss_enabled and batch_preds.get("pert_cell_counts_dispersion") is not None:
                     nb_dispersion_samples.append(
                         collect_sample_values(
-                            batch_preds["pert_cell_counts_dispersion"].detach().cpu().numpy(),
+                            batch_preds["pert_cell_counts_dispersion"].detach().cpu().float().numpy(),
                             cap=100000,
                             take=4096,
                         )
@@ -1258,7 +1268,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                     batch_nb_mean = batch_preds.get("pert_cell_counts_mean", batch_preds["pert_cell_counts_preds"])
                     nb_mean_samples.append(
                         collect_sample_values(
-                            batch_nb_mean.detach().cpu().numpy(),
+                            batch_nb_mean.detach().cpu().float().numpy(),
                             cap=100000,
                             take=4096,
                         )
@@ -1298,20 +1308,20 @@ def run_tx_predict(args: ap.ArgumentParser):
                 )
                 all_gem_groups.extend(batch_labels)
 
-                batch_pred_np = batch_preds["preds"].cpu().numpy().astype(np.float32)
-                batch_real_np = batch_preds["pert_cell_emb"].cpu().numpy().astype(np.float32)
+                batch_pred_np = batch_preds["preds"].cpu().float().numpy()
+                batch_real_np = batch_preds["pert_cell_emb"].cpu().float().numpy()
                 final_preds[current_idx : current_idx + batch_size, :] = batch_pred_np
                 final_reals[current_idx : current_idx + batch_size, :] = batch_real_np
                 current_idx += batch_size
 
                 # Handle X_hvg for HVG space ground truth
                 if final_X_hvg is not None:
-                    batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().numpy().astype(np.float32)
+                    batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().float().numpy()
                     final_X_hvg[current_idx - batch_size : current_idx, :] = batch_real_gene_np
 
                 # Handle decoded gene predictions if available
                 if final_pert_cell_counts_preds is not None:
-                    batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().numpy().astype(np.float32)
+                    batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().float().numpy()
                     final_pert_cell_counts_preds[current_idx - batch_size : current_idx, :] = batch_gene_pred_np
                     if final_pert_cell_log1p_eval_preds is not None:
                         batch_dispersion = batch_preds.get("pert_cell_counts_dispersion")
@@ -1331,7 +1341,7 @@ def run_tx_predict(args: ap.ArgumentParser):
                         )
                         final_pert_cell_log1p_eval_preds[
                             current_idx - batch_size : current_idx, :
-                        ] = batch_log1p_eval.detach().cpu().numpy().astype(np.float32)
+                        ] = batch_log1p_eval.detach().cpu().float().numpy()
 
         logger.info("Creating anndatas from predictions from manual loop...")
 
