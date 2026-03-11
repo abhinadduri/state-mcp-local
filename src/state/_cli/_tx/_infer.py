@@ -96,31 +96,10 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         help="If set, add virtual copies of control cells for every perturbation in the saved one-hot map so all perturbations are simulated.",
     )
     parser.add_argument(
-        "--virtual-cells-per-pert",
+        "--cells-per-pert",
         type=int,
         default=None,
-        help="When using --all-perts, limit the number of control cells cloned for each virtual perturbation to this many (default: use all available controls).",
-    )
-    parser.add_argument(
-        "--min-cells",
-        type=int,
-        default=None,
-        help="Ensure each perturbation has at least this many cells by padding with virtual controls (if needed).",
-    )
-    parser.add_argument(
-        "--max-cells",
-        type=int,
-        default=None,
-        help="Upper bound on cells per perturbation after padding; subsamples excess cells if necessary.",
-    )
-    parser.add_argument(
-        "--batched",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Use batched padded inference (default: enabled). "
-            "Legacy unbatched mode is deprecated and no longer supported."
-        ),
+        help="Number of cells per perturbation. With --all-perts, limits control cells cloned for each virtual perturbation. With --tsv, this value is ignored.",
     )
     parser.add_argument(
         "--set-batch-size",
@@ -129,6 +108,16 @@ def add_arguments_infer(parser: argparse.ArgumentParser):
         help=(
             "Number of fixed-length cell sets to process per forward pass. Defaults to training.batch_size from config."
         ),
+    )
+    parser.add_argument(
+        "--pseudobulk",
+        action="store_true",
+        help="Aggregate predictions into pseudobulk by (cell_type, perturbation) instead of writing cell-level output.",
+    )
+    parser.add_argument(
+        "--deseq2",
+        action="store_true",
+        help="Run DESeq2 on pseudobulk predictions (implies --pseudobulk). Compares each perturbation against control.",
     )
 
 
@@ -173,6 +162,10 @@ def run_tx_infer(args: argparse.Namespace):
             raise InferenceCancelledError("Inference cancelled by request.")
 
     emit_event("phase", phase="initializing", message="Initializing tx inference.")
+
+    # --deseq2 implies --pseudobulk
+    if getattr(args, "deseq2", False) and not getattr(args, "pseudobulk", False):
+        args.pseudobulk = True
 
     def info(msg: str, *fmt: Any) -> None:
         if args.quiet:
@@ -473,10 +466,11 @@ def run_tx_infer(args: argparse.Namespace):
             control_pert = cfg["data"]["kwargs"]["control_pert"]
         except Exception:
             control_pert = None
-    if control_pert is None and args.pert_col == "drugname_drugconc":
-        control_pert = "[('DMSO_TF', 0.0, 'uM')]"
     if control_pert is None:
-        control_pert = "non-targeting"
+        raise ValueError(
+            "Could not determine control perturbation. Provide --control-pert explicitly, "
+            "or ensure data.kwargs.control_pert is set in the training config."
+        )
     if not args.quiet:
         info("Control perturbation: %s", control_pert)
     control_pert_str = str(control_pert)
@@ -576,8 +570,6 @@ def run_tx_infer(args: argparse.Namespace):
     cell_set_len = args.max_set_len if args.max_set_len is not None else getattr(model, "cell_sentence_len", 256)
     if cell_set_len <= 0:
         raise ValueError(f"Resolved cell_set_len must be a positive integer, got {cell_set_len}")
-    if not args.batched:
-        warnings.warn("--no-batched is deprecated. tx infer now always uses batched padded inference (padded=True).")
     set_batch_size = args.set_batch_size
     if set_batch_size is None:
         set_batch_size = int(cfg.get("training", {}).get("batch_size", 1))
@@ -587,6 +579,10 @@ def run_tx_infer(args: argparse.Namespace):
     _OUTPUT_SPACE_ALIASES = {"hvg": "gene", "transcriptome": "all"}
     output_space = getattr(model, "output_space", cfg.get("data", {}).get("kwargs", {}).get("output_space", "gene"))
     output_space = _OUTPUT_SPACE_ALIASES.get(output_space.strip().lower(), output_space)
+    if output_space not in {"embedding", "gene", "all"}:
+        raise ValueError(
+            f"Invalid output_space '{output_space}'. Must be one of: 'embedding', 'gene', 'all'."
+        )
     nb_loss_enabled = bool(getattr(model, "nb_loss", cfg.get("model", {}).get("kwargs", {}).get("nb_loss", False)))
     if nb_loss_enabled and output_space == "embedding":
         raise ValueError(
@@ -629,6 +625,9 @@ def run_tx_infer(args: argparse.Namespace):
         n_vars=int(adata.n_vars),
     )
 
+    if args.tsv and args.all_perts:
+        raise ValueError("--tsv and --all-perts are mutually exclusive. Use one or the other.")
+
     # optional TSV padding mode - pad with additional perturbation cells
     if args.tsv:
         if not args.quiet:
@@ -668,11 +667,9 @@ def run_tx_infer(args: argparse.Namespace):
         if not args.quiet:
             info("Filtered to %d cells (from %d) for cell types: %s", adata.n_obs, n0, keep_cts)
 
-    needs_virtual_padding = args.all_perts or (args.min_cells is not None) or (args.max_cells is not None)
-    if needs_virtual_padding:
+    if args.all_perts:
         if args.pert_col not in adata.obs:
             raise KeyError(f"Perturbation column '{args.pert_col}' not found in adata.obs")
-
         adata.obs = adata.obs.copy()
         adata.obs[args.pert_col] = adata.obs[args.pert_col].astype(str)
 
@@ -692,13 +689,13 @@ def run_tx_infer(args: argparse.Namespace):
             ctrl_template.obs = ctrl_template.obs.copy()
             ctrl_template.obs[args.pert_col] = ctrl_template.obs[args.pert_col].astype(str)
 
-            if args.virtual_cells_per_pert is not None:
-                if args.virtual_cells_per_pert <= 0:
-                    raise ValueError("--virtual-cells-per-pert must be a positive integer if provided.")
-                if ctrl_template.n_obs > args.virtual_cells_per_pert:
+            if args.cells_per_pert is not None:
+                if args.cells_per_pert <= 0:
+                    raise ValueError("--cells-per-pert must be a positive integer if provided.")
+                if ctrl_template.n_obs > args.cells_per_pert:
                     virtual_rng = np.random.RandomState(args.seed)
                     sampled_idx = virtual_rng.choice(
-                        ctrl_template.n_obs, size=args.virtual_cells_per_pert, replace=False
+                        ctrl_template.n_obs, size=args.cells_per_pert, replace=False
                     )
                     ctrl_template = ctrl_template[sampled_idx].copy()
                     ctrl_template.obs = ctrl_template.obs.copy()
@@ -708,7 +705,7 @@ def run_tx_infer(args: argparse.Namespace):
                             "--all-perts: limiting virtual control template to %d cells per perturbation "
                             "(requested %d).",
                             ctrl_template.n_obs,
-                            args.virtual_cells_per_pert,
+                            args.cells_per_pert,
                         )
 
             virtual_blocks: List["sc.AnnData"] = []
@@ -733,87 +730,6 @@ def run_tx_infer(args: argparse.Namespace):
                 )
         elif not args.quiet:
             info("--all-perts requested, but all perturbations already present in AnnData.")
-
-    # ensure each perturbation meets the minimum count by cloning controls
-    if args.min_cells is not None:
-        if args.min_cells <= 0:
-            raise ValueError("--min-cells must be a positive integer if provided.")
-
-        ctrl_mask_min_cells = adata.obs[args.pert_col] == control_pert_str
-        if not bool(np.any(ctrl_mask_min_cells)):
-            raise ValueError("--min-cells requested, but no control cells are available for cloning.")
-
-        pad_rng = np.random.RandomState(args.seed)
-        ctrl_pool = adata[ctrl_mask_min_cells].copy()
-        ctrl_pool.obs = ctrl_pool.obs.copy()
-        virtual_blocks: List["sc.AnnData"] = []
-
-        pert_counts = adata.obs[args.pert_col].value_counts()
-        for pert_name, count in pert_counts.items():
-            deficit = int(args.min_cells) - int(count)
-            if deficit <= 0:
-                continue
-
-            sampled_idx = pad_rng.choice(ctrl_pool.n_obs, size=deficit, replace=True)
-            clone = ctrl_pool[sampled_idx].copy()
-            clone.obs = clone.obs.copy()
-            clone.obs[args.pert_col] = pert_name
-            base_names = list(clone.obs_names)
-            clone.obs_names = [f"{obs_name}__virt_{pert_name}__pad{idx + 1}" for idx, obs_name in enumerate(base_names)]
-            virtual_blocks.append(clone)
-
-        if virtual_blocks:
-            adata = sc.concat([adata, *virtual_blocks], axis=0, join="inner")
-            if not args.quiet:
-                preview = ", ".join(
-                    [f"{pert}:{args.min_cells}" for pert, cnt in pert_counts.items() if int(cnt) < int(args.min_cells)][
-                        :5
-                    ]
-                )
-                if len(virtual_blocks) > 5:
-                    preview += ", ..."
-                total_added = sum(vb.n_obs for vb in virtual_blocks)
-                info(
-                    "Added %d padding cells to meet --min-cells (examples: %s). Total cells: %d.",
-                    total_added,
-                    preview if preview else "n/a",
-                    adata.n_obs,
-                )
-        elif not args.quiet:
-            info("--min-cells set, but all perturbations already meet the threshold.")
-
-    # cap the number of cells per perturbation by subsampling
-    if args.max_cells is not None:
-        if args.max_cells <= 0:
-            raise ValueError("--max-cells must be a positive integer if provided.")
-        if args.min_cells is not None and args.max_cells < args.min_cells:
-            raise ValueError("--max-cells cannot be smaller than --min-cells.")
-
-        trim_rng = np.random.RandomState(args.seed + 1)
-        keep_mask = np.ones(adata.n_obs, dtype=bool)
-        pert_labels = adata.obs[args.pert_col].values
-
-        unique_perts = np.unique(pert_labels)
-        for pert_name in unique_perts:
-            idxs = np.where(pert_labels == pert_name)[0]
-            if len(idxs) <= args.max_cells:
-                continue
-
-            chosen = trim_rng.choice(idxs, size=args.max_cells, replace=False)
-            chosen = np.sort(chosen)
-            drop = np.setdiff1d(idxs, chosen, assume_unique=True)
-            keep_mask[drop] = False
-
-        if not np.all(keep_mask):
-            original_n = adata.n_obs
-            adata = adata[keep_mask].copy()
-            if not args.quiet:
-                total_dropped = original_n - adata.n_obs
-                info(
-                    "Subsampled perturbations exceeding --max-cells; dropped %d cells. Total cells: %d.",
-                    total_dropped,
-                    adata.n_obs,
-                )
 
     # select features: embeddings or genes
     if args.embed_key is None:
@@ -848,13 +764,12 @@ def run_tx_infer(args: argparse.Namespace):
         if batch_col is not None and batch_col in adata.obs:
             raw_labels = adata.obs[batch_col].astype(str).values
             if batch_onehot_map is None:
-                warnings.warn(
+                raise FileNotFoundError(
                     "Model has a batch encoder, but no batch one-hot map was found at any of: "
                     + ", ".join(batch_onehot_map_candidates)
                     + ". "
-                    "Batch info will be ignored; predictions may degrade."
+                    "Cannot proceed without batch encoding."
                 )
-                uses_batch_encoder = False
             else:
                 # Convert labels to indices using saved map
                 label_to_idx: Dict[str, int] = {}
@@ -997,36 +912,20 @@ def run_tx_infer(args: argparse.Namespace):
     def write_pred_rows(row_indices: np.ndarray, pred_rows: np.ndarray):
         nonlocal out_target
         if writes_to[0] == ".X":
-            if pred_rows.shape[1] == sim_X.shape[1]:
-                sim_X[row_indices, :] = pred_rows
-            else:
-                if not args.quiet:
-                    warn(
-                        "Dimension mismatch for X (got %d vs %d). Falling back to adata.obsm['X_state_pred'].",
-                        pred_rows.shape[1],
-                        sim_X.shape[1],
-                    )
-                if "X_state_pred" not in adata.obsm:
-                    adata.obsm["X_state_pred"] = np.zeros((n_total, pred_rows.shape[1]), dtype=np.float32)
-                adata.obsm["X_state_pred"][row_indices, :] = pred_rows
-                out_target = "obsm['X_state_pred']"
+            if pred_rows.shape[1] != sim_X.shape[1]:
+                raise ValueError(
+                    f"Prediction dimension mismatch for X: model produced {pred_rows.shape[1]} "
+                    f"but input has {sim_X.shape[1]} features. Check model output_space and input data."
+                )
+            sim_X[row_indices, :] = pred_rows
         else:
-            if pred_rows.shape[1] == sim_obsm.shape[1]:
-                sim_obsm[row_indices, :] = pred_rows
-            else:
-                side_key = f"{writes_to[1]}_pred"
-                if not args.quiet:
-                    warn(
-                        "Dimension mismatch for obsm[%r] (got %d vs %d). Writing to adata.obsm[%r] instead.",
-                        writes_to[1],
-                        pred_rows.shape[1],
-                        sim_obsm.shape[1],
-                        side_key,
-                    )
-                if side_key not in adata.obsm:
-                    adata.obsm[side_key] = np.zeros((n_total, pred_rows.shape[1]), dtype=np.float32)
-                adata.obsm[side_key][row_indices, :] = pred_rows
-                out_target = f"obsm['{side_key}']"
+            if pred_rows.shape[1] != sim_obsm.shape[1]:
+                raise ValueError(
+                    f"Prediction dimension mismatch for obsm['{writes_to[1]}']: model produced "
+                    f"{pred_rows.shape[1]} but input has {sim_obsm.shape[1]} features. "
+                    f"Check model output_space and input data."
+                )
+            sim_obsm[row_indices, :] = pred_rows
 
     if not args.quiet:
         info(
@@ -1043,6 +942,36 @@ def run_tx_infer(args: argparse.Namespace):
     )
 
     model_device = next(model.parameters()).device
+
+    # --- Pseudobulk accumulator setup ---
+    accumulator = None
+    if getattr(args, "pseudobulk", False):
+        from ._pseudobulk import PseudobulkAccumulator, resolve_scale_flags, build_pseudobulk_anndata
+
+        # Determine if outputs are log1p-scaled from training config
+        is_log1p = cfg.get("data", {}).get("kwargs", {}).get("is_log1p", True)
+        agg_main, agg_gene = resolve_scale_flags(
+            metrics_is_log1p=is_log1p,
+            use_count_outputs=False,  # infer path doesn't use count outputs
+            resolved_exp_counts=False,
+            output_space=output_space,
+        )
+        accumulator = PseudobulkAccumulator(
+            output_dim=X_in.shape[1],
+            gene_dim=None,
+            use_count_outputs=False,
+            aggregate_main_in_count_space=agg_main,
+            aggregate_gene_in_count_space=agg_gene,
+            has_real=False,
+            enable_deseq2=getattr(args, "deseq2", False),
+            nb_loss_enabled=nb_loss_enabled,
+        )
+        if not args.quiet:
+            info("Pseudobulk mode enabled; aggregating by (cell_type, perturbation).")
+            if agg_main:
+                info("Pseudobulk scale: detected log1p outputs; accumulating in count space via expm1.")
+            if getattr(args, "deseq2", False):
+                info("DESeq2 mode enabled; will compute DE on predictions vs control.")
 
     # Match training precision for inference autocast (prevents CUBLAS errors with bf16-trained models)
     import contextlib
@@ -1108,8 +1037,7 @@ def run_tx_infer(args: argparse.Namespace):
                 vec = pert_onehot_map.get(map_key, None)
                 if vec is None:
                     vec = default_pert_vec
-                    if not args.quiet:
-                        warn("Group %r perturbation %r not in mapping; using control fallback one-hot.", g, p)
+                    logger.warning("Group %r perturbation %r not in mapping; using control fallback one-hot.", g, p)
 
                 sentence_specs = []
                 start = 0
@@ -1204,7 +1132,22 @@ def run_tx_infer(args: argparse.Namespace):
                             real_rows_local = spec["real_rows"]
 
                             pred_rows = preds[set_i, :real_n_local, :]
-                            write_pred_rows(real_rows_local, pred_rows)
+                            if accumulator is not None:
+                                # Get context/metadata for these cells
+                                cell_cts = group_labels[real_rows_local] if group_labels is not None else ["__ALL__"] * real_n_local
+                                cell_perts = [p] * real_n_local
+                                cell_contexts = [str(ct) for ct in cell_cts]
+                                cell_batches = ["__NA__"] * real_n_local
+                                accumulator.accumulate_batch(
+                                    batch_size=real_n_local,
+                                    context_labels=cell_contexts,
+                                    pert_names=cell_perts,
+                                    celltypes=[str(ct) for ct in cell_cts],
+                                    batch_labels=cell_batches,
+                                    pred_np=pred_rows,
+                                )
+                            else:
+                                write_pred_rows(real_rows_local, pred_rows)
                             cells_done += real_n_local
 
                             if counts_preds is not None and sim_counts is not None:
@@ -1270,6 +1213,115 @@ def run_tx_infer(args: argparse.Namespace):
 
             if counts_written and sim_counts is not None:
                 clip_array(sim_counts)
+
+    # -----------------------
+    # 4b) Pseudobulk finalization
+    # -----------------------
+    if accumulator is not None:
+        group_entries, total_cells = accumulator.finalize()
+        if len(group_entries) == 0:
+            raise RuntimeError("No pseudobulk groups were generated. Check that input data has perturbation labels.")
+
+        if not args.quiet:
+            info("Built %d pseudobulk groups from %d cells.", len(group_entries), total_cells)
+
+        celltype_col = args.celltype_col or "cell_type"
+        result = build_pseudobulk_anndata(
+            group_entries,
+            output_dim=X_in.shape[1],
+            gene_dim=None,
+            use_count_outputs=False,
+            aggregate_main_in_count_space=agg_main,
+            aggregate_gene_in_count_space=agg_gene,
+            has_real=False,
+            pert_col=args.pert_col,
+            cell_type_key=celltype_col,
+            batch_obs_key="batch",
+            embed_key=args.embed_key,
+        )
+
+        output_path = args.output or args.adata.replace(".h5ad", "_simulated.h5ad")
+        result["adata_pred"].write_h5ad(output_path)
+
+        if not args.quiet:
+            info("Wrote pseudobulk predictions (%d groups) to %s", len(group_entries), output_path)
+
+        # --- DESeq2 on predictions ---
+        if getattr(args, "deseq2", False):
+            try:
+                from deseq2_pipeline import run_from_precomputed
+            except ImportError:
+                logger.warning(
+                    "deseq2-pipeline not installed. Skipping DESeq2. "
+                    "Install with: pip install deseq2-pipeline"
+                )
+                run_from_precomputed = None
+
+            if run_from_precomputed is not None:
+                import os
+
+                output_dir = os.path.dirname(output_path) or "."
+                # Group entries by cell type
+                ct_groups: dict[str, dict[str, dict]] = {}
+                ct_ctrl: dict[str, dict] = {}
+                for entry in group_entries:
+                    ct = entry["celltype_name"]
+                    pname = entry["pert_name"]
+                    if ct not in ct_groups:
+                        ct_groups[ct] = {}
+                        ct_ctrl[ct] = None
+                    if pname == control_pert_str:
+                        ct_ctrl[ct] = entry
+                    else:
+                        ct_groups[ct][pname] = entry
+
+                for ct in sorted(ct_groups.keys()):
+                    ctrl_entry = ct_ctrl.get(ct)
+                    if ctrl_entry is None:
+                        logger.warning("Cell type '%s': no control entry found, skipping DESeq2.", ct)
+                        continue
+                    pert_entries = ct_groups[ct]
+                    if not pert_entries:
+                        continue
+
+                    ct_safe = ct.replace("/", "-")
+                    pred_pert_counts = {
+                        p: np.stack(e["pred_rep_sums"]).astype(np.int64)
+                        for p, e in pert_entries.items()
+                    }
+                    pred_ctrl = np.stack(ctrl_entry["pred_rep_sums"]).astype(np.int64)
+
+                    # Determine gene names
+                    _deseq2_dim = X_in.shape[1]
+                    _deseq2_var = [f"gene_{i}" for i in range(_deseq2_dim)]
+
+                    pred_outdir = os.path.join(output_dir, f"deseq2_{ct_safe}_pred")
+                    if not args.quiet:
+                        info("Running DESeq2 for cell type '%s' (pred, %d perts)...", ct, len(pred_pert_counts))
+                    try:
+                        run_from_precomputed(
+                            pred_pert_counts, pred_ctrl, _deseq2_var,
+                            outdir=pred_outdir,
+                        )
+                        if not args.quiet:
+                            info("DESeq2 complete for cell type '%s'.", ct)
+                    except Exception as exc:
+                        logger.warning("DESeq2 failed for cell type '%s': %s", ct, exc)
+
+        emit_event(
+            "summary",
+            phase="completed",
+            message="Pseudobulk inference completed successfully.",
+            output_path=output_path,
+            n_groups=len(group_entries),
+            total_cells=total_cells,
+        )
+        if not args.quiet:
+            logger.info("=== Pseudobulk inference complete ===")
+            logger.info("Pseudobulk groups: %d", len(group_entries))
+            logger.info("Total cells aggregated: %d", total_cells)
+            logger.info("Saved: %s", output_path)
+        return
 
     # -----------------------
     # 5) Persist the updated AnnData

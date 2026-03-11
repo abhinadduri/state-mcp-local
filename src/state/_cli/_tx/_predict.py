@@ -179,17 +179,6 @@ def _nb_log1p_eval_tensor(
     return torch.clamp(out, min=0.0)
 
 
-def _to_deseq2_counts_np(x, from_log1p: bool):
-    """Convert array-like values to non-negative rounded counts for DESeq2."""
-    import numpy as np
-
-    arr = np.asarray(x, dtype=np.float64)
-    if from_log1p:
-        arr = np.expm1(arr)
-    arr = np.clip(arr, a_min=0.0, a_max=None)
-    return np.round(arr)
-
-
 def _nb_real_eval_needs_log1p_transform(resolved_exp_counts: bool, resolved_is_log1p: bool) -> bool:
     """Whether real-expression eval matrices still need a log1p transform."""
     return bool(resolved_exp_counts or (not resolved_is_log1p))
@@ -886,13 +875,14 @@ def run_tx_predict(args: ap.ArgumentParser):
             else:
                 raise ValueError(f"Unsupported output_space for pseudobulk: {output_space}")
 
-        # If outputs are log1p-scaled expression, aggregate in count space and convert
-        # back to log1p only for eval matrices.
-        aggregate_main_in_count_space = bool(
-            (not use_count_outputs) and metrics_is_log1p and output_space != "embedding"
-        )
-        aggregate_gene_in_count_space = bool(
-            use_count_outputs and metrics_is_log1p and (not resolved_exp_counts)
+        from ._pseudobulk import PseudobulkAccumulator, resolve_scale_flags, build_pseudobulk_anndata
+
+        aggregate_main_in_count_space, aggregate_gene_in_count_space = resolve_scale_flags(
+            metrics_is_log1p=metrics_is_log1p,
+            use_count_outputs=use_count_outputs,
+            resolved_exp_counts=resolved_exp_counts,
+            output_space=output_space,
+            nb_loss_enabled=nb_loss_enabled,
         )
         if aggregate_main_in_count_space or aggregate_gene_in_count_space:
             logger.info(
@@ -904,11 +894,22 @@ def run_tx_predict(args: ap.ArgumentParser):
         # --- DESeq2 replicate configuration ---
         deseq2_n_reps = 2
 
-        pb_groups: dict[tuple[str, str], dict] = {}
-        context_mode = None
-        total_cells_seen = 0
+        accumulator = PseudobulkAccumulator(
+            output_dim=output_dim,
+            gene_dim=pseudo_x_dim,
+            use_count_outputs=use_count_outputs,
+            aggregate_main_in_count_space=aggregate_main_in_count_space,
+            aggregate_gene_in_count_space=aggregate_gene_in_count_space,
+            has_real=True,
+            enable_deseq2=True,
+            deseq2_n_reps=deseq2_n_reps,
+            nb_loss_enabled=nb_loss_enabled,
+            resolved_exp_counts=resolved_exp_counts,
+        )
 
-        # Match training precision for inference autocast (prevents CUBLAS errors with bf16-trained models)
+        context_mode = None
+
+        # Match training precision for inference autocast
         training_precision = cfg.get("training", {}).get("precision", "32-true")
         if "bf16" in training_precision:
             autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
@@ -941,8 +942,6 @@ def run_tx_predict(args: ap.ArgumentParser):
                     )
 
                 batch_size = batch_preds["preds"].shape[0]
-                total_cells_seen += batch_size
-
                 batch_labels = get_batch_labels(
                     (
                         batch.get("batch_name"),
@@ -975,244 +974,57 @@ def run_tx_predict(args: ap.ArgumentParser):
                 batch_pred_np = batch_preds["preds"].cpu().float().numpy()
                 batch_real_np = batch_preds["pert_cell_emb"].cpu().float().numpy()
 
-                if aggregate_main_in_count_space:
-                    batch_pred_pb_np = np.expm1(batch_pred_np.astype(np.float64, copy=False))
-                    batch_real_pb_np = np.expm1(batch_real_np.astype(np.float64, copy=False))
-                    np.clip(batch_pred_pb_np, a_min=0.0, a_max=None, out=batch_pred_pb_np)
-                    np.clip(batch_real_pb_np, a_min=0.0, a_max=None, out=batch_real_pb_np)
-                else:
-                    batch_pred_pb_np = batch_pred_np
-                    batch_real_pb_np = batch_real_np
-
                 batch_real_gene_np = None
                 batch_gene_pred_np = None
-                batch_real_gene_pb_np = None
-                batch_gene_pred_pb_np = None
                 if use_count_outputs:
                     batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().float().numpy()
                     batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().float().numpy()
-                    if aggregate_gene_in_count_space:
-                        # Real values are log1p-scaled when exp_counts=False; convert to count space.
-                        batch_real_gene_pb_np = np.expm1(batch_real_gene_np.astype(np.float64, copy=False))
-                        # NB predictions are already in count space; non-NB decoder outputs may be log1p.
-                        if nb_loss_enabled:
-                            batch_gene_pred_pb_np = batch_gene_pred_np.astype(np.float64, copy=False)
-                        else:
-                            batch_gene_pred_pb_np = np.expm1(batch_gene_pred_np.astype(np.float64, copy=False))
-                        np.clip(batch_real_gene_pb_np, a_min=0.0, a_max=None, out=batch_real_gene_pb_np)
-                        np.clip(batch_gene_pred_pb_np, a_min=0.0, a_max=None, out=batch_gene_pred_pb_np)
-                    else:
-                        batch_real_gene_pb_np = batch_real_gene_np
-                        batch_gene_pred_pb_np = batch_gene_pred_np
 
-                # --- Accumulate pseudobulk sums ---
-                group_to_indices: dict[tuple[str, str], list[int]] = {}
-                for idx in range(batch_size):
-                    key = (context_labels[idx], pert_names[idx])
-                    group_to_indices.setdefault(key, []).append(idx)
+                accumulator.accumulate_batch(
+                    batch_size=batch_size,
+                    context_labels=context_labels,
+                    pert_names=pert_names,
+                    celltypes=celltypes,
+                    batch_labels=[str(x) for x in batch_labels],
+                    pred_np=batch_pred_np,
+                    real_np=batch_real_np,
+                    gene_pred_np=batch_gene_pred_np,
+                    gene_real_np=batch_real_gene_np,
+                )
 
-                for (context_label, pert_name), idxs in group_to_indices.items():
-                    idx_arr = np.asarray(idxs, dtype=np.int64)
-                    first_idx = int(idx_arr[0])
-                    current_celltype = celltypes[first_idx]
-                    current_batch = str(batch_labels[first_idx])
+        group_entries, total_cells_seen = accumulator.finalize()
+        # Keep pb_groups dict for DESeq2 code (which accesses entries by (context, pert) key)
+        pb_groups = accumulator._groups
 
-                    entry = pb_groups.get((context_label, pert_name))
-                    if entry is None:
-                        _need_gene_logsum = use_count_outputs and aggregate_gene_in_count_space
-                        _need_main_logsum = aggregate_main_in_count_space
-                        _deseq2_gene_dim = pseudo_x_dim if use_count_outputs else output_dim
-                        entry = {
-                            "context": context_label,
-                            "pert_name": pert_name,
-                            "celltype_name": current_celltype,
-                            "batch_name": current_batch,
-                            "count": 0,
-                            "pred_sum": np.zeros(output_dim, dtype=np.float64),
-                            "real_sum": np.zeros(output_dim, dtype=np.float64),
-                            "x_hvg_sum": np.zeros(pseudo_x_dim, dtype=np.float64) if use_count_outputs else None,
-                            "counts_pred_sum": np.zeros(pseudo_x_dim, dtype=np.float64) if use_count_outputs else None,
-                            "gene_pred_logsum": np.zeros(pseudo_x_dim, dtype=np.float64) if _need_gene_logsum else None,
-                            "gene_real_logsum": np.zeros(pseudo_x_dim, dtype=np.float64) if _need_gene_logsum else None,
-                            "main_pred_logsum": np.zeros(output_dim, dtype=np.float64) if _need_main_logsum else None,
-                            "main_real_logsum": np.zeros(output_dim, dtype=np.float64) if _need_main_logsum else None,
-                            # Per-replicate count sums for DESeq2 (integer counts)
-                            "pred_rep_sums": [np.zeros(_deseq2_gene_dim, dtype=np.float64) for _ in range(deseq2_n_reps)],
-                            "real_rep_sums": [np.zeros(_deseq2_gene_dim, dtype=np.float64) for _ in range(deseq2_n_reps)],
-                            "rep_counts": [0] * deseq2_n_reps,
-                        }
-                        pb_groups[(context_label, pert_name)] = entry
-                    elif entry["celltype_name"] != current_celltype:
-                        raise ValueError(
-                            f"Inconsistent cell type for context/pert pair ({context_label}, {pert_name}): "
-                            f"saw '{current_celltype}' after '{entry['celltype_name']}'."
-                        )
-
-                    n_cells_this = int(idx_arr.size)
-                    entry["count"] += n_cells_this
-                    entry["pred_sum"] += batch_pred_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
-                    entry["real_sum"] += batch_real_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
-                    if entry["main_pred_logsum"] is not None:
-                        entry["main_pred_logsum"] += batch_pred_np[idx_arr].sum(axis=0, dtype=np.float64)
-                        entry["main_real_logsum"] += batch_real_np[idx_arr].sum(axis=0, dtype=np.float64)
-                    if use_count_outputs:
-                        entry["x_hvg_sum"] += batch_real_gene_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
-                        entry["counts_pred_sum"] += batch_gene_pred_pb_np[idx_arr].sum(axis=0, dtype=np.float64)
-                        if entry["gene_real_logsum"] is not None:
-                            # Accumulate in log1p space for eval (mean of log1p values)
-                            entry["gene_pred_logsum"] += batch_gene_pred_np[idx_arr].sum(axis=0, dtype=np.float64)
-                            entry["gene_real_logsum"] += batch_real_gene_np[idx_arr].sum(axis=0, dtype=np.float64)
-
-                    # --- Per-replicate accumulation for DESeq2 ---
-                    # Convert to integer counts with scale-aware handling.
-                    if use_count_outputs:
-                        # Prediction scale:
-                        # - NB outputs are count-space means/samples.
-                        # - Non-NB decoder outputs may be log1p when aggregate_gene_in_count_space is true.
-                        _pred_from_log1p = (not nb_loss_enabled) and aggregate_gene_in_count_space
-                        _pred_count = _to_deseq2_counts_np(batch_gene_pred_np[idx_arr], from_log1p=_pred_from_log1p)
-
-                        # Real scale:
-                        # - exp_counts=True -> already count-space
-                        # - exp_counts=False with log1p inputs -> convert via expm1
-                        _real_from_log1p = not resolved_exp_counts
-                        _real_count = _to_deseq2_counts_np(batch_real_gene_np[idx_arr], from_log1p=_real_from_log1p)
-                    else:
-                        _pred_count = _to_deseq2_counts_np(batch_pred_np[idx_arr], from_log1p=True)
-                        _real_count = _to_deseq2_counts_np(batch_real_np[idx_arr], from_log1p=True)
-                    # Round-robin assign cells to replicates
-                    prev_count = entry["count"] - n_cells_this
-                    rep_assignments = np.arange(prev_count, prev_count + n_cells_this) % deseq2_n_reps
-                    for rep in range(deseq2_n_reps):
-                        mask = rep_assignments == rep
-                        if mask.any():
-                            entry["pred_rep_sums"][rep] += _pred_count[mask].sum(axis=0)
-                            entry["real_rep_sums"][rep] += _real_count[mask].sum(axis=0)
-                            entry["rep_counts"][rep] += int(mask.sum())
-
-        if len(pb_groups) == 0:
+        if len(group_entries) == 0:
             logger.warning("No pseudobulk groups were generated. Exiting.")
             sys.exit(0)
 
         logger.info(
             "Built %d pseudobulk groups from %d cells.",
-            len(pb_groups),
+            len(group_entries),
             total_cells_seen,
         )
 
-        group_entries = list(pb_groups.values())
-        group_entries.sort(key=lambda x: (str(x["celltype_name"]), str(x["context"]), str(x["pert_name"])))
-        n_groups = len(group_entries)
-
-        # Keep both views:
-        # - sum matrices for persisted pseudobulk outputs
-        # - eval matrices for cell-eval (log1p(sum) when inputs are log1p, mean otherwise)
-        pred_bulk_sum = np.empty((n_groups, output_dim), dtype=np.float32)
-        real_bulk_sum = np.empty((n_groups, output_dim), dtype=np.float32)
-        pred_bulk_eval = np.empty((n_groups, output_dim), dtype=np.float32)
-        real_bulk_eval = np.empty((n_groups, output_dim), dtype=np.float32)
-        pred_x_sum = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
-        real_x_sum = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
-        pred_x_eval = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
-        real_x_eval = np.empty((n_groups, pseudo_x_dim), dtype=np.float32) if use_count_outputs else None
-
-        reserved_obs_keys = {
-            str(data_module.pert_col),
-            str(data_module.cell_type_key),
-            str(batch_obs_key),
-        }
-        if data_module.batch_col:
-            reserved_obs_keys.add(str(data_module.batch_col))
-
-        pseudobulk_context_key = "pseudobulk_context"
-        while pseudobulk_context_key in reserved_obs_keys:
-            pseudobulk_context_key = f"_{pseudobulk_context_key}"
-        pseudobulk_n_cells_key = "pseudobulk_n_cells"
-        while pseudobulk_n_cells_key in reserved_obs_keys or pseudobulk_n_cells_key == pseudobulk_context_key:
-            pseudobulk_n_cells_key = f"_{pseudobulk_n_cells_key}"
-
-        obs_dict = {
-            data_module.pert_col: [],
-            data_module.cell_type_key: [],
-            batch_obs_key: [],
-            pseudobulk_context_key: [],
-            pseudobulk_n_cells_key: [],
-        }
-        if data_module.batch_col and data_module.batch_col != batch_obs_key:
-            obs_dict[data_module.batch_col] = []
-
-        for idx, entry in enumerate(group_entries):
-            count = int(entry["count"])
-            denom = float(count)
-            pred_bulk_sum[idx, :] = entry["pred_sum"].astype(np.float32, copy=False)
-            real_bulk_sum[idx, :] = entry["real_sum"].astype(np.float32, copy=False)
-            if aggregate_main_in_count_space:
-                pred_bulk_eval[idx, :] = (entry["main_pred_logsum"] / denom).astype(np.float32, copy=False)
-                real_bulk_eval[idx, :] = (entry["main_real_logsum"] / denom).astype(np.float32, copy=False)
-            else:
-                pred_bulk_eval[idx, :] = (entry["pred_sum"] / denom).astype(np.float32, copy=False)
-                real_bulk_eval[idx, :] = (entry["real_sum"] / denom).astype(np.float32, copy=False)
-            if use_count_outputs:
-                pred_x_sum[idx, :] = entry["counts_pred_sum"].astype(np.float32, copy=False)
-                real_x_sum[idx, :] = entry["x_hvg_sum"].astype(np.float32, copy=False)
-                if aggregate_gene_in_count_space:
-                    pred_x_eval[idx, :] = (entry["gene_pred_logsum"] / denom).astype(np.float32, copy=False)
-                    real_x_eval[idx, :] = (entry["gene_real_logsum"] / denom).astype(np.float32, copy=False)
-                else:
-                    pred_x_eval[idx, :] = (entry["counts_pred_sum"] / denom).astype(np.float32, copy=False)
-                    real_x_eval[idx, :] = (entry["x_hvg_sum"] / denom).astype(np.float32, copy=False)
-
-            obs_dict[data_module.pert_col].append(entry["pert_name"])
-            obs_dict[data_module.cell_type_key].append(entry["celltype_name"])
-            obs_dict[batch_obs_key].append(entry["batch_name"])
-            obs_dict[pseudobulk_context_key].append(entry["context"])
-            obs_dict[pseudobulk_n_cells_key].append(count)
-            if data_module.batch_col and data_module.batch_col != batch_obs_key:
-                obs_dict[data_module.batch_col].append(entry["batch_name"])
-
-        obs = pd.DataFrame(obs_dict)
-        gene_var_df = pd.DataFrame(index=gene_var_names) if gene_var_names is not None else None
-        if use_count_outputs:
-            # Guard: gene_var_df may have more entries than output columns
-            _var = gene_var_df if (gene_var_df is not None and len(gene_var_df) == pred_x_sum.shape[1]) else None
-            # Persisted outputs: summed pseudobulks.
-            adata_pred = anndata.AnnData(X=pred_x_sum, obs=obs, var=_var)
-            adata_real = anndata.AnnData(X=real_x_sum, obs=obs, var=_var)
-            if data_module.embed_key is not None:
-                adata_pred.obsm[data_module.embed_key] = pred_bulk_sum
-                adata_real.obsm[data_module.embed_key] = real_bulk_sum
-
-            # Metric inputs: mean(log1p) pseudobulks for log1p outputs, mean otherwise.
-            adata_pred_eval = anndata.AnnData(X=pred_x_eval, obs=obs.copy(), var=_var)
-            adata_real_eval = anndata.AnnData(X=real_x_eval, obs=obs.copy(), var=_var)
-            if data_module.embed_key is not None:
-                adata_pred_eval.obsm[data_module.embed_key] = pred_bulk_eval
-                adata_real_eval.obsm[data_module.embed_key] = real_bulk_eval
-        else:
-            # Persisted outputs: summed pseudobulks.
-            adata_pred = anndata.AnnData(X=pred_bulk_sum, obs=obs)
-            adata_real = anndata.AnnData(X=real_bulk_sum, obs=obs)
-            # Metric inputs: mean(log1p) pseudobulks for log1p outputs, mean otherwise.
-            adata_pred_eval = anndata.AnnData(X=pred_bulk_eval, obs=obs.copy())
-            adata_real_eval = anndata.AnnData(X=real_bulk_eval, obs=obs.copy())
-
-        persist_mode = (
-            "sum(expm1(log1p(x)))" if (aggregate_main_in_count_space or aggregate_gene_in_count_space) else "sum(x)"
+        result = build_pseudobulk_anndata(
+            group_entries,
+            output_dim=output_dim,
+            gene_dim=pseudo_x_dim,
+            use_count_outputs=use_count_outputs,
+            aggregate_main_in_count_space=aggregate_main_in_count_space,
+            aggregate_gene_in_count_space=aggregate_gene_in_count_space,
+            has_real=True,
+            pert_col=data_module.pert_col,
+            cell_type_key=data_module.cell_type_key,
+            batch_obs_key=batch_obs_key,
+            batch_col=data_module.batch_col,
+            embed_key=data_module.embed_key,
+            gene_var_names=gene_var_names,
         )
-        eval_mode = (
-            "mean(log1p(x))"
-            if (aggregate_main_in_count_space or aggregate_gene_in_count_space)
-            else "mean(x)"
-        )
-        pseudobulk_meta = {
-            "persisted_aggregation": persist_mode,
-            "eval_aggregation": eval_mode,
-            "n_cells_obs_column": pseudobulk_n_cells_key,
-        }
-        adata_pred.uns["pseudobulk_aggregation"] = dict(pseudobulk_meta)
-        adata_real.uns["pseudobulk_aggregation"] = dict(pseudobulk_meta)
-        adata_pred_eval.uns["pseudobulk_aggregation"] = dict(pseudobulk_meta)
-        adata_real_eval.uns["pseudobulk_aggregation"] = dict(pseudobulk_meta)
+        adata_pred = result["adata_pred"]
+        adata_real = result["adata_real"]
+        adata_pred_eval = result["adata_pred_eval"]
+        adata_real_eval = result["adata_real_eval"]
 
     # -------------------------------------------------------------------
     # 4b. Cell-level inference path
