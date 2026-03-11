@@ -1153,7 +1153,7 @@ def run_tx_infer(args: argparse.Namespace):
                             np.float32, copy=False
                         )
                         if torch.is_tensor(vec):
-                            vec_np = vec.detach().cpu().numpy().astype(np.float32, copy=False)
+                            vec_np = vec.detach().float().cpu().numpy()
                         else:
                             vec_np = np.asarray(vec, dtype=np.float32)
                         if vec_np.ndim != 1:
@@ -1183,16 +1183,16 @@ def run_tx_infer(args: argparse.Namespace):
                             and ("pert_cell_counts_preds" in batch_out)
                             and (batch_out["pert_cell_counts_preds"] is not None)
                         ):
-                            preds_flat = batch_out["pert_cell_counts_preds"].detach().cpu().numpy().astype(np.float32)
+                            preds_flat = batch_out["pert_cell_counts_preds"].detach().float().cpu().numpy()
                         else:
-                            preds_flat = batch_out["preds"].detach().cpu().numpy().astype(np.float32)
+                            preds_flat = batch_out["preds"].detach().float().cpu().numpy()
                         preds = preds_flat.reshape(bsz, cell_set_len, -1)
 
                         counts_preds = None
                         if counts_expected and ("pert_cell_counts_preds" in batch_out):
                             counts_tensor = batch_out.get("pert_cell_counts_preds")
                             if counts_tensor is not None:
-                                counts_flat = counts_tensor.detach().cpu().numpy().astype(np.float32)
+                                counts_flat = counts_tensor.detach().float().cpu().numpy()
                                 counts_preds = counts_flat.reshape(bsz, cell_set_len, -1)
 
                         if counts_preds is not None:
