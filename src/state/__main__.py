@@ -12,7 +12,7 @@ from ._cli import (
     run_emb_preprocess,
     run_emb_eval,
     run_tx_infer,
-    run_tx_predict,
+    run_tx_evaluate,
     run_tx_preprocess_train,
     run_tx_train,
 )
@@ -117,9 +117,8 @@ def main():
                         # Load Hydra config with overrides for sets training
                         cfg = load_hydra_config("tx", args.hydra_overrides)
                         run_tx_train(cfg)
-                case "predict":
-                    # For now, predict uses argparse and not hydra
-                    run_tx_predict(args)
+                case "evaluate":
+                    run_tx_evaluate(args)
                 case "infer":
                     # Run inference using argparse, similar to predict
                     run_tx_infer(args)

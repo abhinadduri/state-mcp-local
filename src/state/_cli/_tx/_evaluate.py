@@ -1,7 +1,7 @@
 import argparse as ap
 
 
-def add_arguments_predict(parser: ap.ArgumentParser):
+def add_arguments_evaluate(parser: ap.ArgumentParser):
     """
     CLI for evaluation using cell-eval metrics.
     """
@@ -364,7 +364,7 @@ def _run_cell_eval(
 # ---------------------------------------------------------------------------
 
 
-def run_tx_predict(args: ap.ArgumentParser):
+def run_tx_evaluate(args: ap.ArgumentParser):
     import json
     import logging
     import os
