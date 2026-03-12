@@ -1399,9 +1399,12 @@ def run_tx_evaluate(args: ap.ArgumentParser):
                     pred_ctrl = np.stack(ctrl_entry["pred_rep_sums"]).astype(np.int64)
                     pred_outdir = os.path.join(results_dir, f"deseq2_{ct_safe}_pred")
                     logger.info("Running DESeq2 for cell type '%s' (pred, %d perts)...", ct, len(pred_pert_counts))
+                    # R workers are single-threaded subprocesses (OMP_NUM_THREADS=1);
+                    # safe to over-subscribe CPU since each worker is short-lived (~6s).
+                    deseq2_n_workers = max(pdex_num_workers, 50)
                     pred_de_df = run_from_precomputed(
                         pred_pert_counts, pred_ctrl, _deseq2_var,
-                        outdir=pred_outdir, n_workers_r=pdex_num_workers,
+                        outdir=pred_outdir, n_workers_r=deseq2_n_workers,
                     )
 
                     # Run DESeq2 for real
@@ -1413,7 +1416,7 @@ def run_tx_evaluate(args: ap.ArgumentParser):
                     logger.info("Running DESeq2 for cell type '%s' (real, %d perts)...", ct, len(real_pert_counts))
                     real_de_df = run_from_precomputed(
                         real_pert_counts, ctrl_rep_counts, _deseq2_var,
-                        outdir=real_outdir, n_workers_r=pdex_num_workers,
+                        outdir=real_outdir, n_workers_r=deseq2_n_workers,
                     )
 
                     # Convert to cell-eval format: target, feature, fold_change, p_value, fdr

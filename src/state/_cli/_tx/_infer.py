@@ -1261,6 +1261,9 @@ def run_tx_infer(args: argparse.Namespace):
                 import os
 
                 output_dir = os.path.dirname(output_path) or "."
+                # R workers are single-threaded subprocesses; safe to over-subscribe CPU.
+                slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+                deseq2_n_workers = max(int(slurm_cpus) if slurm_cpus else 1, 50)
                 # Group entries by cell type
                 ct_groups: dict[str, dict[str, dict]] = {}
                 ct_ctrl: dict[str, dict] = {}
@@ -1301,7 +1304,7 @@ def run_tx_infer(args: argparse.Namespace):
                     try:
                         run_from_precomputed(
                             pred_pert_counts, pred_ctrl, _deseq2_var,
-                            outdir=pred_outdir,
+                            outdir=pred_outdir, n_workers_r=deseq2_n_workers,
                         )
                         if not args.quiet:
                             info("DESeq2 complete for cell type '%s'.", ct)
