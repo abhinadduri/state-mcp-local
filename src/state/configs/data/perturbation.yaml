@@ -6,7 +6,7 @@ kwargs:
   pert_rep: onehot
   basal_rep: sample
   num_workers: 12
-  pin_memory: false
+  pin_memory: true
   n_basal_samples: 1
   downsample: null
   downsample_cells: null
@@ -22,7 +22,7 @@ kwargs:
   store_raw_basal: false
   int_counts: false
   barcode: true
-  use_consecutive_loading: false
+  use_consecutive_loading: true
   val_subsample_fraction: 1.0
 output_dir: null
 debug: true
