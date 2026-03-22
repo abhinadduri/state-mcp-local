@@ -228,25 +228,19 @@ class FilteredGenesCounts(H5adSentenceDataset):
         self.ds_emb_map = {}
 
         emb_cfg = utils.get_embedding_cfg(self.cfg)
-        # for inference, let's make sure this dataset's valid mask is available
+        esm_data = self.protein_embeds or torch.load(emb_cfg["all_embeddings"], weights_only=False)
+
         if adata_name is not None:
-            # append it to self.datasets
+            # Inference path: compute ds_emb_map and derive valid_gene_index from it
             self.datasets.append(adata_name)
             self.shapes_dict[adata_name] = adata.shape
 
-            # compute its embedding‐index vector
-            esm_data = self.protein_embeds or torch.load(emb_cfg["all_embeddings"], weights_only=False)
             valid_genes_list = list(esm_data.keys())
-            # make a gene→global‐index lookup
             global_pos = {g: i for i, g in enumerate(valid_genes_list)}
 
-            # grab var_names from the AnnData
             gene_names = np.array(adata.var_names)
-
-            # for each gene in this dataset, find its global idx or -1 if missing
             new_mapping = np.array([global_pos.get(g, -1) for g in gene_names])
             if (new_mapping == -1).all():
-                # probably it contains ensembl id's instead
                 assert self.gene_column in adata.var.keys(), (
                     f"Column '{self.gene_column}' not found in adata.var. Available columns: {list(adata.var.keys())}"
                 )
@@ -255,32 +249,22 @@ class FilteredGenesCounts(H5adSentenceDataset):
 
             log.info(f"{(new_mapping != -1).sum()} genes mapped to embedding file (out of {len(new_mapping)})")
             self.ds_emb_map[adata_name] = new_mapping
+            self.valid_gene_index[adata_name] = new_mapping != -1
 
-        esm_data = self.protein_embeds or torch.load(emb_cfg["all_embeddings"], weights_only=False)
+        # For file-based datasets (training path), compute valid_gene_index from h5 files
         valid_genes_list = list(esm_data.keys())
         for name in self.datasets:
-            if adata is None:
+            if name not in self.valid_gene_index:
                 a = self.dataset_file(name)
                 try:
                     gene_names = np.array(
                         [g.decode("utf-8") for g in a[f"/var/{self.gene_column}"][:]]
-                    )  # Decode byte strings
-                except:
+                    )
+                except Exception:
                     gene_categories = a[f"/var/{self.gene_column}/categories"][:]
                     gene_codes = np.array(a[f"/var/{self.gene_column}/codes"][:])
                     gene_names = np.array([g.decode("utf-8") for g in gene_categories[gene_codes]])
-                valid_mask = np.isin(gene_names, valid_genes_list)
-                self.valid_gene_index[name] = valid_mask
-            else:
-                gene_names = np.array(adata.var_names)
-                valid_mask = np.isin(gene_names, valid_genes_list)
-
-                if not valid_mask.any():
-                    # none of the genes were valid, probably ensembl id's
-                    gene_names = adata.var[self.gene_column].values
-                    valid_mask = np.isin(gene_names, valid_genes_list)
-
-                self.valid_gene_index[name] = valid_mask
+                self.valid_gene_index[name] = np.isin(gene_names, valid_genes_list)
 
     def __getitem__(self, idx):
         counts, idx, dataset, dataset_num = super().__getitem__(idx)
@@ -496,22 +480,11 @@ class VCIDatasetSentenceCollator(object):
         original_counts = original_counts_raw
         counts = counts_raw
         if valid_gene_mask is not None:
-            if ds_emb_idxs.shape[0] == valid_gene_mask.shape[0]:
-                # Filter the dataset embedding indices based on the valid gene mask
-                ds_emb_idxs = ds_emb_idxs[valid_gene_mask]
-            else:
-                # Our preprocessing is such that sometimes the ds emb idxs are already filtered
-                # in this case we do nothing to (no subsetting) but assert that the mask matches
-                assert valid_gene_mask.sum() == ds_emb_idxs.shape[0], (
-                    f"Something wrong with filtering or mask for dataset {dataset}"
-                )
-
-            # Counts are never filtered in our preprocessing step, so we always need to apply the valid genes mask
+            ds_emb_idxs = ds_emb_idxs[valid_gene_mask]
             if counts_raw.shape[1] == valid_gene_mask.shape[0]:
                 counts = counts_raw[:, valid_gene_mask]
                 original_counts = original_counts_raw[:, valid_gene_mask]
 
-        # so counts are filtered. wtf is happening with the tabular loss then? and why do we error out?
         if counts.sum() == 0:
             expression_weights = F.softmax(counts, dim=1)
         else:
