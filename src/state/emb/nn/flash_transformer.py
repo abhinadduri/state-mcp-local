@@ -20,6 +20,7 @@ class FlashTransformerEncoderLayer(nn.Module):
         """
         super().__init__()
         torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
 
         self.d_model = d_model
         self.nhead = nhead
@@ -64,7 +65,9 @@ class FlashTransformerEncoderLayer(nn.Module):
         v = v.view(src.size(0), src.size(1), self.nhead, head_dim).transpose(1, 2)
 
         # Use PyTorch’s built-in scaled_dot_product_attention.
-        attn_output = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout, is_causal=False)
+        attn_output = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=False
+        )
         # Merge heads.
         attn_output = attn_output.transpose(1, 2).contiguous().view(src.size(0), src.size(1), self.d_model)
         attn_output = self.out_proj(attn_output)

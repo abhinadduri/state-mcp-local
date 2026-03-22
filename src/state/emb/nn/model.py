@@ -381,7 +381,7 @@ class StateEmbeddingModel(L.LightningModule):
             prefix = "trainer" if self.training else "validation"
             self._log_nonzero_elements_stats(batch_sentences, prefix)
 
-        z = embs.unsqueeze(1).repeat(1, X.shape[1], 1)  # CLS token
+        z = embs.unsqueeze(1).expand(-1, X.shape[1], -1)  # CLS token
 
         if self.z_dim_rd == 1:
             mu = (
@@ -396,7 +396,7 @@ class StateEmbeddingModel(L.LightningModule):
                 else None
             )
             reshaped_counts = mu.unsqueeze(1).unsqueeze(2)
-            reshaped_counts = reshaped_counts.repeat(1, X.shape[1], 1)
+            reshaped_counts = reshaped_counts.expand(-1, X.shape[1], -1)
 
             # Concatenate all three tensors along the third dimension
             combine = torch.cat((X, z, reshaped_counts), dim=2)
@@ -407,7 +407,7 @@ class StateEmbeddingModel(L.LightningModule):
 
         if self.dataset_token is not None and dataset_embs is not None:
             ds_emb = self.dataset_embedder(dataset_embs)
-            ds_emb = ds_emb.unsqueeze(1).repeat(1, X.shape[1], 1)
+            ds_emb = ds_emb.unsqueeze(1).expand(-1, X.shape[1], -1)
             combine = torch.cat((combine, ds_emb), dim=2)
 
         # concatenate the counts

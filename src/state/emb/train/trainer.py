@@ -34,7 +34,7 @@ def get_embeddings(cfg):
 
 def main(cfg):
     print(f"Starting training with Embedding {cfg.embeddings.current} and dataset {cfg.dataset.current}")
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    torch.set_float32_matmul_precision("high")
     os.environ["NCCL_LAUNCH_TIMEOUT"] = str(cfg.experiment.ddp_timeout)
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
     TOTAL_N_CELL = cfg.dataset.num_cells
@@ -76,6 +76,8 @@ def main(cfg):
         collate_fn=val_dataset_sentence_collator,
         num_workers=cfg.dataset.num_val_workers,
         persistent_workers=True,
+        pin_memory=True,
+        prefetch_factor=4,
         generator=generator,
     )
 
