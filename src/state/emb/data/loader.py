@@ -8,12 +8,27 @@ import torch
 import torch.nn.functional as F
 import torch.utils.data as data
 
-from typing import Dict, Optional
+from typing import Dict, NamedTuple, Optional
 
 from torch.utils.data import DataLoader
 from .. import utils
 
 log = logging.getLogger(__file__)
+
+
+class CollatedBatch(NamedTuple):
+    """Output of VCIDatasetSentenceCollator.__call__."""
+
+    batch_sentences: torch.Tensor  # [B, pad_length] gene indices for cell sentence
+    task_genes: torch.Tensor  # [B, P+N(+S)] gene indices for task
+    task_counts: torch.Tensor  # [B, P+N(+S)] log1p counts for task genes
+    cell_indices: torch.Tensor  # [B] original cell index in dataset
+    batch_weights: torch.Tensor  # [B, max_genes] expression weights
+    masks: torch.Tensor  # [B, pad_length] padding mask
+    total_counts: Optional[torch.Tensor]  # [B] total task counts (rda)
+    sentence_counts: Optional[torch.Tensor]  # [B, pad_length] expression pct per slot
+    dataset_nums: Optional[torch.Tensor]  # [B] dataset index (dataset_correction)
+
 
 # Threshold for flagging implausibly high UMIs when we undo a log1p
 EXPONENTIATED_UMIS_LIMIT = 5_000_000
@@ -412,16 +427,16 @@ class VCIDatasetSentenceCollator(object):
             if batch_sentences_counts is not None:
                 batch_sentences_counts = batch_sentences_counts.to(dtype=self.precision)
 
-        return (
-            batch_sentences[:, :max_len],
-            Xs,
-            Ys,
-            idxs,
-            batch_weights,
-            masks,
-            total_counts_all if self.cfg.model.rda else None,
-            batch_sentences_counts if self.cfg.model.counts else None,
-            dataset_nums if self.use_dataset_info else None,
+        return CollatedBatch(
+            batch_sentences=batch_sentences[:, :max_len],
+            task_genes=Xs,
+            task_counts=Ys,
+            cell_indices=idxs,
+            batch_weights=batch_weights,
+            masks=masks,
+            total_counts=total_counts_all if self.cfg.model.rda else None,
+            sentence_counts=batch_sentences_counts if self.cfg.model.counts else None,
+            dataset_nums=dataset_nums if self.use_dataset_info else None,
         )
 
     def softmax(self, x):

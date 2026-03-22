@@ -206,16 +206,15 @@ class StateEmbeddingModel(L.LightningModule):
             pass
 
     def _compute_embedding_for_batch(self, batch):
-        batch_sentences = batch[0].to(self.device)
-        X = batch[1].to(self.device)
-        Y = batch[2]
-        batch_weights = batch[4]
-        mask = batch[5]
-        mask = mask.to(torch.bool)
-        batch_sentences_counts = batch[7]
+        batch_sentences = batch.batch_sentences.to(self.device)
+        X = batch.task_genes.to(self.device)
+        Y = batch.task_counts
+        batch_weights = batch.batch_weights
+        mask = batch.masks.to(torch.bool)
+        batch_sentences_counts = batch.sentence_counts
         if batch_sentences_counts is not None:
             batch_sentences_counts = batch_sentences_counts.to(self.device)
-        dataset_nums = batch[8]
+        dataset_nums = batch.dataset_nums
         if dataset_nums is not None:
             dataset_nums = dataset_nums.to(self.device)
 
@@ -364,7 +363,7 @@ class StateEmbeddingModel(L.LightningModule):
         X, Y, batch_weights, embs, dataset_embs = self._compute_embedding_for_batch(batch)
 
         # Track non-zero elements in the sentence
-        batch_sentences = batch[7].to(self.device).bool()
+        batch_sentences = batch.sentence_counts.to(self.device).bool()
         prefix = "trainer" if self.training else "validation"
         self._log_nonzero_elements_stats(batch_sentences, prefix)
 
@@ -428,7 +427,7 @@ class StateEmbeddingModel(L.LightningModule):
         if dataset_embs is not None:
             # use the dataset loss
             dataset_pred = self.dataset_encoder(dataset_embs)  # B x # datasets
-            dataset_labels = batch[8].to(self.device).long()
+            dataset_labels = batch.dataset_nums.to(self.device).long()
 
             # self.dataset_loss is a nn.CrossEntropyLoss
             dataset_loss = self.dataset_loss(dataset_pred, dataset_labels)
