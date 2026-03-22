@@ -276,26 +276,21 @@ class StateEmbeddingModel(L.LightningModule):
 
     @staticmethod
     def resize_batch(cell_embeds, task_embeds, task_counts=None, sampled_rda=None, ds_emb=None):
-        A = task_embeds.unsqueeze(0).repeat(cell_embeds.size(0), 1, 1)
-        B = cell_embeds.unsqueeze(1).repeat(1, task_embeds.size(0), 1)
+        B, T = cell_embeds.size(0), task_embeds.size(0)
+        # expand is a zero-copy view (unlike repeat which allocates)
+        A = task_embeds.unsqueeze(0).expand(B, -1, -1)
+        C = cell_embeds.unsqueeze(1).expand(-1, T, -1)
         if sampled_rda is not None:
-            # computes mu and std dev from Y
-            reshaped_counts = sampled_rda.unsqueeze(1)
-            reshaped_counts = reshaped_counts.repeat(1, A.shape[1], 1)
-            combine = torch.cat((A, B, reshaped_counts), dim=2)
+            reshaped_counts = sampled_rda.unsqueeze(1).expand(-1, T, -1)
+            combine = torch.cat((A, C, reshaped_counts), dim=2)
         elif task_counts is not None:
-            reshaped_counts = task_counts.unsqueeze(1).unsqueeze(2)
-            reshaped_counts = reshaped_counts.repeat(1, A.shape[1], 1)
-
-            # Concatenate all three tensors along the third dimension
-            combine = torch.cat((A, B, reshaped_counts), dim=2)
+            reshaped_counts = task_counts.unsqueeze(1).unsqueeze(2).expand(-1, T, -1)
+            combine = torch.cat((A, C, reshaped_counts), dim=2)
         else:
-            # Original behavior if total_counts is None
-            combine = torch.cat((A, B), dim=2)
+            combine = torch.cat((A, C), dim=2)
 
         if ds_emb is not None:
-            # ds_emb is a tensor of shape (batch_size, 10). concatenate it to the combine tensor
-            ds_emb = ds_emb.unsqueeze(1).repeat(1, A.shape[1], 1)
+            ds_emb = ds_emb.unsqueeze(1).expand(-1, T, -1)
             combine = torch.cat((combine, ds_emb), dim=2)
 
         return combine
