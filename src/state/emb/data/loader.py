@@ -305,13 +305,12 @@ class VCIDatasetSentenceCollator(object):
             )
 
         self.global_size = utils.get_embedding_cfg(self.cfg).num
-        self.global_to_local = {}
+        self._is_tabular = self.cfg.loss.name == "tabular"
         # Pre-compute per-dataset tensors once (avoids re-creating them per cell)
-        self._ds_emb_idxs = {}           # unfiltered: dataset -> LongTensor[num_genes]
         self._ds_emb_idxs_filtered = {}  # filtered by valid_gene_mask: dataset -> LongTensor[num_valid]
+        self.global_to_local = {}        # only populated for tabular loss
         for dataset_name, raw_idxs in self.dataset_to_protein_embeddings.items():
             ds_emb_idxs = torch.tensor(raw_idxs, dtype=torch.long)
-            self._ds_emb_idxs[dataset_name] = ds_emb_idxs
 
             # Pre-apply valid_gene_mask if available
             if self.valid_gene_mask is not None and dataset_name in self.valid_gene_mask:
@@ -319,12 +318,14 @@ class VCIDatasetSentenceCollator(object):
             else:
                 self._ds_emb_idxs_filtered[dataset_name] = ds_emb_idxs
 
-            # Build reverse mapping (global_idx -> local_idx) for tabular loss
-            reverse_mapping = torch.full((self.global_size,), -1, dtype=torch.int64)
-            local_indices = torch.arange(ds_emb_idxs.size(0), dtype=torch.int64)
-            mask = (ds_emb_idxs >= 0) & (ds_emb_idxs < self.global_size)
-            reverse_mapping[ds_emb_idxs[mask]] = local_indices[mask]
-            self.global_to_local[dataset_name] = reverse_mapping
+            # Build reverse mapping (global_idx -> local_idx) only for tabular loss
+            # (shared genes are sampled in global space and need reverse-mapping to get counts)
+            if self._is_tabular:
+                reverse_mapping = torch.full((self.global_size,), -1, dtype=torch.int64)
+                local_indices = torch.arange(ds_emb_idxs.size(0), dtype=torch.int64)
+                mask = (ds_emb_idxs >= 0) & (ds_emb_idxs < self.global_size)
+                reverse_mapping[ds_emb_idxs[mask]] = local_indices[mask]
+                self.global_to_local[dataset_name] = reverse_mapping
 
     def __call__(self, batch):
         num_aug = getattr(self.cfg.model, "num_downsample", 1)
@@ -478,19 +479,18 @@ class VCIDatasetSentenceCollator(object):
 
         ### At this point, counts_raw holds log1p counts for ALL genes ###
 
-        # Keep an unfiltered copy for shared-gene lookups (tabular loss needs
-        # to index by original dataset position, not filtered position)
-        counts_all_genes = counts_raw.clone()
+        # Only clone unfiltered counts when tabular loss needs them
+        # (shared genes are looked up by original dataset position)
+        counts_all_genes = counts_raw.clone() if self._is_tabular else None
 
         # Filter to valid genes only (genes that have protein embeddings)
+        ds_emb_idxs = self._ds_emb_idxs_filtered.get(dataset)
         if valid_gene_mask is not None and counts_raw.shape[1] == valid_gene_mask.shape[0]:
-            ds_emb_idxs = self._ds_emb_idxs_filtered[dataset]
             counts = counts_raw[:, valid_gene_mask]
-            counts_for_targets = counts_all_genes[:, valid_gene_mask]
+            counts_for_targets = counts_all_genes[:, valid_gene_mask] if counts_all_genes is not None else counts
         else:
-            ds_emb_idxs = self._ds_emb_idxs.get(dataset, self._ds_emb_idxs_filtered.get(dataset))
             counts = counts_raw
-            counts_for_targets = counts_all_genes
+            counts_for_targets = counts
 
         if counts.sum() == 0:
             expression_weights = torch.ones_like(counts) / counts.shape[1]
