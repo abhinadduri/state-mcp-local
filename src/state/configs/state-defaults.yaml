@@ -1,5 +1,5 @@
 experiment:
-  name: vci_pretrain_${loss.name}_${model.nhead}_${model.nlayers}
+  name: experiment
   local: local
   compiled: false
   deaware: false
@@ -18,10 +18,10 @@ experiment:
   limit_val_batches: 100
   ddp_timeout: 3600
   checkpoint:
-    path: /scratch/ctc/ML/vci/checkpoint/pretrain
+    path: /checkpoint/se_pretrain
     save_top_k: 2
     monitor: validation/val_loss
-    every_n_train_steps: 1000
+    every_n_train_steps: 10000
 wandb:
   enable: true
   project: vci
