@@ -26,7 +26,7 @@ wandb:
   enable: true
   project: vci
 embeddings:
-  current: esm2-cellxgene
+  current: SE-167M
   esm2-cellxgene:
     all_embeddings: /large_storage/ctc/ML/data/cell/misc/Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2.pt
     ds_emb_mapping: /large_storage/ctc/datasets/vci/training/gene_embidx_mapping.torch
@@ -88,9 +88,9 @@ embeddings:
     size: 5120
     num: 19790
   SE-167M:
-    all_embeddings: /home/aadduri/state/SE-167M-Data/all_embeddings_SE-167M.pt
-    ds_emb_mapping: /home/aadduri/state/SE-167M-Data/ds_emb_mapping_SE-167M.torch
-    valid_genes_masks: /home/aadduri/state/SE-167M-Data/valid_genes_masks_SE-167M.torch
+    all_embeddings: /data/SE-167M-Human/Preprint-Profile/all_embeddings_Preprint-SE-167M-Human.pt
+    ds_emb_mapping: /data/SE-167M-Human/Preprint-Profile/ds_emb_mapping_Preprint-SE-167M-Human.torch
+    valid_genes_masks: /data/SE-167M-Human/Preprint-Profile/valid_genes_masks_Preprint-SE-167M-Human.torch
     size: 5120
     num: 19790
 validations:
@@ -115,7 +115,7 @@ dataset:
   seed: 42
   num_train_workers: 16
   num_val_workers: 4
-  current: cellxgene
+  current: SE-167M
   cellxgene:
     data_dir: /large_experiments/goodarzilab/mohsen/cellxgene/processed
     ds_type: h5ad
@@ -198,15 +198,15 @@ dataset:
     num_datasets: 31195
   SE-167M:
     ds_type: h5ad
-    train: /home/aadduri/state/SE-167M-Data/train_SE-167M.csv
-    val: /home/aadduri/state/SE-167M-Data/val_SE-167M.csv
+    train: /data/SE-167M-Human/Preprint-Profile/train_Preprint-SE-167M-Human.csv
+    val: /data/SE-167M-Human/Preprint-Profile/val_Preprint-SE-167M-Human.csv
     filter: true
     num_datasets: 14418
 tokenizer:
   token_dim: 5120
 model:
   name: vci
-  batch_size: 128
+  batch_size: 96
   emsize: 512
   d_hid: 1024
   nhead: 16

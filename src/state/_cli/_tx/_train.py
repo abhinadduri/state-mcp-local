@@ -91,10 +91,12 @@ def run_tx_train(cfg: DictConfig):
             )
             cfg["data"]["kwargs"]["store_raw_basal"] = True
 
-    if output_space == "embedding":
-        checkpoint_monitor_metric = "val/embedding_loss"
-    else:
-        checkpoint_monitor_metric = "val/expression_loss"
+    checkpoint_monitor_metric = cfg["training"].get("checkpoint_monitor", None)
+    if checkpoint_monitor_metric is None:
+        if output_space == "embedding":
+            checkpoint_monitor_metric = "val/embedding_loss"
+        else:
+            checkpoint_monitor_metric = "val/expression_loss"
 
     # bf16-mixed has limited mantissa — enforce float32 collation, rely on GPU autocast only
     precision_val = cfg["training"].get("precision")
