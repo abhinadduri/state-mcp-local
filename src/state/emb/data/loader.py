@@ -306,14 +306,21 @@ class VCIDatasetSentenceCollator(object):
 
         self.global_size = utils.get_embedding_cfg(self.cfg).num
         self.global_to_local = {}
-        for dataset_name, ds_emb_idxs in self.dataset_to_protein_embeddings.items():
-            # make sure tensor with long data type
-            ds_emb_idxs = torch.tensor(ds_emb_idxs, dtype=torch.long)
+        # Pre-compute per-dataset tensors once (avoids re-creating them per cell)
+        self._ds_emb_idxs = {}           # unfiltered: dataset -> LongTensor[num_genes]
+        self._ds_emb_idxs_filtered = {}  # filtered by valid_gene_mask: dataset -> LongTensor[num_valid]
+        for dataset_name, raw_idxs in self.dataset_to_protein_embeddings.items():
+            ds_emb_idxs = torch.tensor(raw_idxs, dtype=torch.long)
+            self._ds_emb_idxs[dataset_name] = ds_emb_idxs
 
+            # Pre-apply valid_gene_mask if available
+            if self.valid_gene_mask is not None and dataset_name in self.valid_gene_mask:
+                self._ds_emb_idxs_filtered[dataset_name] = ds_emb_idxs[self.valid_gene_mask[dataset_name]]
+            else:
+                self._ds_emb_idxs_filtered[dataset_name] = ds_emb_idxs
 
-            # Create a tensor filled with -1 (indicating not present in this dataset)
+            # Build reverse mapping (global_idx -> local_idx) for tabular loss
             reverse_mapping = torch.full((self.global_size,), -1, dtype=torch.int64)
-
             local_indices = torch.arange(ds_emb_idxs.size(0), dtype=torch.int64)
             mask = (ds_emb_idxs >= 0) & (ds_emb_idxs < self.global_size)
             reverse_mapping[ds_emb_idxs[mask]] = local_indices[mask]
@@ -474,16 +481,15 @@ class VCIDatasetSentenceCollator(object):
         # store the raw counts here, we need them as targets
         original_counts_raw = counts_raw.clone()
 
-        # logic to sample a single cell sentence and task sentence here
-        ds_emb_idxs = torch.tensor(self.dataset_to_protein_embeddings[dataset], dtype=torch.long)
-
-        original_counts = original_counts_raw
-        counts = counts_raw
+        # Use pre-computed per-dataset embedding index tensors
         if valid_gene_mask is not None:
-            ds_emb_idxs = ds_emb_idxs[valid_gene_mask]
-            if counts_raw.shape[1] == valid_gene_mask.shape[0]:
-                counts = counts_raw[:, valid_gene_mask]
-                original_counts = original_counts_raw[:, valid_gene_mask]
+            ds_emb_idxs = self._ds_emb_idxs_filtered[dataset]
+            counts = counts_raw[:, valid_gene_mask] if counts_raw.shape[1] == valid_gene_mask.shape[0] else counts_raw
+            original_counts = original_counts_raw[:, valid_gene_mask] if counts_raw.shape[1] == valid_gene_mask.shape[0] else original_counts_raw
+        else:
+            ds_emb_idxs = self._ds_emb_idxs[dataset]
+            counts = counts_raw
+            original_counts = original_counts_raw
 
         if counts.sum() == 0:
             expression_weights = F.softmax(counts, dim=1)
