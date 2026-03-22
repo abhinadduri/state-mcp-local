@@ -16,7 +16,6 @@ from ..train.callbacks import (
     LogLR,
     ProfilerCallback,
     ResumeCallback,
-    EMACallback,
     PerfProfilerCallback,
     CumulativeFLOPSCallback,
 )
@@ -138,10 +137,6 @@ def main(cfg):
         exp_logger = None
 
     callbacks = [checkpoint_callback, LogLR(100), ResumeCallback(cfg), PerfProfilerCallback()]
-
-    if getattr(cfg.model, "ema", False):
-        ema_decay = getattr(cfg.model, "ema_decay", 0.999)
-        callbacks.append(EMACallback(decay=ema_decay))
 
     # Add cumulative FLOPS callback
     callbacks.append(CumulativeFLOPSCallback(use_backward=cfg.experiment.cumulative_flops_use_backward))
