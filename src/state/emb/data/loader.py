@@ -492,7 +492,7 @@ class VCIDatasetSentenceCollator(object):
             original_counts = original_counts_raw
 
         if counts.sum() == 0:
-            expression_weights = F.softmax(counts, dim=1)
+            expression_weights = torch.ones_like(counts) / counts.shape[1]
         else:
             expression_weights = counts / torch.sum(counts, dim=1, keepdim=True)
 

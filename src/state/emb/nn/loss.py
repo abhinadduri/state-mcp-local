@@ -133,7 +133,7 @@ class TabularLoss(nn.Module):
         cell_mmd = self.cell_loss(cell_inputs, cell_targets).nanmean()
 
         # Combine losses, skipping any that are NaN (can happen with degenerate batches)
-        final_loss = torch.tensor(0.0).to(cell_mmd.device)
+        final_loss = torch.tensor(0.0, device=cell_mmd.device, dtype=cell_mmd.dtype)
         if not gene_mmd.isnan():
             final_loss += gene_mmd
         if not cell_mmd.isnan():
