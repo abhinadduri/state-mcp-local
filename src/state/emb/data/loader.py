@@ -241,10 +241,6 @@ class FilteredGenesCounts(H5adSentenceDataset):
             log.info(f"{(new_mapping != -1).sum()} genes mapped to embedding file (out of {len(new_mapping)})")
             self.ds_emb_map[adata_name] = new_mapping
 
-        print(
-            f"!!! {(self.ds_emb_map[adata_name] != -1).sum()} genes mapped to embedding file (out of {len(self.ds_emb_map[adata_name])})"
-        )
-
         esm_data = self.protein_embeds or torch.load(emb_cfg["all_embeddings"], weights_only=False)
         valid_genes_list = list(esm_data.keys())
         for name in self.datasets:
@@ -314,7 +310,7 @@ class VCIDatasetSentenceCollator(object):
         for dataset_name, ds_emb_idxs in self.dataset_to_protein_embeddings.items():
             # make sure tensor with long data type
             ds_emb_idxs = torch.tensor(ds_emb_idxs, dtype=torch.long)
-            # assert ds_emb_idxs.unique().numel() == ds_emb_idxs.numel(), f"duplicate global IDs in dataset {dataset_name}!"
+
 
             # Create a tensor filled with -1 (indicating not present in this dataset)
             reverse_mapping = torch.full((self.global_size,), -1, dtype=torch.int64)
@@ -409,8 +405,6 @@ class VCIDatasetSentenceCollator(object):
 
         # Cast tensors to specified precision if provided
         if self.precision is not None:
-            # batch_sentences = batch_sentences.to(dtype=self.precision)
-            # Xs = Xs.to(dtype=self.precision)
             Ys = Ys.to(dtype=self.precision)
             batch_weights = batch_weights.to(dtype=self.precision)
             if total_counts_all is not None:
@@ -593,14 +587,12 @@ class VCIDatasetSentenceCollator(object):
             if shared_genes is not None:
                 # Overwrite the final positions of task_sentence
 
-                task_sentence[c, unshared_num:] = shared_genes  # in the old impl these are global gene indices
-                # task_sentence[c, unshared_num:] = ds_emb_idxs[shared_genes.to(torch.int32)] # in the new impl these are local gene indices
+                task_sentence[c, unshared_num:] = shared_genes
 
                 # convert the shared_genes, which are global indices, to the dataset specific indices
                 local_indices = self.global_to_local[dataset][shared_genes].to(
                     cell.device
-                )  # in the old impl these are global gene indices
-                # local_indices = shared_genes # in the new impl these are local gene indices
+                )
 
                 shared_counts = torch.zeros(local_indices.shape, dtype=cell.dtype, device=cell.device)
                 valid_mask = local_indices != -1

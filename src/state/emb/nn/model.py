@@ -83,7 +83,6 @@ class StateEmbeddingModel(L.LightningModule):
         self.model_type = "Transformer"
         self.cls_token = nn.Parameter(torch.randn(1, token_dim))
 
-        # self.pos_encoder = PositionalEncoding(d_model, dropout)
         self.d_model = d_model
         self.warmup_steps = warmup_steps
         self.dropout = dropout
