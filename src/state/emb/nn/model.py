@@ -371,13 +371,13 @@ class StateEmbeddingModel(L.LightningModule):
         self.log(f"{prefix}/nonzero_fraction", nonzero_fraction)
 
     def shared_step(self, batch, batch_idx):
-        logging.info(f"Step {self.global_step} - Batch {batch_idx}")
         X, Y, batch_weights, embs, dataset_embs = self._compute_embedding_for_batch(batch)
 
-        # Track non-zero elements in the sentence
-        batch_sentences = batch.sentence_counts.to(self.device).bool()
-        prefix = "trainer" if self.training else "validation"
-        self._log_nonzero_elements_stats(batch_sentences, prefix)
+        # Track non-zero elements at low frequency (every 100 steps)
+        if self.global_step % 100 == 0:
+            batch_sentences = batch.sentence_counts.to(self.device).bool()
+            prefix = "trainer" if self.training else "validation"
+            self._log_nonzero_elements_stats(batch_sentences, prefix)
 
         z = embs.unsqueeze(1).repeat(1, X.shape[1], 1)  # CLS token
 
