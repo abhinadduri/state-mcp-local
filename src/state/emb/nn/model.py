@@ -170,6 +170,23 @@ class StateEmbeddingModel(L.LightningModule):
         else:
             self.dataset_token = None
 
+        # Initialize the main loss criterion once (not every step)
+        if self.cfg.loss.name == "cross_entropy":
+            self.criterion = BCEWithLogitsLoss()
+        elif self.cfg.loss.name == "mse":
+            self.criterion = nn.MSELoss()
+        elif self.cfg.loss.name == "wasserstein":
+            self.criterion = WassersteinLoss()
+        elif self.cfg.loss.name == "kl_divergence":
+            self.criterion = KLDivergenceLoss(apply_normalization=self.cfg.loss.normalization)
+        elif self.cfg.loss.name == "mmd":
+            kernel = self.cfg.loss.get("kernel", "energy")
+            self.criterion = MMDLoss(kernel=kernel)
+        elif self.cfg.loss.name == "tabular":
+            self.criterion = TabularLoss(shared=self.cfg.dataset.S)
+        else:
+            raise ValueError(f"Loss {self.cfg.loss.name} not supported")
+
     def on_save_checkpoint(self, checkpoint):
         """
         Persist a snapshot of the training config inside the checkpoint so downstream
@@ -399,31 +416,13 @@ class StateEmbeddingModel(L.LightningModule):
         # concatenate the counts
         decs = self.binary_decoder(combine)
 
-        if self.cfg.loss.name == "cross_entropy":
-            criterion = BCEWithLogitsLoss()
-            target = Y
-        elif self.cfg.loss.name == "mse":
-            criterion = nn.MSELoss()
-            target = Y
-        elif self.cfg.loss.name == "wasserstein":
-            criterion = WassersteinLoss()
-            target = Y
-        elif self.cfg.loss.name == "kl_divergence":
-            criterion = KLDivergenceLoss(apply_normalization=self.cfg.loss.normalization)
-            target = batch_weights
-        elif self.cfg.loss.name == "mmd":
-            kernel = self.cfg.loss.get("kernel", "energy")
-            criterion = MMDLoss(kernel=kernel, downsample=self.cfg.model.num_downsample if self.training else 1)
-            target = Y
-        elif self.cfg.loss.name == "tabular":
-            criterion = TabularLoss(
-                shared=self.cfg.dataset.S, downsample=self.cfg.model.num_downsample if self.training else 1
-            )
-            target = Y
-        else:
-            raise ValueError(f"Loss {self.cfg.loss.name} not supported")
+        target = batch_weights if self.cfg.loss.name == "kl_divergence" else Y
 
-        loss = criterion(decs.squeeze(), target)
+        if self.cfg.loss.name in ("mmd", "tabular"):
+            downsample = self.cfg.model.num_downsample if self.training else 1
+            loss = self.criterion(decs.squeeze(), target, downsample=downsample)
+        else:
+            loss = self.criterion(decs.squeeze(), target)
         if dataset_embs is not None:
             # use the dataset loss
             dataset_pred = self.dataset_encoder(dataset_embs)  # B x # datasets

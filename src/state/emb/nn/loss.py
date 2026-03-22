@@ -84,29 +84,27 @@ class KLDivergenceLoss(nn.Module):
 
 
 class MMDLoss(nn.Module):
-    def __init__(self, kernel="energy", blur=0.05, scaling=0.5, downsample=1):
+    def __init__(self, kernel="energy", blur=0.05, scaling=0.5):
         super().__init__()
         self.mmd_loss = SamplesLoss(loss=kernel, blur=blur, scaling=scaling)
-        self.downsample = downsample
 
-    def forward(self, input, target):
-        input = input.reshape(-1, self.downsample, input.shape[-1])
-        target = target.reshape(-1, self.downsample, target.shape[-1])
+    def forward(self, input, target, downsample=1):
+        input = input.reshape(-1, downsample, input.shape[-1])
+        target = target.reshape(-1, downsample, target.shape[-1])
 
         loss = self.mmd_loss(input, target)
         return loss.mean()
 
 
 class TabularLoss(nn.Module):
-    def __init__(self, shared=128, downsample=1):
+    def __init__(self, shared=128):
         super().__init__()
         self.shared = shared
-        self.downsample = downsample
 
         self.gene_loss = SamplesLoss(loss="energy")
         self.cell_loss = SamplesLoss(loss="energy")
 
-    def forward(self, input, target):
+    def forward(self, input, target, downsample=1):
         """Dual energy-distance loss: gene-level MMD + cell-level MMD.
 
         Gene-level: treats each cell's decoder outputs as a point cloud over
@@ -119,8 +117,8 @@ class TabularLoss(nn.Module):
         """
         # Group augmented copies together:
         # (B*D, P+N+S) -> (B, D, P+N+S)  where D = downsample count
-        input = input.reshape(-1, self.downsample, input.shape[-1])
-        target = target.reshape(-1, self.downsample, target.shape[-1])
+        input = input.reshape(-1, downsample, input.shape[-1])
+        target = target.reshape(-1, downsample, target.shape[-1])
         gene_mmd = self.gene_loss(input, target).nanmean()
 
         # Extract the S shared genes (last S columns) for cross-cell comparison
