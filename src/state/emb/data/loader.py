@@ -476,20 +476,21 @@ class VCIDatasetSentenceCollator(object):
             total_umis = int(exp_log_counts.sum(axis=1).item())
             count_expr_dist = exp_log_counts / exp_log_counts.sum(axis=1, keepdim=True)
 
-        ### At this point, counts_raw is assumed to be log counts ###
+        ### At this point, counts_raw holds log1p counts for ALL genes ###
 
-        # store the raw counts here, we need them as targets
-        original_counts_raw = counts_raw.clone()
+        # Keep an unfiltered copy for shared-gene lookups (tabular loss needs
+        # to index by original dataset position, not filtered position)
+        counts_all_genes = counts_raw.clone()
 
-        # Use pre-computed per-dataset embedding index tensors
-        if valid_gene_mask is not None:
+        # Filter to valid genes only (genes that have protein embeddings)
+        if valid_gene_mask is not None and counts_raw.shape[1] == valid_gene_mask.shape[0]:
             ds_emb_idxs = self._ds_emb_idxs_filtered[dataset]
-            counts = counts_raw[:, valid_gene_mask] if counts_raw.shape[1] == valid_gene_mask.shape[0] else counts_raw
-            original_counts = original_counts_raw[:, valid_gene_mask] if counts_raw.shape[1] == valid_gene_mask.shape[0] else original_counts_raw
+            counts = counts_raw[:, valid_gene_mask]
+            counts_for_targets = counts_all_genes[:, valid_gene_mask]
         else:
-            ds_emb_idxs = self._ds_emb_idxs[dataset]
+            ds_emb_idxs = self._ds_emb_idxs.get(dataset, self._ds_emb_idxs_filtered.get(dataset))
             counts = counts_raw
-            original_counts = original_counts_raw
+            counts_for_targets = counts_all_genes
 
         if counts.sum() == 0:
             expression_weights = torch.ones_like(counts) / counts.shape[1]
@@ -571,7 +572,7 @@ class VCIDatasetSentenceCollator(object):
 
             # set counts for unshared genes
             task_idxs = task_sentence[c, :unshared_num].to(torch.int32)
-            task_counts[c, :unshared_num] = original_counts[c, task_idxs]
+            task_counts[c, :unshared_num] = counts_for_targets[c, task_idxs]
 
             # convert from dataset specific gene indices to global gene indices
             # only do this for everything up to shared genes, which are already global indices
@@ -591,7 +592,7 @@ class VCIDatasetSentenceCollator(object):
                 shared_counts = torch.zeros(local_indices.shape, dtype=cell.dtype, device=cell.device)
                 valid_mask = local_indices != -1
                 if valid_mask.any():
-                    shared_counts[valid_mask] = original_counts_raw[c, local_indices[valid_mask]]
+                    shared_counts[valid_mask] = counts_all_genes[c, local_indices[valid_mask]]
 
                 # for indices which are -1, count is 0, else index into cell
                 task_counts[c, unshared_num:] = shared_counts
