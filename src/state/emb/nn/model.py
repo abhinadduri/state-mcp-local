@@ -235,9 +235,11 @@ class StateEmbeddingModel(L.LightningModule):
         if dataset_nums is not None:
             dataset_nums = dataset_nums.to(self.device)
 
-        # convert the cell sentence and task sentence into embeddings
-        batch_sentences = self.pe_embedding(batch_sentences)
-        X = self.pe_embedding(X)
+        # Lookup frozen protein embeddings — detach to avoid storing the
+        # large (B × seq_len × 5120) intermediate tensor for backward
+        with torch.no_grad():
+            batch_sentences = self.pe_embedding(batch_sentences)
+            X = self.pe_embedding(X)
 
         # Normalize token outputs now
         batch_sentences = nn.functional.normalize(batch_sentences, dim=2)
@@ -447,7 +449,8 @@ class StateEmbeddingModel(L.LightningModule):
 
     def configure_optimizers(self):
         max_lr = self.max_lr
-        optimizer = torch.optim.AdamW(self.parameters(), lr=max_lr, weight_decay=self.cfg.optimizer.weight_decay)
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=self.cfg.optimizer.weight_decay)
         total_steps = self.trainer.estimated_stepping_batches
 
         lr_schedulers = [
