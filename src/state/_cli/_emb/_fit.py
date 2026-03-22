@@ -41,6 +41,10 @@ def run_emb_fit(cfg, args):
         log.error("Please set the desired dataset to 'dataset.current'")
         sys.exit(1)
 
+    if not cfg.get("experiment", {}).get("name"):
+        log.error("Experiment name is required for training. Please set 'experiment.name'")
+        sys.exit(1)
+
     # Set environment variables
     os.environ["MASTER_PORT"] = str(cfg.experiment.port)
     # WAR: Workaround for sbatch failing when --ntasks-per-node is set.
