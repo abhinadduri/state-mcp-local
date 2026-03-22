@@ -18,7 +18,7 @@ from torch import nn, Tensor
 from torch.nn import BCEWithLogitsLoss
 
 
-from torch.optim.lr_scheduler import ChainedScheduler, LinearLR, CosineAnnealingLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import ChainedScheduler, LinearLR, CosineAnnealingLR
 
 from ..utils import (
     get_embedding_cfg,
@@ -436,14 +436,6 @@ class StateEmbeddingModel(L.LightningModule):
             else:
                 self.log("validation/dataset_loss", dataset_loss)
 
-        sch = self.lr_schedulers()
-
-        for scheduler in sch._schedulers:
-            if isinstance(scheduler, ReduceLROnPlateau):
-                scheduler.step(loss)
-            else:
-                scheduler.step()
-        sch._last_lr = [group["lr"] for group in sch._schedulers[-1].optimizer.param_groups]
         return loss
 
     @torch.compile(disable=True)
@@ -461,7 +453,7 @@ class StateEmbeddingModel(L.LightningModule):
     def configure_optimizers(self):
         max_lr = self.max_lr
         optimizer = torch.optim.AdamW(self.parameters(), lr=max_lr, weight_decay=self.cfg.optimizer.weight_decay)
-        total_steps = self.trainer.estimated_stepping_batches * 2  # not sure why need to do this
+        total_steps = self.trainer.estimated_stepping_batches
 
         lr_schedulers = [
             LinearLR(
