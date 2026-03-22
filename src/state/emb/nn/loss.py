@@ -107,19 +107,34 @@ class TabularLoss(nn.Module):
         self.cell_loss = SamplesLoss(loss="energy")
 
     def forward(self, input, target):
+        """Dual energy-distance loss: gene-level MMD + cell-level MMD.
+
+        Gene-level: treats each cell's decoder outputs as a point cloud over
+        genes, then compares predicted vs target distributions per cell.
+
+        Cell-level: for the S shared genes (the last ``self.shared`` features),
+        transposes so each gene becomes a "sample set" of cells, then compares
+        predicted vs target cell distributions per gene.  This encourages the
+        model to match cross-cell structure, not just per-cell reconstruction.
+        """
+        # Group augmented copies together:
+        # (B*D, P+N+S) -> (B, D, P+N+S)  where D = downsample count
         input = input.reshape(-1, self.downsample, input.shape[-1])
         target = target.reshape(-1, self.downsample, target.shape[-1])
         gene_mmd = self.gene_loss(input, target).nanmean()
 
-        # cell_mmd should only be on the shared genes, and match scale to mse loss
+        # Extract the S shared genes (last S columns) for cross-cell comparison
         cell_inputs = input[:, :, -self.shared :]
         cell_targets = target[:, :, -self.shared :]
 
-        # need to reshape each from (B, self.downsample, F) to (F, self.downsample, B)
+        # Transpose (B, D, S) -> (S, D, B): each shared gene becomes a "sample"
+        # of (downsample, batch) points, so SamplesLoss compares per-gene
+        # distributions across cells
         cell_inputs = cell_inputs.transpose(2, 0)
         cell_targets = cell_targets.transpose(2, 0)
         cell_mmd = self.cell_loss(cell_inputs, cell_targets).nanmean()
 
+        # Combine losses, skipping any that are NaN (can happen with degenerate batches)
         final_loss = torch.tensor(0.0).to(cell_mmd.device)
         if not gene_mmd.isnan():
             final_loss += gene_mmd
