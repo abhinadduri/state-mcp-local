@@ -14,11 +14,11 @@ experiment:
   num_nodes: 1
   num_gpus_per_node: 1
   port: 12400
-  val_check_interval: 1000
-  limit_val_batches: 100
+  val_check_interval: 10000
+  limit_val_batches: 500
   ddp_timeout: 3600
   checkpoint:
-    path: /checkpoint/se_pretrain
+    path: /checkpoints/se_pretrain
     save_top_k: 2
     monitor: validation/val_loss
     every_n_train_steps: 10000
@@ -206,7 +206,7 @@ tokenizer:
   token_dim: 5120
 model:
   name: vci
-  batch_size: 96
+  batch_size: 128
   emsize: 512
   d_hid: 1024
   nhead: 16
@@ -236,7 +236,7 @@ optimizer:
   reset_lr_on_restart: false
   zclip: false
 loss:
-  name: tabular
+  name: mmd
   apply_normalization: false
   kernel: energy
   uniformity: false
