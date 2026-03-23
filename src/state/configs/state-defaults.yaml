@@ -232,6 +232,7 @@ model:
 task:
   mask: 0.2
 optimizer:
+  name: adamw
   max_lr: 1.0e-05
   weight_decay: 0.01
   start: 0.33
