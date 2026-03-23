@@ -309,6 +309,10 @@ class LatentCollator:
         return gene_indices[top_idx], gene_counts[top_idx]
 
     def __call__(self, batch):
+        num_aug = getattr(self.cfg.model, "num_downsample", 1)
+        if num_aug > 1 and self.is_train:
+            batch = [item for item in batch for _ in range(num_aug)]
+
         batch_size = len(batch)
         cells = []  # list of (gene_indices, gene_counts) per cell
         task_genes_list = []
