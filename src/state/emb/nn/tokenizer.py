@@ -207,15 +207,16 @@ class SentenceTokenizer(Tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# LatentTokenizer: projects all genes to latent tokens via linear reduction
+# LatentTokenizer: sparse cross-attention from latent queries to measured genes
 # ---------------------------------------------------------------------------
 
 
 class LatentBatch(NamedTuple):
-    """Output of LatentCollator."""
+    """Output of LatentCollator. Sparse representation — only measured genes."""
 
-    global_counts: torch.Tensor  # [B, n_genes] log1p counts aligned to global gene space
-    measurement_mask: torch.Tensor  # [B, n_genes] bool — True where gene was measured
+    gene_indices: torch.Tensor  # [B, k_max] int64 global gene IDs, padded with 0
+    gene_counts: torch.Tensor  # [B, k_max] float log1p counts, 0 for padding
+    gene_mask: torch.Tensor  # [B, k_max] bool — True for real genes, False for padding
     task_genes: torch.Tensor  # [B, P+N] int32 global gene indices for decoder
     task_counts: torch.Tensor  # [B, P+N] log1p target counts
     dataset_nums: Optional[torch.Tensor]  # [B] dataset index
@@ -224,12 +225,10 @@ class LatentBatch(NamedTuple):
 class LatentCollator:
     """CPU-side collation for LatentTokenizer.
 
-    Aligns each cell's counts to the global gene space using ds_emb_map,
-    builds a measurement mask, and samples P+N task genes for reconstruction.
+    Produces a sparse representation: only measured genes per cell (with their
+    global indices and counts), padded to the max measured count in the batch.
+    Samples P+N task genes for reconstruction.
     """
-
-    EXPONENTIATED_UMIS_LIMIT = 5_000_000
-    RAW_COUNT_HEURISTIC_THRESHOLD = 35
 
     def __init__(self, cfg, ds_emb_mapping, n_genes: int, is_train: bool = True):
         self.cfg = cfg
@@ -254,8 +253,7 @@ class LatentCollator:
         return total_umis > 5_000_000
 
     def _process_cell(self, counts_raw: torch.Tensor, dataset: str):
-        """Normalize counts and align to global gene space. Returns (global_counts, measurement_mask)."""
-        # Ensure log1p
+        """Normalize counts, return sparse (gene_indices, gene_counts) in global space."""
         if counts_raw.numel() > 0 and self._is_raw_counts(counts_raw):
             counts_raw = torch.log1p(F.relu(counts_raw))
         elif torch.any(counts_raw < 0):
@@ -264,28 +262,19 @@ class LatentCollator:
         counts_raw = counts_raw.squeeze(0)  # [G_local]
         mapping = self._ds_mapping[dataset]  # [G_local] → global indices, -1 for unmapped
 
-        global_counts = torch.zeros(self.n_genes)
-        measurement_mask = torch.zeros(self.n_genes, dtype=torch.bool)
-
         valid = mapping >= 0
-        global_idx = mapping[valid]
-        global_counts[global_idx] = counts_raw[valid]
-        measurement_mask[global_idx] = True
+        gene_indices = mapping[valid]  # [k] global gene IDs
+        gene_counts = counts_raw[valid]  # [k] log1p counts
+        return gene_indices, gene_counts
 
-        return global_counts, measurement_mask
+    def _sample_task_genes(self, gene_indices: torch.Tensor, gene_counts: torch.Tensor):
+        """Sample P expressed + N unexpressed genes from measured genes."""
+        if len(gene_indices) == 0:
+            return torch.zeros(self.P + self.N, dtype=torch.int32), torch.zeros(self.P + self.N)
 
-    def _sample_task_genes(self, global_counts: torch.Tensor, measurement_mask: torch.Tensor):
-        """Sample P expressed + N unexpressed genes among measured genes for reconstruction."""
-        measured_idx = torch.where(measurement_mask)[0]
-        if len(measured_idx) == 0:
-            # Degenerate: no measured genes — return zeros
-            task_genes = torch.zeros(self.P + self.N, dtype=torch.int32)
-            task_counts = torch.zeros(self.P + self.N)
-            return task_genes, task_counts
-
-        measured_counts = global_counts[measured_idx]
-        expressed = measured_idx[measured_counts > 0]
-        unexpressed = measured_idx[measured_counts == 0]
+        expressed_mask = gene_counts > 0
+        expressed = gene_indices[expressed_mask]
+        unexpressed = gene_indices[~expressed_mask]
 
         # Sample P expressed genes
         if len(expressed) >= self.P:
@@ -293,8 +282,7 @@ class LatentCollator:
         elif len(expressed) > 0:
             p_idx = expressed[torch.randint(len(expressed), (self.P,))]
         else:
-            # No expressed genes — sample from measured
-            p_idx = measured_idx[torch.randint(len(measured_idx), (self.P,))]
+            p_idx = gene_indices[torch.randint(len(gene_indices), (self.P,))]
 
         # Sample N unexpressed genes
         if len(unexpressed) >= self.N:
@@ -302,33 +290,47 @@ class LatentCollator:
         elif len(unexpressed) > 0:
             n_idx = unexpressed[torch.randint(len(unexpressed), (self.N,))]
         else:
-            # All measured genes are expressed — sample from measured
-            n_idx = measured_idx[torch.randint(len(measured_idx), (self.N,))]
+            n_idx = gene_indices[torch.randint(len(gene_indices), (self.N,))]
 
         task_genes = torch.cat([p_idx, n_idx]).to(torch.int32)
-        task_counts = global_counts[task_genes.long()]
+        # Look up counts for task genes from the sparse representation
+        # Build a quick lookup: global_idx → count
+        idx_to_count = torch.zeros(self.n_genes)
+        idx_to_count[gene_indices] = gene_counts
+        task_counts = idx_to_count[task_genes.long()]
         return task_genes, task_counts
 
     def __call__(self, batch):
         batch_size = len(batch)
-        global_counts_list = []
-        mask_list = []
+        cells = []  # list of (gene_indices, gene_counts) per cell
         task_genes_list = []
         task_counts_list = []
         dataset_nums = torch.zeros(batch_size, dtype=torch.int32)
 
         for i, (counts, idx, dataset, dataset_num) in enumerate(batch):
-            gc, mm = self._process_cell(counts, dataset)
-            tg, tc = self._sample_task_genes(gc, mm)
-            global_counts_list.append(gc)
-            mask_list.append(mm)
+            gi, gc = self._process_cell(counts, dataset)
+            tg, tc = self._sample_task_genes(gi, gc)
+            cells.append((gi, gc))
             task_genes_list.append(tg)
             task_counts_list.append(tc)
             dataset_nums[i] = dataset_num
 
+        # Pad to max measured genes in batch
+        k_max = max(len(c[0]) for c in cells)
+        gene_indices = torch.zeros(batch_size, k_max, dtype=torch.long)
+        gene_counts = torch.zeros(batch_size, k_max)
+        gene_mask = torch.zeros(batch_size, k_max, dtype=torch.bool)
+
+        for i, (gi, gc) in enumerate(cells):
+            k = len(gi)
+            gene_indices[i, :k] = gi
+            gene_counts[i, :k] = gc
+            gene_mask[i, :k] = True
+
         return LatentBatch(
-            global_counts=torch.stack(global_counts_list),
-            measurement_mask=torch.stack(mask_list),
+            gene_indices=gene_indices,
+            gene_counts=gene_counts,
+            gene_mask=gene_mask,
             task_genes=torch.stack(task_genes_list),
             task_counts=torch.stack(task_counts_list),
             dataset_nums=dataset_nums if self.use_dataset_info else None,
@@ -336,16 +338,17 @@ class LatentCollator:
 
 
 class LatentTokenizer(Tokenizer):
-    """Projects all genes to latent tokens via linear reduction.
+    """Sparse cross-attention from latent queries to measured gene tokens.
 
-    For each of the n_genes positions:
-    - Measured gene: encoder(pe_embedding[i]) + count_emb(count_i)
-    - Unmeasured gene: missing_emb[i] (learned per-position)
+    Only measured genes are materialized as tokens — no (B, n_genes, d_model)
+    intermediate. Scales to 200K+ genes across species.
 
-    Then projects (B, n_genes, d_model) → (B, n_latent, d_model) via Linear(n_genes, n_latent).
-    CLS token + transformer + decoder produces the cell embedding.
+    For each measured gene:  gene_token = encoder(pe_embedding[i]) + count_emb(count_i)
+    Unmeasured genes are simply absent (not padded with a missing embedding).
 
-    ~250x cheaper attention than SentenceTokenizer (n_latent vs pad_length tokens).
+    Learned latent queries cross-attend to the sparse gene tokens, producing
+    (B, n_latent, d_model) latent tokens. Self-attention + decoder produce
+    the CLS cell embedding.
     """
 
     def __init__(
@@ -377,13 +380,7 @@ class LatentTokenizer(Tokenizer):
         )
         self.gene_embedding_layer = self.encoder  # alias for decoder task genes
 
-        # Learned embedding for unmeasured gene positions
-        self.missing_emb = nn.Parameter(torch.randn(n_genes, d_model) * 0.02)
-
-        # Gene-to-latent projection: Linear(n_genes, n_latent) applied per d_model channel
-        self.gene_reduction = nn.Linear(n_genes, n_latent)
-
-        # Count encoding (same as SentenceTokenizer)
+        # Count encoding
         if cfg and cfg.model.counts:
             self.bin_encoder = nn.Embedding(10, d_model)
             self.count_encoder = nn.Sequential(
@@ -395,7 +392,20 @@ class LatentTokenizer(Tokenizer):
             self.bin_encoder = None
             self.count_encoder = None
 
-        # Learnable CLS token (in d_model space, not token_dim)
+        # Learned latent queries — cross-attend to gene tokens
+        self.latent_queries = nn.Parameter(torch.randn(n_latent, d_model) * 0.02)
+
+        # Cross-attention: latent queries (Q) attend to gene tokens (K, V)
+        # Using manual projections + F.scaled_dot_product_attention for flash/mem-efficient backends
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.cross_q_proj = nn.Linear(d_model, d_model)
+        self.cross_kv_proj = nn.Linear(d_model, d_model * 2)
+        self.cross_out_proj = nn.Linear(d_model, d_model)
+        self.cross_norm = nn.LayerNorm(d_model)
+        self.cross_dropout = dropout
+
+        # Learnable CLS token
         self.cls_token = nn.Parameter(torch.randn(1, d_model))
 
         # Dataset correction token
@@ -404,7 +414,7 @@ class LatentTokenizer(Tokenizer):
         else:
             self.dataset_token = None
 
-        # Transformer (operates on n_latent + 1 tokens, much cheaper than SentenceTokenizer)
+        # Self-attention transformer (operates on n_latent + CLS tokens)
         layers = [FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout) for _ in range(nlayers)]
         self.transformer_encoder = FlashTransformerEncoder(layers)
         if compiled:
@@ -421,8 +431,8 @@ class LatentTokenizer(Tokenizer):
         # Frozen protein embedding table (set externally)
         self.pe_embedding = None
 
-        # Cache for projected gene identity embeddings (computed once)
-        self._gene_identity_cache = None
+        # Cache for projected ESM2 table: (n_genes, d_model), computed once
+        self._esm2_proj_cache = None
 
     def make_collator(self, cfg, is_train: bool, **kwargs):
         from .. import utils
@@ -438,73 +448,89 @@ class LatentTokenizer(Tokenizer):
             is_train=is_train,
         )
 
-    def _get_gene_identity_embs(self, device):
-        """Compute encoder(pe_embedding[0..n_genes]) once and cache."""
-        if self._gene_identity_cache is not None and self._gene_identity_cache.device == device:
-            return self._gene_identity_cache
+    def _get_esm2_proj_table(self, device):
+        """Compute encoder(pe_embedding) for all genes once and cache as frozen buffer."""
+        if self._esm2_proj_cache is not None and self._esm2_proj_cache.device == device:
+            return self._esm2_proj_cache
 
         with torch.no_grad():
             all_indices = torch.arange(self.n_genes, device=device)
             pe_out = self.pe_embedding(all_indices)  # [n_genes, token_dim]
-
-        # Encoder projection (has grad — part of the model)
-        gene_identity = self.encoder(pe_out)  # [n_genes, d_model]
-        self._gene_identity_cache = gene_identity.detach()
-        return self._gene_identity_cache
+            proj = self.encoder(pe_out)  # [n_genes, d_model]
+        self._esm2_proj_cache = proj  # frozen, no grad
+        return self._esm2_proj_cache
 
     def forward(self, batch: LatentBatch) -> TokenizerOutput:
         device = next(self.parameters()).device
 
-        global_counts = batch.global_counts.to(device)  # [B, n_genes]
-        measurement_mask = batch.measurement_mask.to(device)  # [B, n_genes] bool
+        gene_indices = batch.gene_indices.to(device)  # [B, k_max]
+        gene_counts = batch.gene_counts.to(device)  # [B, k_max]
+        gene_mask = batch.gene_mask.to(device)  # [B, k_max] bool
         task_genes = batch.task_genes.to(device)
         task_counts = batch.task_counts
         dataset_nums = batch.dataset_nums
         if dataset_nums is not None:
             dataset_nums = dataset_nums.to(device)
 
-        B = global_counts.shape[0]
+        B, k_max = gene_indices.shape
 
-        # --- Build per-gene tokens ---
-        # Gene identity embeddings from frozen protein embeddings (cached)
-        gene_identity = self._get_gene_identity_embs(device)  # [n_genes, d_model]
+        # --- Build sparse gene tokens (only measured genes) ---
+        esm2_table = self._get_esm2_proj_table(device)  # [n_genes, d_model]
 
-        # Count encoding for all gene positions
+        # Gather ESM2 projected embeddings for measured genes only
+        gene_embs = esm2_table[gene_indices]  # [B, k_max, d_model]
+
+        # Count encoding for measured genes only
         if self.count_encoder is not None:
-            counts_input = global_counts.unsqueeze(-1)  # [B, n_genes, 1]
-            bin_weights = F.softmax(self.count_encoder(counts_input), dim=-1)  # [B, n_genes, 10]
+            counts_input = gene_counts.unsqueeze(-1)  # [B, k_max, 1]
+            bin_weights = F.softmax(self.count_encoder(counts_input), dim=-1)  # [B, k_max, 10]
             bin_embeddings = self.bin_encoder(torch.arange(10, device=device))  # [10, d_model]
-            count_emb = torch.matmul(bin_weights, bin_embeddings)  # [B, n_genes, d_model]
+            count_emb = torch.matmul(bin_weights, bin_embeddings)  # [B, k_max, d_model]
         else:
-            count_emb = torch.zeros(B, self.n_genes, self.d_model, device=device)
+            count_emb = torch.zeros(B, k_max, self.d_model, device=device)
 
-        # Measured genes: gene_identity + count_emb
-        # Unmeasured genes: missing_emb
-        measured_tokens = gene_identity.unsqueeze(0) + count_emb  # [B, n_genes, d_model]
-        missing_tokens = self.missing_emb.unsqueeze(0).expand(B, -1, -1)  # [B, n_genes, d_model]
+        gene_tokens = gene_embs + count_emb  # [B, k_max, d_model]
 
-        # Select measured vs missing per position
-        mask_3d = measurement_mask.unsqueeze(-1)  # [B, n_genes, 1]
-        gene_tokens = torch.where(mask_3d, measured_tokens, missing_tokens)  # [B, n_genes, d_model]
+        # --- Cross-attention: latent queries attend to sparse gene tokens ---
+        queries = self.latent_queries.unsqueeze(0).expand(B, -1, -1)  # [B, n_latent, d_model]
 
-        # --- Project to latent tokens ---
-        # gene_reduction: Linear(n_genes, n_latent) applied per d_model channel
-        latent_tokens = self.gene_reduction(
-            gene_tokens.transpose(1, 2)  # [B, d_model, n_genes]
-        ).transpose(1, 2)  # [B, n_latent, d_model]
+        # Project Q, K, V and reshape for multi-head attention
+        q = self.cross_q_proj(queries)  # [B, n_latent, d_model]
+        kv = self.cross_kv_proj(gene_tokens)  # [B, k_max, 2*d_model]
+        k, v = kv.chunk(2, dim=-1)  # each [B, k_max, d_model]
+
+        # Reshape to (B, nhead, seq, head_dim) for SDPA
+        q = q.view(B, self.n_latent, self.nhead, self.head_dim).transpose(1, 2)
+        k = k.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
+
+        # Zero out padded key/value positions so they contribute nothing,
+        # then run SDPA without an explicit mask (enables flash attention backend)
+        padding_mask = gene_mask.unsqueeze(-1)  # [B, k_max, 1]
+        k = k * padding_mask.unsqueeze(1)  # broadcast over heads: [B, nhead, k_max, head_dim]
+        v = v * padding_mask.unsqueeze(1)
+
+        # Flash/mem-efficient cross-attention (no attn_mask = flash-eligible)
+        dropout_p = self.cross_dropout if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+
+        # Merge heads and project
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, self.n_latent, self.d_model)
+        attn_out = self.cross_out_proj(attn_out)
+
+        latent_tokens = self.cross_norm(queries + attn_out)  # residual + norm
 
         # --- Prepend CLS token (+ optional dataset token) ---
-        cls = self.cls_token.expand(B, -1).unsqueeze(1)  # [B, 1, d_model]
+        cls = self.cls_token.unsqueeze(0).expand(B, 1, -1)  # [B, 1, d_model]
         if self.dataset_token is not None:
-            ds_tok = self.dataset_token.expand(B, -1).unsqueeze(1)  # [B, 1, d_model]
-            src = torch.cat([cls, latent_tokens, ds_tok], dim=1)  # [B, 1+n_latent+1, d_model]
+            ds_tok = self.dataset_token.unsqueeze(0).expand(B, 1, -1)
+            src = torch.cat([cls, latent_tokens, ds_tok], dim=1)
         else:
-            src = torch.cat([cls, latent_tokens], dim=1)  # [B, 1+n_latent, d_model]
+            src = torch.cat([cls, latent_tokens], dim=1)
 
-        # Scale (matching SentenceTokenizer convention)
         src = src * math.sqrt(self.d_model)
 
-        # --- Transformer + decoder ---
+        # --- Self-attention transformer + decoder ---
         output = self.transformer_encoder(src, src_key_padding_mask=None)
         gene_output = self.decoder(output)
 
@@ -519,8 +545,8 @@ class LatentTokenizer(Tokenizer):
 
         # --- Task gene embeddings for decoder ---
         with torch.no_grad():
-            task_pe = self.pe_embedding(task_genes.long())  # [B, P+N, token_dim]
-        task_gene_embs = self.gene_embedding_layer(task_pe)  # [B, P+N, d_model]
+            task_pe = self.pe_embedding(task_genes.long())
+        task_gene_embs = self.gene_embedding_layer(task_pe)
 
         return TokenizerOutput(
             cell_embedding=embedding,
