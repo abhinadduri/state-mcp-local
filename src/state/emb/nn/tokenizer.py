@@ -522,10 +522,12 @@ class LatentTokenizer(Tokenizer):
         v = v.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
 
         # Zero out padded key/value positions so they contribute nothing,
-        # then run SDPA without an explicit mask (enables flash attention backend)
-        padding_mask = gene_mask.unsqueeze(-1)  # [B, k_max, 1]
-        k = k * padding_mask.unsqueeze(1)  # broadcast over heads: [B, nhead, k_max, head_dim]
-        v = v * padding_mask.unsqueeze(1)
+        # then run SDPA without an explicit mask (enables flash attention backend).
+        # Skip when all cells have the same length (common with k_top truncation).
+        if not gene_mask.all():
+            padding_mask = gene_mask.unsqueeze(-1)  # [B, k_max, 1]
+            k = k * padding_mask.unsqueeze(1)  # broadcast over heads: [B, nhead, k_max, head_dim]
+            v = v * padding_mask.unsqueeze(1)
 
         # Flash/mem-efficient cross-attention (no attn_mask = flash-eligible)
         dropout_p = self.cross_dropout if self.training else 0.0
@@ -549,6 +551,12 @@ class LatentTokenizer(Tokenizer):
 
         # --- Self-attention transformer + decoder ---
         output = self.transformer_encoder(src, src_key_padding_mask=None)
+
+        # Only decode CLS (+ dataset) token — skip 256 latent tokens
+        if self.dataset_token is not None:
+            output = output[:, [0, -1], :]  # [B, 2, d_model]
+        else:
+            output = output[:, :1, :]  # [B, 1, d_model]
         gene_output = self.decoder(output)
 
         # CLS embedding
@@ -561,9 +569,11 @@ class LatentTokenizer(Tokenizer):
             dataset_emb = gene_output[:, -1, :]
 
         # --- Task gene embeddings for decoder ---
+        # Must run encoder WITH gradients so its parameters get updated.
+        # (The esm2_proj_cache is computed under no_grad and can't provide gradients.)
         with torch.no_grad():
-            task_pe = self.pe_embedding(task_genes.long())
-        task_gene_embs = self.gene_embedding_layer(task_pe)
+            task_pe = self.pe_embedding(task_genes.long())  # [B, P+N, token_dim]
+        task_gene_embs = self.gene_embedding_layer(task_pe)  # [B, P+N, d_model] — grad flows here
 
         return TokenizerOutput(
             cell_embedding=embedding,

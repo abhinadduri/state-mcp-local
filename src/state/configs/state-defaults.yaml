@@ -227,6 +227,7 @@ model:
   tokenizer: sentence
   n_latent: 256
   k_top: 4096
+  decoder_bottleneck_dim: null
 task:
   mask: 0.2
 optimizer:

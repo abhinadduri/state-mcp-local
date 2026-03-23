@@ -79,11 +79,24 @@ class StateEmbeddingModel(L.LightningModule):
         self.z_dim_ds = 10 if self.cfg.model.get("dataset_correction", False) else 0
         self.z_dim = self.z_dim_rd + self.z_dim_ds
 
-        self.binary_decoder = nn.Sequential(
-            SkipBlock(output_dim + d_model + self.z_dim),
-            SkipBlock(output_dim + d_model + self.z_dim),
-            nn.Linear(output_dim + d_model + self.z_dim, 1, bias=True),
-        )
+        bottleneck_dim = getattr(self.cfg.model, "decoder_bottleneck_dim", None)
+        if bottleneck_dim is not None:
+            # Project gene_emb and cell_emb to small bottleneck dim before concat
+            self.gene_proj = nn.Linear(d_model, bottleneck_dim)
+            self.cell_proj = nn.Linear(output_dim, bottleneck_dim)
+            dec_input_dim = bottleneck_dim * 2 + self.z_dim
+            self.binary_decoder = nn.Sequential(
+                SkipBlock(dec_input_dim),
+                nn.Linear(dec_input_dim, 1, bias=True),
+            )
+        else:
+            self.gene_proj = None
+            self.cell_proj = None
+            self.binary_decoder = nn.Sequential(
+                SkipBlock(output_dim + d_model + self.z_dim),
+                SkipBlock(output_dim + d_model + self.z_dim),
+                nn.Linear(output_dim + d_model + self.z_dim, 1, bias=True),
+            )
 
         if compiled:
             self.binary_decoder = torch.compile(self.binary_decoder)
@@ -217,7 +230,13 @@ class StateEmbeddingModel(L.LightningModule):
         embs = out.cell_embedding  # [B, output_dim]
         dataset_embs = out.dataset_emb  # [B, output_dim] or None
 
-        z = embs.unsqueeze(1).expand(-1, X.shape[1], -1)  # CLS token
+        # Bottleneck: project gene and cell embeddings to small dim before concat
+        if self.gene_proj is not None:
+            X_dec = self.gene_proj(X)  # [B, n_task, bottleneck_dim]
+            z = self.cell_proj(embs).unsqueeze(1).expand(-1, X.shape[1], -1)
+        else:
+            X_dec = X
+            z = embs.unsqueeze(1).expand(-1, X.shape[1], -1)  # CLS token
 
         if self.z_dim_rd == 1:
             mu = (
@@ -233,10 +252,10 @@ class StateEmbeddingModel(L.LightningModule):
             )
             reshaped_counts = mu.unsqueeze(1).unsqueeze(2)
             reshaped_counts = reshaped_counts.expand(-1, X.shape[1], -1)
-            combine = torch.cat((X, z, reshaped_counts), dim=2)
+            combine = torch.cat((X_dec, z, reshaped_counts), dim=2)
         else:
             assert self.z_dim_rd == 0
-            combine = torch.cat((X, z), dim=2)
+            combine = torch.cat((X_dec, z), dim=2)
 
         if self.dataset_embedder is not None and dataset_embs is not None:
             ds_emb = self.dataset_embedder(dataset_embs)
