@@ -159,7 +159,8 @@ class CumulativeFLOPSCallback(L.Callback):
         This has only been tested with StateEmbeddingModel. Behavior with any other model has not been verified.
         """
         model.zero_grad(set_to_none=True)
-        loss: torch.Tensor = model.training_step(batch, 0)  # type: ignore
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            loss: torch.Tensor = model.training_step(batch, 0)  # type: ignore
         if self.use_backward:
             loss.backward()
         return loss
