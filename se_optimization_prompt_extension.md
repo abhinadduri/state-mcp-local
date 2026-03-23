@@ -1,98 +1,168 @@
-# SE Model: Latent Token Utilization Ideas
+# SE Model: In-Context Learning via Position-Aligned Latent Exchange
 
-The LatentTokenizer produces 256 latent tokens after self-attention, but only CLS is used. These proposals aim to leverage the latent tokens for better training signal and downstream representations.
+## Core Idea
 
-## Proposal A: Hybrid Cross-Attention Decoder
+The SE LatentTokenizer's 256 learned latent queries are **shared across all cells**. This means `latent_token[i]` from cell A and `latent_token[i]` from cell B were produced by the same query attending to different cells' gene profiles. After training, each latent position develops a **positional semantics** — position 47 might specialize in cell cycle, position 128 in immune activation, etc.
 
-**Status**: Under consideration | **Impact**: High | **Complexity**: Medium
-
-Replace the binary decoder (two SkipBlocks on concat(CLS, gene_emb)) with a cross-attention decoder where task genes attend to **[CLS + 256 latent tokens]** (257 keys total):
+This enables a dual-axis attention pattern structurally analogous to Stack's `TabularAttentionLayer`, but operating in compressed latent space:
 
 ```
-Q = task_gene_embs           [B, P+N, d_model]
-K, V = [CLS, latent_tokens]  [B, 257, d_model]
-output = cross_attn(Q, K, V) [B, P+N, d_model]
-prediction = Linear(output)  [B, P+N, 1]
+Intra-cell:  (B*C, 257, d_model)  — latent tokens attend within a cell
+Inter-cell:  (B*256, C, d_model)  — cells attend per latent position
 ```
 
-**Why this works:**
-- Each task gene selectively reads from relevant latent tokens (pathway-specific info) AND the CLS token (global cell state)
-- CLS still participates as a key → gets direct gradient from expression loss → remains a good downstream embedding
-- Replaces expensive SkipBlocks (30-50% of forward FLOPs at 600M scale) with a single cross-attention + linear head
-- Gradients flow through all 256 latent tokens, not just CLS → better self-attention training
+Each of the 256 latent positions becomes an **independent inter-cell communication channel**. When cells exchange information at position `i`, they are comparing their states for a specific biological program — "how does my immune signaling compare to the population?" This is richer than a single CLS exchange and more structured than Stack's approach (which flattens all gene programs into one 1600-dim vector for inter-cell attention).
 
-**Key tension resolved:** CLS must be a good downstream embedding (for TX model), but we also want efficient expression prediction. By making CLS one of 257 keys, it stays in the gradient path while latent tokens do the heavy lifting.
+## Comparison to Stack
 
-**Risks:**
-- CLS might become less informative if latent tokens dominate attention. Could add a small CLS-specific auxiliary loss (e.g., read-depth prediction) as insurance.
-- Flash attention for decoder cross-attention needs P+N to not vary (it doesn't — P and N are config constants).
+Stack alternates two attention axes every layer:
 
-## Proposal B: Masked Latent Reconstruction (Auxiliary Loss)
+| | Stack (TabularAttention) | SE-ICL (Latent Exchange) |
+|---|---|---|
+| Intra-cell | 100 gene tokens self-attend `(B*C, 100, 16)` | 257 latent+CLS tokens self-attend `(B*C, 257, d_model)` |
+| Inter-cell | cells attend as flattened vectors `(B, C, 1600)` | cells attend per latent position `(B*256, C, d_model)` |
+| Channels | 1 mixed channel (1600-dim) | 256 specialized channels (d_model each) |
+| Gene representation | learned linear from counts, no protein info | ESM2 protein embeddings, cross-species transfer |
+| Gene vocabulary | fixed `n_genes`, zeros for unmeasured | sparse, variable, scales to 200K+ |
+| Per-cell capacity | 100 * 16 = 1,600 dims | 256 * d_model = 131K dims (d=512) |
 
-**Status**: Under consideration | **Impact**: Medium-High | **Complexity**: Low (~50 lines)
+**Attention cost per layer** (C=128 cells, comparable to Stack's sample_size=256):
+- Intra-cell: `C * 257^2 = ~8.5M` entries — similar to Stack's `C * 100^2 = ~2.6M`
+- Inter-cell: `256 * C^2 = ~4.2M` entries — cheaper than Stack's `C^2 * 100 = ~6.6M` (at C=256)
 
-Mask ~30% of latent tokens before self-attention, predict the original cross-attention outputs after self-attention. Uses L2 or cosine loss on continuous targets.
+SE-ICL is comparable or cheaper in attention cost while being richer in per-cell representation.
+
+## Architecture
+
+### Per-cell pipeline (unchanged from current SE)
+```
+1. LatentCollator: raw counts → sparse (gene_indices[k], gene_counts[k]), top-K truncation
+2. Cross-attention: 256 learned queries attend to k gene tokens → (C, 256, d_model)
+3. Prepend CLS token → (C, 257, d_model)
+```
+
+### Dual-axis transformer (new, replaces FlashTransformerEncoder)
+Each layer alternates:
+```
+For each layer l = 1..L:
+  # Intra-cell: latent tokens attend within their cell
+  x = reshape(B, C, 257, d_model) → (B*C, 257, d_model)
+  x = self_attn_intra(x)  # flash attention, 257 tokens
+  x = reshape back to (B, C, 257, d_model)
+
+  # Inter-cell: cells attend per latent position (including CLS at position 0)
+  x = x.permute(0, 2, 1, 3)  → (B, 257, C, d_model)
+  x = reshape → (B*257, C, d_model)
+  x = self_attn_inter(x)  # flash attention, C tokens
+  x = reshape back to (B, C, 257, d_model)
+
+  # FFN (shared or separate for intra/inter)
+  x = ffn(x)
+```
+
+### Decoder (unchanged)
+```
+4. Extract CLS token → cell embedding
+5. Binary decoder: concat(CLS, gene_emb) → predicted expression
+6. MMD loss
+```
+
+## Data Loading
+
+### New: ContextDataset
+
+Replace the current single-cell `H5adSentenceDataset` with a `ContextDataset` that yields **groups of C cells** from the same biological context (same H5AD file, contiguous or locality-sampled).
+
+```python
+class ContextDataset(Dataset):
+    """Yields groups of C cells from the same biological context.
+
+    Each __getitem__ returns C cells from one H5AD file.
+    Cells are sampled contiguously (nearby in the file) to share
+    tissue/donor/condition context, similar to Stack's locality sampling.
+    """
+
+    def __init__(self, cfg, context_size: int = 128):
+        self.context_size = context_size
+        # ... load file list, cell counts per file ...
+
+    def __getitem__(self, idx):
+        # Map idx to (file, start_position)
+        # Return C consecutive cells as a list of (counts, idx, dataset, dataset_num)
+        ...
+```
+
+The `LatentCollator` would be updated to accept a list of C-cell groups and produce a batched `LatentBatch` with shape `(B, C, k_max)` instead of `(B, k_max)`. Here B is the number of contexts (meta-batch), C is cells per context.
+
+### Remove num_downsample
+
+The `num_downsample` augmentation in the collator should be removed as a first step. It complicates the collator and is orthogonal to the ICL approach. It can be re-added later if needed for the MMD loss, but contextual training (C cells per sample) already provides natural augmentation through inter-cell information.
+
+## Training Objective
+
+### Phase 1: Contextual denoising
+
+Keep the existing per-cell expression prediction loss, but with **asymmetric corruption** across cells in a context:
+- Randomly corrupt 20-50% of cells heavily (mask 80%+ of their gene tokens before cross-attention)
+- Leave the remaining cells lightly corrupted (mask 10-20%, as current)
+- All cells predict their own expression as usual
+
+Heavily corrupted cells must rely on inter-cell context to reconstruct their expression — their own cross-attention output is too impoverished. This naturally incentivizes ICL without requiring new loss functions.
+
+### Phase 2: Perturbation prediction (Stack-style finetuning)
+
+Given control cells as context + empty query slots, predict post-perturbation expression:
+- Add `query_pos_embedding` to distinguish context from query cells (as in Stack)
+- Add causal mask on inter-cell attention: control cells cannot attend to query cells
+- Training: flow-matching interpolation (random fraction of query cells receive ground-truth)
+
+## Auxiliary: Masked Latent Reconstruction
+
+Can be combined with either phase. Mask ~30% of latent tokens before self-attention, predict the original cross-attention outputs after self-attention using L2 loss on continuous targets.
 
 ```
-# After cross-attention, before self-attention:
-targets = latent_tokens.detach()          # stop-gradient on reconstruction targets
-mask = torch.rand(B, 256) < 0.3
-latent_tokens[mask] = self.mask_token     # learned [MASK] parameter
+targets = latent_tokens.detach()          # stop-gradient
+mask = torch.rand(B, C, 256) < 0.3
+latent_tokens[mask] = self.mask_token     # learned parameter
 
-# Run self-attention on [CLS, partially_masked_latent]
-output = transformer([CLS, latent_tokens])
+output = dual_axis_transformer([CLS, latent_tokens])
 
-# Reconstruction loss at masked positions
-predicted = recon_head(output[:, 1:][mask])  # small MLP or linear
-loss = F.mse_loss(predicted, targets[mask])
+predicted = recon_head(output[:, :, 1:][mask])
+recon_loss = F.mse_loss(predicted, targets[mask])
 total_loss = expression_loss + alpha * recon_loss
 ```
 
-**Precedent:** MAE reconstructs continuous pixel values; data2vec and I-JEPA predict continuous latent representations. Continuous target prediction is well-established.
+**Precedent:** MAE, data2vec, I-JEPA all reconstruct continuous representations successfully. The targets here are cross-attention outputs that encode gene identity (ESM2) + expression level.
 
-**Why this helps:**
-- Prevents latent token collapse (many tokens going unused because only CLS gets gradient)
-- Forces self-attention to build globally coherent representations — each token must be predictable from its neighbors
-- Self-supervised signal, no additional labels needed
-- Complements expression prediction loss
+## Implementation Plan
 
-**Hyperparameters to tune:** mask_ratio (start 0.3), alpha loss weight (start 0.1), recon_head architecture (linear vs small MLP).
+### Step 1: Remove num_downsample from LatentCollator
+- Remove augmentation duplication logic
+- Simplify collator to single-cell batching only
 
-**Risks:** Too much masking could hurt expression prediction. Disable masking during validation/inference.
+### Step 2: ContextDataset + ContextCollator
+- New dataset class that yields C-cell groups from the same file
+- New collator that produces `(B, C, k_max)` batched latent representations
+- Cross-attention runs per-cell as before: reshape `(B*C, k_max, d_model)`
 
-## Proposal C: CLS Contrastive with num_downsample
+### Step 3: DualAxisTransformerEncoder
+- New transformer module that alternates intra-cell and inter-cell self-attention
+- Initialize from pretrained SE weights for intra-cell layers
+- Inter-cell layers init with near-zero output projections (model starts as if no inter-cell communication, gradually learns to use it)
 
-**Status**: Under consideration | **Impact**: Medium | **Complexity**: Medium
+### Step 4: Contextual denoising objective
+- Asymmetric gene masking across cells in a context
+- All cells still predict their own expression via the existing binary decoder + MMD loss
 
-Use the existing `num_downsample` mechanism to create augmented pairs. Two views of the same cell (different gene top-K sampling due to random tie-breaking, different task gene sampling) should produce similar CLS embeddings.
+### Step 5: Perturbation prediction finetuning
+- Add query_pos_embedding, causal masking
+- Flow-matching interpolation
+- This becomes the path to replacing Stack's TX pipeline
 
-```
-# With num_downsample=2, collator produces pairs: cell_i_view1, cell_i_view2
-# After forward pass, CLS embeddings for the same cell should be similar
-# InfoNCE: sim(cls_i_v1, cls_i_v2) high; sim(cls_i_v1, cls_j_v2) low
-```
+## Key Advantages Over Stack
 
-**Why this helps:**
-- Explicit training signal for CLS quality, independent of the expression decoder
-- Particularly useful if Proposal A shifts expression prediction to latent tokens
-- Pairs come for free from the existing augmentation pipeline
-
-**Limitation:** With k_top=4096 deterministic truncation, the cross-attention input is identical across augmentations of the same cell. Only the task gene sampling differs. This means CLS embeddings would already be nearly identical without contrastive loss. To get meaningful augmentation diversity, would need either (a) stochastic top-K (sample proportional to expression rather than hard top-K), or (b) random gene dropout.
-
-**Priority:** Lower than A and B. Only becomes important if Proposal A degrades CLS quality.
-
-## Implementation Order
-
-1. **Proposal A** first — highest impact, solves both the decoder cost problem AND latent token utilization
-2. **Proposal B** second — low-effort add-on to prevent latent collapse and improve representations
-3. **Proposal C** only if CLS quality degrades after A
-
-## Relationship to Current Optimization Campaign
-
-These proposals interact with the runtime optimizations in `se_optimization_prompt.md`:
-
-- **Proposal A replaces optimization #1** (simplify binary decoder) — the cross-attention decoder IS the simplified decoder
-- **Optimization #2** (ESM2 cache for task genes) still applies — task gene embeddings feed the cross-attention queries
-- **Optimization #3** (CLS-only decoding in tokenizer) needs revision — we'd keep latent tokens in the output, but the tokenizer decoder (SkipBlock+Linear) still only runs on CLS
-- **Optimization #4** (torch.compile) still applies
-- **Optimization #5** (remove padding mask) still applies
+1. **ESM2 cross-species bridge**: orthologs get similar latent representations, enabling multi-species ICL
+2. **256 specialized communication channels** vs Stack's 1 mixed channel
+3. **Sparse gene handling**: scales to 200K+ genes without affecting inter-cell attention cost
+4. **Modular**: cross-attention (per-cell gene compression) is decoupled from inter-cell communication
+5. **Pretrained initialization**: can warm-start from existing SE checkpoint, only adding inter-cell layers
