@@ -1,7 +1,7 @@
 # SE Model Optimization Campaign
 
 ## Goal
-Maximize training throughput (cells/sec) for the State Embedding model on H100 GPUs, targeting the ability to train on all of basecount (~167M cells) in ~1 day on a single GPU. Build toward a multi-species model (200K+ genes).
+Maximize training throughput (cells/sec) for the State Embedding model on H100 GPUs, targeting the ability to train on all of basecount (~167M cells) in ~1 day on a single GPU. Build toward a multi-species model (200K+ genes). Work maximally in parallel, spawning teammates as needed to do literature search, implement features, etc. The code to change is in /home/aadduri/state-mcp-local. Use local resources well and also use as much of the slurm backend as is helpful towards the campaign goal.
 
 ## Current Architecture: LatentTokenizer (sparse Perceiver cross-attention)
 
