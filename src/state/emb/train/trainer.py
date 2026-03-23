@@ -155,8 +155,8 @@ def main(cfg):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
         model.tokenizer = torch.compile(model.tokenizer)
-        model.binary_decoder = torch.compile(model.binary_decoder)
-        print(f"Compiled tokenizer and binary_decoder with torch.compile")
+        model._decode = torch.compile(model._decode)
+        print(f"Compiled tokenizer and _decode with torch.compile")
 
     model = model.train()
 
