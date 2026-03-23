@@ -111,8 +111,12 @@ class Finetune(nn.Module):
         else:
             stacked = all_pe
         stacked.requires_grad = False
-        self.model.pe_embedding = nn.Embedding.from_pretrained(stacked)  # type: ignore
-        self.model.pe_embedding.to(self.device)  # type: ignore
+        pe_emb = nn.Embedding.from_pretrained(stacked)
+        pe_emb.to(self.device)
+        if hasattr(self.model, "tokenizer") and self.model.tokenizer is not None:
+            self.model.tokenizer.pe_embedding = pe_emb
+        else:
+            self.model.pe_embedding = pe_emb
 
         # Keep a mapping from gene name -> raw protein embedding vector
         self.protein_embeds = packaged_pe

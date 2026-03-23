@@ -163,8 +163,13 @@ class Inference:
         all_pe = self.protein_embeds or get_embeddings(self._vci_conf)
         if isinstance(all_pe, dict):
             all_pe = torch.vstack(list(all_pe.values()))
-        self.model.pe_embedding = nn.Embedding.from_pretrained(all_pe)
-        self.model.pe_embedding.to(self.model.device, dtype=precision)
+        pe_emb = nn.Embedding.from_pretrained(all_pe)
+        pe_emb.to(self.model.device, dtype=precision)
+        # Set on tokenizer if available, otherwise on model (backward compat)
+        if hasattr(self.model, "tokenizer") and self.model.tokenizer is not None:
+            self.model.tokenizer.pe_embedding = pe_emb
+        else:
+            self.model.pe_embedding = pe_emb
         self.model.binary_decoder.requires_grad = False
         self.model.eval()
 
