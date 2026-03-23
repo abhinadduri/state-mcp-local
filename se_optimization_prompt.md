@@ -1,111 +1,101 @@
 # SE Model Optimization Campaign
 
 ## Goal
-Maximize training throughput (cells/sec) for the State Embedding model on H100 GPUs, targeting the ability to train on all of basecount (~167M cells) in ~1 day on a single GPU. Establish FLOP-efficiency benchmarks comparing tokenization strategies.
+Maximize training throughput (cells/sec) for the State Embedding model on H100 GPUs, targeting the ability to train on all of basecount (~167M cells) in ~1 day on a single GPU. Build toward a multi-species model (200K+ genes).
 
-## Current Baseline (2025-03-22)
-- **Throughput**: 256 cells/sec (batch_size=128, single H100)
-- **Step time**: 501ms (forward=189ms, backward=309ms, optimizer=2ms)
-- **Loss**: MMD (energy distance)
-- **Model**: 37M trainable params (8-layer transformer, d_model=512, nhead=16)
-- **Sequence length**: pad_length=2048 (all genes as explicit tokens)
-- **Token dim**: 5120 (ESM2 protein embeddings, frozen)
-- **GPU memory**: 52 GB peak / 80 GB available
-- **Bottleneck**: Compute-bound (99% forward+backward on O(2048²) attention)
-- At current throughput, 1 epoch over 167M cells ≈ 7.5 days
+## Current Architecture: LatentTokenizer (sparse Perceiver cross-attention)
 
-## Architecture: Tokenizer Abstraction
+The model uses a Tokenizer abstraction (`src/state/emb/nn/tokenizer.py`) that decouples tokenization from the model. The **LatentTokenizer** is the primary approach.
 
-The core insight: the current collator mixes *tokenization strategy* (how to convert raw counts into transformer tokens) with *data loading*. These should be decoupled. The model's job — CLS bottleneck + transformer + decoder — is agnostic to how tokens are produced.
+### Data flow
+```
+LatentCollator (CPU):
+  Raw cell counts → sparse (gene_indices[k], gene_counts[k]) in global space
+  Top-K truncation: keep top k_top=4096 genes by expression
+  Sample P+N task genes for reconstruction (from ALL measured genes, before truncation)
 
-### Interface
+LatentTokenizer.forward (GPU):
+  1. Gather ESM2 projected embeddings for measured genes:  esm2_table[indices] → (B, k, d_model)
+  2. Count encoding for measured genes:  MLP(counts) → (B, k, d_model)
+  3. Gene tokens = esm2_emb + count_emb:  (B, k, d_model)
+  4. Cross-attention: latent_queries(256) attend to gene_tokens(k) → (B, 256, d_model)
+  5. CLS + self-attention transformer + decoder → cell embedding
 
-```python
-class Tokenizer(nn.Module):
-    """Converts raw gene expression counts into transformer-ready tokens."""
-
-    def tokenize(self, counts, dataset_info) -> torch.Tensor:
-        """Returns (batch, seq_len, token_dim) ready for the transformer."""
-        ...
-
-    @property
-    def token_dim(self) -> int: ...
-
-    @property
-    def seq_len(self) -> int: ...
+Binary decoder (model.py):
+  6. Task gene embeddings: pe_embedding(task_genes) → gene_embedding_layer → (B, P+N, d_model)
+  7. Concat [task_gene_embs, cell_emb_expanded, read_depth] → (B, P+N, d_model+output_dim+1)
+  8. Two SkipBlocks + Linear(1) → (B, P+N, 1) predictions
+  9. MMD loss (energy distance)
 ```
 
-The model receives tokens from the tokenizer and runs: `CLS + transformer(tokens) → CLS embedding → decoder → reconstruction`.
+### Key design properties
+- **Sparse**: only measured genes materialized — no (B, n_genes, d_model) dense intermediate
+- **Scales to 200K+ genes**: cost depends on measured genes per cell (k), not vocabulary size
+- **ESM2 cross-species bridge**: orthologs with similar protein sequences get similar K/V vectors in cross-attention
+- **Missing genes are absent, not padded**: correct inductive bias for scRNA-seq
+- **Top-K truncation**: only top 4096 expressed genes enter cross-attention; task genes still sampled from all measured genes
+- **num_downsample**: duplicates each cell N times in the batch for better MMD distribution estimation (costs Nx in unique cell throughput)
 
-### Implementation 1: SentenceTokenizer (current approach, preserves pretrained model)
-
-This wraps the existing logic — no behavior change, just extraction into a clean interface.
-
-**Collator output**: sampled gene indices (P+N or P+N+S), counts, sentence indices
-**Tokenizer**:
-1. Look up frozen protein embeddings: `pe_embedding(gene_indices)` → (B, 2048, 5120)
-2. Project: `encoder(5120 → d_model)` → (B, 2048, 512)
-3. Add count embeddings (soft binning)
-4. Prepend CLS token
-
-**Output**: (B, 2048, 512) — explicit gene tokens
-**Attention cost**: O(2048² × 512) per layer = 2.1B ops
-
-### Implementation 2: LatentTokenizer (new, latent bottleneck)
-
-**Collator output**: global-aligned count vector (19,790-dim) + measurement mask
-**Tokenizer**:
-1. Build per-gene tokens: for each of the 19,790 gene positions:
-   - **Measured gene**: `gene_emb[i] + count_emb(count_i)` (protein embedding + count encoding, same as current)
-   - **Unmeasured gene**: `missing_emb[i]` (learned per-position embedding, replaces the entire token)
-2. Project to latent tokens: `Linear(19790 × token_dim → n_latent × d_model)` or cross-attention
-3. Prepend CLS token
-
-**Output**: (B, n_latent, d_model) — e.g., (B, 128, 512)
-**Attention cost**: O(128² × 512) per layer = 8.4M ops (**250x cheaper than SentenceTokenizer**)
-
-Key design decisions:
-- **n_latent**: number of latent tokens (try 64, 128, 256)
-- **d_model (emsize)**: reuse existing 512 for both tokenizers
-- **Missing embedding**: learned per-gene-position `nn.Parameter(19790, token_dim)`, used in place of both gene_emb and count_emb when gene is unmeasured
-- **Reconstruction target**: same as current — predict expression for queried genes via binary_decoder
-- **Gene-to-latent projection**: start with a simple linear; can try cross-attention later if needed
-
-### Collator changes for LatentTokenizer
-
-The collator produces a global-aligned count vector using the existing `ds_emb_map`:
-```python
-# For each cell:
-global_counts = torch.zeros(19790)
-measurement_mask = torch.zeros(19790, dtype=torch.bool)
-valid = ds_emb_map[dataset] != -1
-global_counts[ds_emb_map[dataset][valid]] = log1p_counts[valid]
-measurement_mask[ds_emb_map[dataset][valid]] = True
+### Config defaults
+```yaml
+model.tokenizer: sentence    # or "latent"
+model.n_latent: 256          # latent query count
+model.k_top: 4096            # top-K genes for cross-attention (null = all)
+model.num_downsample: 1      # MMD augmentation factor
+model.emsize: 512            # d_model
+model.nlayers: 8             # transformer layers
+model.nhead: 16
+model.batch_size: 128
+loss.name: mmd
+loss.kernel: energy
 ```
-No data reprocessing needed — `ds_emb_map` from preprocessing already provides the mapping.
 
-### FLOP-Efficiency Comparison
+### Usage
+```bash
+# LatentTokenizer (recommended)
+python -m src.state emb fit experiment.name=latent_256 model.tokenizer=latent
 
-The campaign's central experiment: **at equal FLOP budgets, which tokenizer achieves lower validation loss?**
+# 100M scale
+python -m src.state emb fit experiment.name=latent_100M model.tokenizer=latent model.emsize=1024 model.d_hid=2048 model.output_dim=1024
 
-| Metric | SentenceTokenizer | LatentTokenizer (n=128) |
-|--------|-------------------|------------------------|
-| Attention FLOPs/layer | 2.1B | 8.4M |
-| Ratio | 250x | 1x |
-| Estimated throughput | ~256 cells/sec | ~5,000+ cells/sec (projected) |
-| 1 epoch (167M cells) | ~7.5 days | ~9 hours (projected) |
+# 600M scale
+python -m src.state emb fit experiment.name=latent_600M model.tokenizer=latent model.emsize=2048 model.d_hid=4096 model.output_dim=2048 model.nlayers=16
 
-If LatentTokenizer reaches comparable val loss at 10x fewer FLOPs, it's the strictly better vehicle for scaling.
+# With top-K override
+python -m src.state emb fit experiment.name=test model.tokenizer=latent model.k_top=2048
+```
 
-## SE vs Stack Reference
+## Benchmarks (single H100, bf16-mixed, 2025-03-23)
 
-| | Stack (StateICL) | SE (SentenceTokenizer) | SE (LatentTokenizer, projected) |
-|---|---|---|---|
-| Attention seq len | 100 latent tokens | 2048 gene tokens | 128 latent tokens |
-| Token dim | 16 | 512 | 512 (d_model) |
-| Attention cost/layer | O(100² × 16) = 160K | O(2048² × 512) = 2.1B | O(128² × 512) = 8.4M |
-| Missing gene handling | zeros | N/A (sampled genes only) | learned per-position embedding |
-| Protein embeddings | none | ESM2 5120-dim | ESM2 (for measured genes) + learned missing |
+### Throughput by scale (LatentTokenizer, k_top=4096)
+| Scale | d_model | nlayers | B | ds | cells/sec | Mem GB | Params |
+|-------|---------|---------|---|----|-----------|--------|--------|
+| 30M   | 512     | 8       | 128 | 1 | **787** | 16.5 | 38M |
+| 100M  | 1024    | 8       | 128 | 1 | **388** | 27.7 | 132M |
+| 100M  | 1024    | 8       | 32  | 4 | **97**  | ~28  | 132M |
+| 600M  | 2048    | 16      | 64  | 1 | **107** | 36.4 | 755M |
+| 600M  | 2048    | 16      | 32  | 4 | **27**  | 67.6 | 755M |
+
+- num_downsample=4 costs exactly 4x in unique cell throughput (expected)
+- 600M model fits on single H100 thanks to k_top=4096
+
+### Effect of k_top (LatentTokenizer, bf16-mixed, ds=1)
+| d_model | k_top | B | cells/sec | Mem GB | Speedup |
+|---------|-------|---|-----------|--------|---------|
+| 512     | all (~19K) | 128 | 608 | 41.2 | baseline |
+| 512     | 4096 | 128 | 787 | 16.5 | 1.3x, 60% less memory |
+| 1024    | all (~19K) | 64 | 261 | 37.0 | baseline (OOMs at B=128) |
+| 1024    | 4096 | 128 | 388 | 27.7 | 1.5x + enables B=128 |
+
+### Sentence vs Latent comparison (k_top=all, ds=1)
+| Tokenizer | d_model | B | cells/sec | Mem GB |
+|-----------|---------|---|-----------|--------|
+| sentence  | 512     | 128 | 255 | 53.6 |
+| latent    | 512     | 128 | 608 | 41.2 |
+| sentence  | 1024    | 64  | 129 | 48.4 |
+| latent    | 1024    | 128 | 388 | 27.7 |
+
+Latent is **2.4x** faster at d=512, **3x** at d=1024 (including batch size gains).
 
 ## Next Optimization Opportunities
 
@@ -141,23 +131,14 @@ If LatentTokenizer reaches comparable val loss at 10x fewer FLOPs, it's the stri
 - Replace AdamW; already used in TX model
 - Cheaper per-step updates, potentially better convergence
 
-### Latest Benchmarks (H100, bf16-mixed, latent tokenizer, k_top=4096)
-
-| Scale | d_model | nlayers | B | ds | cells/sec | Mem GB | Params |
-|-------|---------|---------|---|----|-----------|--------|--------|
-| 30M   | 512     | 8       | 128 | 1 | **787** | 16.5 | 38M |
-| 100M  | 1024    | 8       | 128 | 1 | **388** | 27.7 | 132M |
-| 100M  | 1024    | 8       | 32  | 4 | **97**  | ~28  | 132M |
-| 600M  | 2048    | 16      | 64  | 1 | **107** | 36.4 | 755M |
-| 600M  | 2048    | 16      | 32  | 4 | **27**  | 67.6 | 755M |
-
-- num_downsample=4 costs exactly 4x in unique cell throughput (expected)
-- 600M model fits on single H100 thanks to k_top=4096
-
 ## Completed Optimizations
+- [x] Tokenizer abstraction (SentenceTokenizer + LatentTokenizer)
+- [x] Sparse Perceiver cross-attention (only measured genes materialized)
+- [x] Top-K gene truncation (k_top=4096 default)
+- [x] num_downsample support in LatentCollator
 - [x] Loss init once in __init__ (not every step)
 - [x] LR scheduler double-stepping fix
-- [x] CollatedBatch NamedTuple (clarity)
+- [x] CollatedBatch / LatentBatch NamedTuples
 - [x] Cache ds_emb_idxs tensors in collator
 - [x] expand() instead of repeat() in resize_batch + shared_step
 - [x] Reduce logging frequency
@@ -171,3 +152,4 @@ If LatentTokenizer reaches comparable val loss at 10x fewer FLOPs, it's the stri
 - [x] Add pin_memory + prefetch_factor to val DataLoader
 - [x] Increase default batch_size from 96 to 128
 - [x] Require experiment.name for training
+- [x] task_counts moved to GPU in both tokenizers
