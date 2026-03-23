@@ -16,6 +16,7 @@ experiment:
   port: 12400
   val_check_interval: 10000
   limit_val_batches: 500
+  strategy: ddp
   ddp_timeout: 3600
   checkpoint:
     path: /checkpoints/se_pretrain

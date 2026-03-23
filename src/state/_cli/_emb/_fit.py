@@ -28,9 +28,12 @@ def run_emb_fit(cfg, args):
         cfg = OmegaConf.load(args.conf)
 
     # Process the remaining command line arguments as overrides
+    # Filter out scale= which is handled by load_hydra_config
     if args.hydra_overrides:
-        overrides = OmegaConf.from_dotlist(args.hydra_overrides)
-        cfg = OmegaConf.merge(cfg, overrides)
+        filtered = [o for o in args.hydra_overrides if not o.startswith("scale=")]
+        if filtered:
+            overrides = OmegaConf.from_dotlist(filtered)
+            cfg = OmegaConf.merge(cfg, overrides)
 
     # Validate required configuration
     if cfg.embeddings.current is None:

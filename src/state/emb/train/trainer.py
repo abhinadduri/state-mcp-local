@@ -8,7 +8,7 @@ from datetime import timedelta
 
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.strategies import DDPStrategy
+from lightning.pytorch.strategies import DDPStrategy, FSDPStrategy
 
 from ..nn.model import StateEmbeddingModel
 from ..nn.tokenizer import SentenceTokenizer, LatentTokenizer
@@ -198,6 +198,27 @@ def main(cfg):
         max_steps = cfg.experiment.profile.max_steps
 
     val_interval = int(cfg.experiment.val_check_interval * cfg.experiment.num_gpus_per_node * cfg.experiment.num_nodes)
+
+    strategy_name = cfg.experiment.get("strategy", "ddp").lower()
+    if strategy_name == "fsdp":
+        from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+        from ..nn.flash_transformer import FlashTransformerEncoderLayer
+        from ..nn.tokenizer import CrossAttentionBlock
+
+        strategy = FSDPStrategy(
+            auto_wrap_policy=ModuleWrapPolicy({FlashTransformerEncoderLayer, CrossAttentionBlock}),
+            sharding_strategy="FULL_SHARD",
+            process_group_backend="nccl",
+            timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
+        )
+        print(f"Using FSDP (FULL_SHARD) wrapping FlashTransformerEncoderLayer + CrossAttentionBlock")
+    else:
+        strategy = DDPStrategy(
+            process_group_backend="nccl",
+            find_unused_parameters=False,
+            timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
+        )
+
     trainer = L.Trainer(
         max_epochs=cfg.experiment.num_epochs,
         max_steps=max_steps,
@@ -208,11 +229,7 @@ def main(cfg):
         gradient_clip_val=cfg.optimizer.max_grad_norm,
         accumulate_grad_batches=cfg.optimizer.gradient_accumulation_steps,
         precision="bf16-mixed",
-        strategy=DDPStrategy(
-            process_group_backend="nccl",
-            find_unused_parameters=False,
-            timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
-        ),
+        strategy=strategy,
         val_check_interval=val_interval,
         # Logging
         logger=exp_logger,

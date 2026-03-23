@@ -248,6 +248,10 @@ class StateEmbeddingModel(L.LightningModule):
 
         return self.binary_decoder(combine)
 
+    def forward(self, batch, batch_idx=0):
+        """Forward pass for FSDP compatibility — delegates to shared_step."""
+        return self.shared_step(batch, batch_idx)
+
     def shared_step(self, batch, batch_idx):
         out = self.tokenizer(batch)
 
