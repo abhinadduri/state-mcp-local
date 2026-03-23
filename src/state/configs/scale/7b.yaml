@@ -1,0 +1,11 @@
+# SE 7B scale — 6.77B params, ~20 c/s on H100, MFU 44%
+model:
+  emsize: 4096
+  d_hid: 16384
+  output_dim: 4096
+  nlayers: 32
+  nhead: 64
+  n_latent: 512
+  n_cross_attn_rounds: 2
+  batch_size: 8
+  gradient_checkpointing: false

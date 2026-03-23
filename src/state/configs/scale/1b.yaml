@@ -1,0 +1,11 @@
+# SE 1B scale — 1.09B params, ~165 c/s on H100, MFU 44%
+model:
+  emsize: 2048
+  d_hid: 8192
+  output_dim: 2048
+  nlayers: 20
+  nhead: 32
+  n_latent: 384
+  n_cross_attn_rounds: 1
+  batch_size: 64
+  gradient_checkpointing: false

@@ -1,0 +1,11 @@
+# SE 4B scale — 3.82B params, ~38 c/s on H100, MFU 47%
+model:
+  emsize: 3072
+  d_hid: 12288
+  output_dim: 3072
+  nlayers: 32
+  nhead: 48
+  n_latent: 512
+  n_cross_attn_rounds: 2
+  batch_size: 16
+  gradient_checkpointing: false

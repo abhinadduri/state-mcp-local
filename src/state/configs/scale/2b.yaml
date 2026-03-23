@@ -1,0 +1,11 @@
+# SE 2B scale — 1.71B params, ~99 c/s on H100, MFU 42%
+model:
+  emsize: 2048
+  d_hid: 8192
+  output_dim: 2048
+  nlayers: 32
+  nhead: 32
+  n_latent: 384
+  n_cross_attn_rounds: 2
+  batch_size: 32
+  gradient_checkpointing: false

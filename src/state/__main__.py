@@ -1,7 +1,7 @@
 import argparse as ap
 
 from hydra import compose, initialize
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from ._cli import (
     add_arguments_emb,
@@ -30,20 +30,50 @@ def get_args() -> tuple[ap.Namespace, list[str]]:
 
 
 def load_hydra_config(method: str, overrides: list[str] = None) -> DictConfig:
-    """Load Hydra config with optional overrides"""
+    """Load Hydra config with optional overrides.
+
+    Supports scale= shorthand for SE model:
+        python -m src.state emb fit scale=2b experiment.name=my_run
+    This loads configs/scale/2b.yaml and merges its model overrides
+    before applying remaining CLI overrides.
+    """
     if overrides is None:
         overrides = []
+
+    # Extract scale= override if present (not a Hydra config group, just a convenience)
+    scale_name = None
+    remaining_overrides = []
+    for o in overrides:
+        if o.startswith("scale="):
+            scale_name = o.split("=", 1)[1]
+        else:
+            remaining_overrides.append(o)
 
     # Initialize Hydra with the path to your configs directory
     # Adjust the path based on where this file is relative to configs/
     with initialize(version_base=None, config_path="configs"):
         match method:
             case "emb":
-                cfg = compose(config_name="state-defaults", overrides=overrides)
+                cfg = compose(config_name="state-defaults", overrides=remaining_overrides)
             case "tx":
-                cfg = compose(config_name="config", overrides=overrides)
+                cfg = compose(config_name="config", overrides=remaining_overrides)
             case _:
                 raise ValueError(f"Unknown method: {method}")
+
+    # Merge scale config if specified
+    if scale_name is not None:
+        from pathlib import Path
+        scale_path = Path(__file__).parent / "configs" / "scale" / f"{scale_name}.yaml"
+        if not scale_path.exists():
+            available = [f.stem for f in scale_path.parent.glob("*.yaml")]
+            raise ValueError(f"Unknown scale '{scale_name}'. Available: {available}")
+        scale_cfg = OmegaConf.load(scale_path)
+        cfg = OmegaConf.merge(cfg, scale_cfg)
+        # Re-apply CLI overrides so they take precedence over the scale config
+        if remaining_overrides:
+            cli_overrides = OmegaConf.from_dotlist(remaining_overrides)
+            cfg = OmegaConf.merge(cfg, cli_overrides)
+
     return cfg
 
 

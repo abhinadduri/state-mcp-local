@@ -1,0 +1,11 @@
+# SE 30M scale — 31M params, ~2700 c/s on H100, MFU 17%
+model:
+  emsize: 512
+  d_hid: 1024
+  output_dim: 512
+  nlayers: 8
+  nhead: 16
+  n_latent: 256
+  n_cross_attn_rounds: 1
+  batch_size: 256
+  gradient_checkpointing: false

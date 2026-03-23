@@ -1,0 +1,11 @@
+# SE 100M scale — 100M params, ~1580 c/s on H100, MFU 30%
+model:
+  emsize: 1024
+  d_hid: 2048
+  output_dim: 1024
+  nlayers: 8
+  nhead: 16
+  n_latent: 256
+  n_cross_attn_rounds: 1
+  batch_size: 256
+  gradient_checkpointing: false

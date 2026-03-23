@@ -1,0 +1,11 @@
+# SE 600M scale — 622M params, ~400 c/s on H100, MFU 43%
+model:
+  emsize: 2048
+  d_hid: 4096
+  output_dim: 2048
+  nlayers: 16
+  nhead: 16
+  n_latent: 256
+  n_cross_attn_rounds: 1
+  batch_size: 128
+  gradient_checkpointing: false
