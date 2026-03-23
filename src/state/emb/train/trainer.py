@@ -139,24 +139,42 @@ def main(cfg):
     train_collator.cfg = cfg
     val_collator.cfg = cfg
     model.collater = val_collator
-    model = model.cuda()
 
-    # Load frozen protein embeddings onto the tokenizer (bf16 to avoid dtype conversion)
-    all_pe = get_embeddings(cfg)
-    all_pe = all_pe.to(torch.bfloat16)
-    all_pe.requires_grad = False
-    model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
+    strategy_name = cfg.experiment.get("strategy", "ddp").lower()
+    use_fsdp = strategy_name == "fsdp"
 
-    # Compile after pe_embedding is set so the cache can be populated first.
-    # Full-module compile gives 1.25x vs 1.16x for individual submodules.
-    if compiled:
-        # Populate the ESM2 projection cache before compile to avoid graph breaks
-        # Use autocast since pe_embedding is bf16 but encoder weights are fp32
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
-        model.tokenizer = torch.compile(model.tokenizer)
-        model._decode = torch.compile(model._decode)
-        print(f"Compiled tokenizer and _decode with torch.compile")
+    if use_fsdp:
+        # FSDP: keep model on CPU — Lightning shards across GPUs (each gets 1/8 of params).
+        # Loading the full 7B model onto a single GPU before sharding would OOM.
+        # pe_embedding is loaded on CPU and moved to GPU by FSDP.
+        all_pe = torch.load(get_embedding_cfg(cfg).all_embeddings, weights_only=False)
+        if isinstance(all_pe, dict):
+            all_pe = torch.vstack(list(all_pe.values()))
+        all_pe = all_pe.to(torch.bfloat16)
+        all_pe.requires_grad = False
+        model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
+        # Skip torch.compile — FSDP1 + compile has compatibility issues.
+        # ESM2 projection cache will be populated lazily on first forward.
+        print(f"FSDP mode: model on CPU, pe_embedding loaded, skipping compile")
+    else:
+        model = model.cuda()
+
+        # Load frozen protein embeddings onto the tokenizer (bf16 to avoid dtype conversion)
+        all_pe = get_embeddings(cfg)
+        all_pe = all_pe.to(torch.bfloat16)
+        all_pe.requires_grad = False
+        model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
+
+        # Compile after pe_embedding is set so the cache can be populated first.
+        # Full-module compile gives 1.25x vs 1.16x for individual submodules.
+        if compiled:
+            # Populate the ESM2 projection cache before compile to avoid graph breaks
+            # Use autocast since pe_embedding is bf16 but encoder weights are fp32
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
+            model.tokenizer = torch.compile(model.tokenizer)
+            model._decode = torch.compile(model._decode)
+            print(f"Compiled tokenizer and _decode with torch.compile")
 
     model = model.train()
 
@@ -204,6 +222,21 @@ def main(cfg):
         from torch.distributed.fsdp.wrap import ModuleWrapPolicy
         from ..nn.flash_transformer import FlashTransformerEncoderLayer
         from ..nn.tokenizer import CrossAttentionBlock
+
+        # Detach frozen pe_embedding (bf16) before FSDP wrapping to avoid
+        # mixed-dtype flattening error. Re-attach after FSDP setup.
+        _pe_embedding = model.tokenizer.pe_embedding
+        model.tokenizer.pe_embedding = None
+
+        class _ReattachPECallback(L.Callback):
+            """Re-attach pe_embedding after FSDP wraps the model."""
+            def __init__(self, pe_emb):
+                self._pe_emb = pe_emb
+            def on_fit_start(self, trainer, pl_module):
+                device = next(pl_module.parameters()).device
+                pl_module.tokenizer.pe_embedding = self._pe_emb.to(device)
+
+        callbacks.append(_ReattachPECallback(_pe_embedding))
 
         strategy = FSDPStrategy(
             auto_wrap_policy=ModuleWrapPolicy({FlashTransformerEncoderLayer, CrossAttentionBlock}),
