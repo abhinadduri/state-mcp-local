@@ -226,7 +226,7 @@ model:
   variable_masking: true
   tokenizer: sentence
   n_latent: 256
-  k_top: null
+  k_top: 4096
 task:
   mask: 0.2
 optimizer:
