@@ -145,7 +145,7 @@ class SentenceTokenizer(Tokenizer):
 
         batch_sentences = batch.batch_sentences.to(device)
         task_genes = batch.task_genes.to(device)
-        task_counts = batch.task_counts
+        task_counts = batch.task_counts.to(device)
         sentence_counts = batch.sentence_counts
         if sentence_counts is not None:
             sentence_counts = sentence_counts.to(device)
@@ -230,12 +230,13 @@ class LatentCollator:
     Samples P+N task genes for reconstruction.
     """
 
-    def __init__(self, cfg, ds_emb_mapping, n_genes: int, is_train: bool = True):
+    def __init__(self, cfg, ds_emb_mapping, n_genes: int, is_train: bool = True, k_top: Optional[int] = None):
         self.cfg = cfg
         self.P = cfg.dataset.P
         self.N = cfg.dataset.N
         self.n_genes = n_genes
         self.is_train = is_train
+        self.k_top = k_top  # if set, keep only top-k expressed genes for cross-attention
         self.use_dataset_info = getattr(cfg.model, "dataset_correction", False)
 
         # Pre-compute per-dataset mappings as tensors
@@ -300,6 +301,13 @@ class LatentCollator:
         task_counts = idx_to_count[task_genes.long()]
         return task_genes, task_counts
 
+    def _truncate_top_k(self, gene_indices: torch.Tensor, gene_counts: torch.Tensor):
+        """Keep only the top k_top genes by expression count."""
+        if self.k_top is None or len(gene_indices) <= self.k_top:
+            return gene_indices, gene_counts
+        _, top_idx = torch.topk(gene_counts, self.k_top)
+        return gene_indices[top_idx], gene_counts[top_idx]
+
     def __call__(self, batch):
         batch_size = len(batch)
         cells = []  # list of (gene_indices, gene_counts) per cell
@@ -309,7 +317,10 @@ class LatentCollator:
 
         for i, (counts, idx, dataset, dataset_num) in enumerate(batch):
             gi, gc = self._process_cell(counts, dataset)
+            # Sample task genes from ALL measured genes (before truncation)
             tg, tc = self._sample_task_genes(gi, gc)
+            # Truncate to top-k for cross-attention input
+            gi, gc = self._truncate_top_k(gi, gc)
             cells.append((gi, gc))
             task_genes_list.append(tg)
             task_counts_list.append(tc)
@@ -441,11 +452,13 @@ class LatentTokenizer(Tokenizer):
             utils.get_embedding_cfg(cfg).ds_emb_mapping.format(utils.get_embedding_cfg(cfg).size),
             weights_only=False,
         )
+        k_top = getattr(cfg.model, "k_top", None)
         return LatentCollator(
             cfg=cfg,
             ds_emb_mapping=ds_emb_mapping,
             n_genes=self.n_genes,
             is_train=is_train,
+            k_top=k_top,
         )
 
     def _get_esm2_proj_table(self, device):
@@ -467,7 +480,7 @@ class LatentTokenizer(Tokenizer):
         gene_counts = batch.gene_counts.to(device)  # [B, k_max]
         gene_mask = batch.gene_mask.to(device)  # [B, k_max] bool
         task_genes = batch.task_genes.to(device)
-        task_counts = batch.task_counts
+        task_counts = batch.task_counts.to(device)
         dataset_nums = batch.dataset_nums
         if dataset_nums is not None:
             dataset_nums = dataset_nums.to(device)
