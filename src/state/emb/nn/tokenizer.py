@@ -98,8 +98,9 @@ class SentenceTokenizer(Tokenizer):
         )
 
         # Transformer
+        grad_ckpt = cfg and getattr(cfg.model, "gradient_checkpointing", False)
         layers = [FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout) for _ in range(nlayers)]
-        self.transformer_encoder = FlashTransformerEncoder(layers)
+        self.transformer_encoder = FlashTransformerEncoder(layers, gradient_checkpointing=grad_ckpt)
         if compiled:
             self.transformer_encoder = torch.compile(self.transformer_encoder)
 
@@ -386,6 +387,7 @@ class LatentTokenizer(Tokenizer):
         self.n_latent = n_latent
         self.d_model = d_model
         self.output_dim = output_dim
+        self._gradient_checkpointing = cfg and getattr(cfg.model, "gradient_checkpointing", False)
 
         # Encoder: projects protein embedding dim → d_model (shared with task gene embedding)
         self.encoder = nn.Sequential(
@@ -431,7 +433,7 @@ class LatentTokenizer(Tokenizer):
 
         # Self-attention transformer (operates on n_latent + CLS tokens)
         layers = [FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout) for _ in range(nlayers)]
-        self.transformer_encoder = FlashTransformerEncoder(layers)
+        self.transformer_encoder = FlashTransformerEncoder(layers, gradient_checkpointing=self._gradient_checkpointing)
         if compiled:
             self.transformer_encoder = torch.compile(self.transformer_encoder)
 
@@ -465,6 +467,28 @@ class LatentTokenizer(Tokenizer):
             k_top=k_top,
         )
 
+    def _cross_attention(self, queries, gene_tokens, gene_mask, B, k_max):
+        """Cross-attention: latent queries attend to sparse gene tokens."""
+        q = self.cross_q_proj(queries)  # [B, n_latent, d_model]
+        kv = self.cross_kv_proj(gene_tokens)  # [B, k_max, 2*d_model]
+        k, v = kv.chunk(2, dim=-1)
+
+        q = q.view(B, self.n_latent, self.nhead, self.head_dim).transpose(1, 2)
+        k = k.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
+
+        if not gene_mask.all():
+            padding_mask = gene_mask.unsqueeze(-1)
+            k = k * padding_mask.unsqueeze(1)
+            v = v * padding_mask.unsqueeze(1)
+
+        dropout_p = self.cross_dropout if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, self.n_latent, self.d_model)
+        attn_out = self.cross_out_proj(attn_out)
+        return self.cross_norm(queries + attn_out)
+
     def _get_esm2_proj_table(self, device):
         """Compute encoder(pe_embedding) for all genes once and cache as frozen buffer."""
         if self._esm2_proj_cache is not None and self._esm2_proj_cache.device == device:
@@ -473,8 +497,8 @@ class LatentTokenizer(Tokenizer):
         with torch.no_grad():
             all_indices = torch.arange(self.n_genes, device=device)
             pe_out = self.pe_embedding(all_indices)  # [n_genes, token_dim]
-            proj = self.encoder(pe_out)  # [n_genes, d_model]
-        self._esm2_proj_cache = proj  # frozen, no grad
+            proj = self.encoder(pe_out).to(torch.bfloat16)  # [n_genes, d_model], bf16 to avoid dtype casts
+        self._esm2_proj_cache = proj  # frozen, no grad, bf16
         return self._esm2_proj_cache
 
     def forward(self, batch: LatentBatch) -> TokenizerOutput:
@@ -511,33 +535,14 @@ class LatentTokenizer(Tokenizer):
         # --- Cross-attention: latent queries attend to sparse gene tokens ---
         queries = self.latent_queries.unsqueeze(0).expand(B, -1, -1)  # [B, n_latent, d_model]
 
-        # Project Q, K, V and reshape for multi-head attention
-        q = self.cross_q_proj(queries)  # [B, n_latent, d_model]
-        kv = self.cross_kv_proj(gene_tokens)  # [B, k_max, 2*d_model]
-        k, v = kv.chunk(2, dim=-1)  # each [B, k_max, d_model]
-
-        # Reshape to (B, nhead, seq, head_dim) for SDPA
-        q = q.view(B, self.n_latent, self.nhead, self.head_dim).transpose(1, 2)
-        k = k.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
-        v = v.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
-
-        # Zero out padded key/value positions so they contribute nothing,
-        # then run SDPA without an explicit mask (enables flash attention backend).
-        # Skip when all cells have the same length (common with k_top truncation).
-        if not gene_mask.all():
-            padding_mask = gene_mask.unsqueeze(-1)  # [B, k_max, 1]
-            k = k * padding_mask.unsqueeze(1)  # broadcast over heads: [B, nhead, k_max, head_dim]
-            v = v * padding_mask.unsqueeze(1)
-
-        # Flash/mem-efficient cross-attention (no attn_mask = flash-eligible)
-        dropout_p = self.cross_dropout if self.training else 0.0
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-
-        # Merge heads and project
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, self.n_latent, self.d_model)
-        attn_out = self.cross_out_proj(attn_out)
-
-        latent_tokens = self.cross_norm(queries + attn_out)  # residual + norm
+        if self._gradient_checkpointing and self.training:
+            from torch.utils.checkpoint import checkpoint
+            latent_tokens = checkpoint(
+                self._cross_attention, queries, gene_tokens, gene_mask, B, k_max,
+                use_reentrant=False,
+            )
+        else:
+            latent_tokens = self._cross_attention(queries, gene_tokens, gene_mask, B, k_max)
 
         # --- Prepend CLS token (+ optional dataset token) ---
         cls = self.cls_token.unsqueeze(0).expand(B, 1, -1)  # [B, 1, d_model]

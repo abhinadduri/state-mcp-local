@@ -141,8 +141,9 @@ def main(cfg):
     model.collater = val_collator
     model = model.cuda()
 
-    # Load frozen protein embeddings onto the tokenizer
+    # Load frozen protein embeddings onto the tokenizer (bf16 to avoid dtype conversion)
     all_pe = get_embeddings(cfg)
+    all_pe = all_pe.to(torch.bfloat16)
     all_pe.requires_grad = False
     model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
 

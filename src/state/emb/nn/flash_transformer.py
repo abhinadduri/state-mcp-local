@@ -6,6 +6,7 @@ This module implements a Transformer encoder layer.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class FlashTransformerEncoderLayer(nn.Module):
@@ -81,14 +82,16 @@ class FlashTransformerEncoderLayer(nn.Module):
 
 
 class FlashTransformerEncoder(nn.Module):
-    def __init__(self, layers):
+    def __init__(self, layers, gradient_checkpointing=False):
         """
         A simple encoder that applies a stack of FlashTransformerEncoderLayer instances.
         Args:
             layers (list[nn.Module]): list of FlashTransformerEncoderLayer instances.
+            gradient_checkpointing (bool): if True, checkpoint each layer to save memory.
         """
         super().__init__()
         self.layers = nn.ModuleList(layers)
+        self.gradient_checkpointing = gradient_checkpointing
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
         """
@@ -104,5 +107,8 @@ class FlashTransformerEncoder(nn.Module):
         mask = src_key_padding_mask if src_key_padding_mask is not None else src_mask
         output = src
         for layer in self.layers:
-            output = layer(output, src_mask=mask, src_key_padding_mask=mask)
+            if self.gradient_checkpointing and self.training:
+                output = checkpoint(layer, output, mask, mask, use_reentrant=False)
+            else:
+                output = layer(output, src_mask=mask, src_key_padding_mask=mask)
         return output
