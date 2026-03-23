@@ -224,6 +224,8 @@ model:
   batch_tabular_loss: false
   num_downsample: 1
   variable_masking: true
+  tokenizer: sentence
+  n_latent: 128
 task:
   mask: 0.2
 optimizer:

@@ -11,7 +11,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
 
 from ..nn.model import StateEmbeddingModel
-from ..nn.tokenizer import SentenceTokenizer
+from ..nn.tokenizer import SentenceTokenizer, LatentTokenizer
 from ..data import H5adSentenceDataset
 from ..train.callbacks import (
     LogLR,
@@ -43,17 +43,35 @@ def main(cfg):
     warmup_steps = EPOCH_LENGTH * 6
 
     # --- Build tokenizer ---
-    tokenizer = SentenceTokenizer(
-        token_dim=get_embedding_cfg(cfg).size,
-        d_model=cfg.model.emsize,
-        nhead=cfg.model.nhead,
-        d_hid=cfg.model.d_hid,
-        nlayers=cfg.model.nlayers,
-        output_dim=cfg.model.output_dim,
-        dropout=cfg.model.dropout,
-        compiled=False,
-        cfg=cfg,
-    )
+    tokenizer_type = getattr(cfg.model, "tokenizer", "sentence")
+    if tokenizer_type == "latent":
+        n_latent = getattr(cfg.model, "n_latent", 128)
+        tokenizer = LatentTokenizer(
+            n_genes=get_embedding_cfg(cfg).num,
+            n_latent=n_latent,
+            token_dim=get_embedding_cfg(cfg).size,
+            d_model=cfg.model.emsize,
+            nhead=cfg.model.nhead,
+            d_hid=cfg.model.d_hid,
+            nlayers=cfg.model.nlayers,
+            output_dim=cfg.model.output_dim,
+            dropout=cfg.model.dropout,
+            compiled=False,
+            cfg=cfg,
+        )
+        print(f"Using LatentTokenizer: n_genes={get_embedding_cfg(cfg).num}, n_latent={n_latent}")
+    else:
+        tokenizer = SentenceTokenizer(
+            token_dim=get_embedding_cfg(cfg).size,
+            d_model=cfg.model.emsize,
+            nhead=cfg.model.nhead,
+            d_hid=cfg.model.d_hid,
+            nlayers=cfg.model.nlayers,
+            output_dim=cfg.model.output_dim,
+            dropout=cfg.model.dropout,
+            compiled=False,
+            cfg=cfg,
+        )
 
     # --- Build collators from tokenizer ---
     train_collator = tokenizer.make_collator(cfg, is_train=True)
