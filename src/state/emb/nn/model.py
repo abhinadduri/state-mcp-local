@@ -219,7 +219,7 @@ class StateEmbeddingModel(L.LightningModule):
         out = self.tokenizer(batch)
         return out.task_gene_embs, out.task_counts, None, out.cell_embedding, out.dataset_emb
 
-    def _decode(self, X, Y, embs):
+    def _decode(self, X, Y, embs, ds_emb=None):
         """Core decoder path: project + concat + binary_decoder.
 
         Extracted for torch.compile — compiling this as one graph gives ~2% speedup
@@ -242,6 +242,10 @@ class StateEmbeddingModel(L.LightningModule):
         else:
             combine = torch.cat((X_dec, z), dim=2)
 
+        if ds_emb is not None:
+            ds_emb_expanded = ds_emb.unsqueeze(1).expand(-1, X.shape[1], -1)
+            combine = torch.cat((combine, ds_emb_expanded), dim=2)
+
         return self.binary_decoder(combine)
 
     def shared_step(self, batch, batch_idx):
@@ -252,24 +256,11 @@ class StateEmbeddingModel(L.LightningModule):
         embs = out.cell_embedding  # [B, output_dim]
         dataset_embs = out.dataset_emb  # [B, output_dim] or None
 
-        decs = self._decode(X, Y, embs)
-
+        ds_emb = None
         if self.dataset_embedder is not None and dataset_embs is not None:
             ds_emb = self.dataset_embedder(dataset_embs)
-            ds_emb_expanded = ds_emb.unsqueeze(1).expand(-1, X.shape[1], -1)
-            # Re-decode with dataset embedding (rare path, not compiled)
-            if self.gene_proj is not None:
-                X_dec = self.gene_proj(X)
-                z = self.cell_proj(embs).unsqueeze(1).expand(-1, X.shape[1], -1)
-            else:
-                X_dec, z = X, embs.unsqueeze(1).expand(-1, X.shape[1], -1)
-            if self.z_dim_rd == 1:
-                mu = torch.nan_to_num(torch.nanmean(Y.float().masked_fill(Y == 0, float("nan")), dim=1), nan=0.0)
-                rc = mu.unsqueeze(1).unsqueeze(2).expand(-1, X.shape[1], -1)
-                combine = torch.cat((X_dec, z, rc, ds_emb_expanded), dim=2)
-            else:
-                combine = torch.cat((X_dec, z, ds_emb_expanded), dim=2)
-            decs = self.binary_decoder(combine)
+
+        decs = self._decode(X, Y, embs, ds_emb=ds_emb)
 
         target = Y
         if self.cfg.loss.name in ("mmd", "tabular"):
