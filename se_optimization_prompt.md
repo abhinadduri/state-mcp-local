@@ -107,27 +107,52 @@ If LatentTokenizer reaches comparable val loss at 10x fewer FLOPs, it's the stri
 | Missing gene handling | zeros | N/A (sampled genes only) | learned per-position embedding |
 | Protein embeddings | none | ESM2 5120-dim | ESM2 (for measured genes) + learned missing |
 
-## Optimization Ideas (beyond tokenizer)
+## Next Optimization Opportunities
 
-### torch.compile
-- Model runs uncompiled; `@torch.compile(disable=True)` decorators on training_step
-- Expected 10-30% speedup from kernel fusion
-- Low risk, high reward for both tokenizers
+### 1. Simplify binary decoder (HIGH IMPACT)
+- `model.py:82-86` — two SkipBlocks applied to all 1024 task genes per cell
+- Input dim = output_dim + d_model + z_dim, scales quadratically with d_model
+- At 600M (d=2048): each SkipBlock is Linear(2571→5142)+Linear(5142→2571) × 1024 tokens × B — likely 30-50% of forward FLOPs
+- **Options**: (a) bilinear decoder `(cell_emb * W * gene_emb).sum()`, (b) project to small bottleneck dim (256) before concat, (c) single Linear→ReLU→Linear(1)
 
-### Muon optimizer
+### 2. Use ESM2 proj cache for task gene embeddings (HIGH IMPACT, trivial fix)
+- `tokenizer.py:564-566` — re-runs `Linear(5120→d_model)` on 1024 task tokens per cell
+- `_esm2_proj_cache` already has the projected result for all genes
+- **Fix**: `task_gene_embs = esm2_table[task_genes.long()]` instead of `gene_embedding_layer(pe_embedding(task_genes))`
+- Eliminates a full encoder forward on 1024×5120 tokens per step
+
+### 3. CLS-only decoding in tokenizer (MEDIUM-HIGH, trivial fix)
+- `tokenizer.py:552` — SkipBlock+Linear runs on all 257 tokens (256 latent + CLS), only CLS output used
+- 99% of tokenizer decoder compute is wasted
+- **Fix**: slice `output[:, 0:1, :]` before decoder, or `output[:, [0, -1], :]` if dataset_token
+
+### 4. torch.compile (MEDIUM)
+- `@torch.compile(disable=True)` on training_step/validation_step
+- `compiled=False` in tokenizer and model construction
+- Expected 20-40% from kernel fusion on H100 with bf16
+- Target: transformer_encoder, binary_decoder, cross-attention block
+
+### 5. Remove padding mask ops when k_top is set (MEDIUM, trivial fix)
+- `tokenizer.py:524-528` — `k * mask` and `v * mask` elementwise multiplies on (B, nhead, k_max, head_dim)
+- With k_top=4096, most/all cells have exactly 4096 genes (no padding), making the mask ops pure overhead
+- **Fix**: skip masking when k_top is set and all cells have >= k_top genes
+
+### 6. Muon optimizer (MEDIUM)
 - Replace AdamW; already used in TX model
 - Cheaper per-step updates, potentially better convergence
 
-### Consecutive data loading
-- Read consecutive cells from same H5AD file (like stack)
-- Currently hidden by 16 workers but will surface when LatentTokenizer makes compute cheap
+### Latest Benchmarks (H100, bf16-mixed, latent tokenizer, k_top=4096)
 
-### num_downsample > 1 for MMD
-- Currently num_downsample=1, which is degenerate for MMD (single-point distributions)
-- With LatentTokenizer's faster compute, can afford more augmentations per cell
+| Scale | d_model | nlayers | B | ds | cells/sec | Mem GB | Params |
+|-------|---------|---------|---|----|-----------|--------|--------|
+| 30M   | 512     | 8       | 128 | 1 | **787** | 16.5 | 38M |
+| 100M  | 1024    | 8       | 128 | 1 | **388** | 27.7 | 132M |
+| 100M  | 1024    | 8       | 32  | 4 | **97**  | ~28  | 132M |
+| 600M  | 2048    | 16      | 64  | 1 | **107** | 36.4 | 755M |
+| 600M  | 2048    | 16      | 32  | 4 | **27**  | 67.6 | 755M |
 
-## Known Issue: Padding mask intentionally unused
-The model is a CLS bottleneck learner, not a masked reconstruction task. All gene token positions (including "unexpressed" slots) carry signal for the CLS embedding. The padding mask in the collator is a vestige that should be removed for clarity.
+- num_downsample=4 costs exactly 4x in unique cell throughput (expected)
+- 600M model fits on single H100 thanks to k_top=4096
 
 ## Completed Optimizations
 - [x] Loss init once in __init__ (not every step)
