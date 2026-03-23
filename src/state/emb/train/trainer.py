@@ -151,7 +151,9 @@ def main(cfg):
     # Full-module compile gives 1.25x vs 1.16x for individual submodules.
     if compiled:
         # Populate the ESM2 projection cache before compile to avoid graph breaks
-        model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
+        # Use autocast since pe_embedding is bf16 but encoder weights are fp32
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
         model.tokenizer = torch.compile(model.tokenizer)
         model.binary_decoder = torch.compile(model.binary_decoder)
         print(f"Compiled tokenizer and binary_decoder with torch.compile")

@@ -494,11 +494,11 @@ class LatentTokenizer(Tokenizer):
         if self._esm2_proj_cache is not None and self._esm2_proj_cache.device == device:
             return self._esm2_proj_cache
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             all_indices = torch.arange(self.n_genes, device=device)
             pe_out = self.pe_embedding(all_indices)  # [n_genes, token_dim]
-            proj = self.encoder(pe_out).to(torch.bfloat16)  # [n_genes, d_model], bf16 to avoid dtype casts
-        self._esm2_proj_cache = proj  # frozen, no grad, bf16
+            proj = self.encoder(pe_out)  # [n_genes, d_model], bf16 under autocast
+        self._esm2_proj_cache = proj.to(torch.bfloat16)  # ensure bf16
         return self._esm2_proj_cache
 
     def forward(self, batch: LatentBatch) -> TokenizerOutput:
