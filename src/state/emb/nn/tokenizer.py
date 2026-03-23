@@ -353,6 +353,45 @@ class LatentCollator:
         )
 
 
+class CrossAttentionBlock(nn.Module):
+    """Single cross-attention round: queries attend to key-value tokens."""
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0):
+        super().__init__()
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.d_model = d_model
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.kv_proj = nn.Linear(d_model, d_model * 2)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = dropout
+
+    def forward(self, queries, kv_tokens, kv_mask):
+        B = queries.shape[0]
+        n_q = queries.shape[1]
+        k_max = kv_tokens.shape[1]
+
+        q = self.q_proj(queries)
+        kv = self.kv_proj(kv_tokens)
+        k, v = kv.chunk(2, dim=-1)
+
+        q = q.view(B, n_q, self.nhead, self.head_dim).transpose(1, 2)
+        k = k.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
+        v = v.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
+
+        if not kv_mask.all():
+            padding_mask = kv_mask.unsqueeze(-1)
+            k = k * padding_mask.unsqueeze(1)
+            v = v * padding_mask.unsqueeze(1)
+
+        dropout_p = self.dropout if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, n_q, self.d_model)
+        attn_out = self.out_proj(attn_out)
+        return self.norm(queries + attn_out)
+
+
 class LatentTokenizer(Tokenizer):
     """Sparse cross-attention from latent queries to measured gene tokens.
 
@@ -412,15 +451,14 @@ class LatentTokenizer(Tokenizer):
         # Learned latent queries — cross-attend to gene tokens
         self.latent_queries = nn.Parameter(torch.randn(n_latent, d_model) * 0.02)
 
-        # Cross-attention: latent queries (Q) attend to gene tokens (K, V)
-        # Using manual projections + F.scaled_dot_product_attention for flash/mem-efficient backends
+        # Cross-attention rounds: latent queries iteratively attend to gene tokens
+        n_cross_rounds = getattr(cfg.model, "n_cross_attn_rounds", 1) if cfg else 1
+        self.cross_attn_rounds = nn.ModuleList([
+            CrossAttentionBlock(d_model, nhead, dropout)
+            for _ in range(n_cross_rounds)
+        ])
         self.nhead = nhead
         self.head_dim = d_model // nhead
-        self.cross_q_proj = nn.Linear(d_model, d_model)
-        self.cross_kv_proj = nn.Linear(d_model, d_model * 2)
-        self.cross_out_proj = nn.Linear(d_model, d_model)
-        self.cross_norm = nn.LayerNorm(d_model)
-        self.cross_dropout = dropout
 
         # Learnable CLS token
         self.cls_token = nn.Parameter(torch.randn(1, d_model))
@@ -467,28 +505,6 @@ class LatentTokenizer(Tokenizer):
             k_top=k_top,
         )
 
-    def _cross_attention(self, queries, gene_tokens, gene_mask, B, k_max):
-        """Cross-attention: latent queries attend to sparse gene tokens."""
-        q = self.cross_q_proj(queries)  # [B, n_latent, d_model]
-        kv = self.cross_kv_proj(gene_tokens)  # [B, k_max, 2*d_model]
-        k, v = kv.chunk(2, dim=-1)
-
-        q = q.view(B, self.n_latent, self.nhead, self.head_dim).transpose(1, 2)
-        k = k.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
-        v = v.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
-
-        if not gene_mask.all():
-            padding_mask = gene_mask.unsqueeze(-1)
-            k = k * padding_mask.unsqueeze(1)
-            v = v * padding_mask.unsqueeze(1)
-
-        dropout_p = self.cross_dropout if self.training else 0.0
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-
-        attn_out = attn_out.transpose(1, 2).contiguous().view(B, self.n_latent, self.d_model)
-        attn_out = self.cross_out_proj(attn_out)
-        return self.cross_norm(queries + attn_out)
-
     def _get_esm2_proj_table(self, device):
         """Compute encoder(pe_embedding) for all genes once and cache as frozen buffer."""
         if self._esm2_proj_cache is not None and self._esm2_proj_cache.device == device:
@@ -532,17 +548,18 @@ class LatentTokenizer(Tokenizer):
 
         gene_tokens = gene_embs + count_emb  # [B, k_max, d_model]
 
-        # --- Cross-attention: latent queries attend to sparse gene tokens ---
-        queries = self.latent_queries.unsqueeze(0).expand(B, -1, -1)  # [B, n_latent, d_model]
+        # --- Cross-attention: latent queries iteratively attend to sparse gene tokens ---
+        latent_tokens = self.latent_queries.unsqueeze(0).expand(B, -1, -1)  # [B, n_latent, d_model]
 
-        if self._gradient_checkpointing and self.training:
-            from torch.utils.checkpoint import checkpoint
-            latent_tokens = checkpoint(
-                self._cross_attention, queries, gene_tokens, gene_mask, B, k_max,
-                use_reentrant=False,
-            )
-        else:
-            latent_tokens = self._cross_attention(queries, gene_tokens, gene_mask, B, k_max)
+        for cross_attn in self.cross_attn_rounds:
+            if self._gradient_checkpointing and self.training:
+                from torch.utils.checkpoint import checkpoint
+                latent_tokens = checkpoint(
+                    cross_attn, latent_tokens, gene_tokens, gene_mask,
+                    use_reentrant=False,
+                )
+            else:
+                latent_tokens = cross_attn(latent_tokens, gene_tokens, gene_mask)
 
         # --- Prepend CLS token (+ optional dataset token) ---
         cls = self.cls_token.unsqueeze(0).expand(B, 1, -1)  # [B, 1, d_model]
