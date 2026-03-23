@@ -25,6 +25,7 @@ experiment:
 wandb:
   enable: true
   project: vci
+  entity: arcinstitute
 embeddings:
   current: SE-167M
   esm2-cellxgene:

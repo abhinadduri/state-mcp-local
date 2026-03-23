@@ -174,7 +174,7 @@ def main(cfg):
         try:
             import wandb
 
-            exp_logger = WandbLogger(project=cfg.wandb.project, name=cfg.experiment.name)
+            exp_logger = WandbLogger(project=cfg.wandb.project, entity=cfg.wandb.entity, name=cfg.experiment.name)
             exp_logger.watch(model, log_freq=1000)
         except ImportError:
             print("Warning: wandb is not installed. Skipping wandb logging.")
