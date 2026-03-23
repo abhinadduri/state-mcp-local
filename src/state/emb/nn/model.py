@@ -297,8 +297,33 @@ class StateEmbeddingModel(L.LightningModule):
 
     def configure_optimizers(self):
         max_lr = self.max_lr
-        trainable_params = [p for p in self.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=self.cfg.optimizer.weight_decay)
+        weight_decay = self.cfg.optimizer.weight_decay
+        optimizer_name = getattr(self.cfg.optimizer, "name", "adamw").lower()
+
+        if optimizer_name == "muon":
+            from ...tx.optim import MuonWithAuxAdamW
+            from ...tx.models.state_transition import _split_muon_parameters
+
+            muon_params, adamw_params = _split_muon_parameters(self)
+            print(f"Muon: {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm params")
+            optimizer = MuonWithAuxAdamW(
+                muon_params, adamw_params,
+                lr=max_lr,
+                weight_decay=weight_decay,
+                momentum=getattr(self.cfg.optimizer, "muon_momentum", 0.95),
+                nesterov=getattr(self.cfg.optimizer, "muon_nesterov", True),
+                ns_steps=getattr(self.cfg.optimizer, "muon_ns_steps", 5),
+                muon_eps=getattr(self.cfg.optimizer, "muon_eps", 1e-7),
+                adamw_betas=(
+                    getattr(self.cfg.optimizer, "muon_adamw_beta1", 0.9),
+                    getattr(self.cfg.optimizer, "muon_adamw_beta2", 0.95),
+                ),
+                adamw_eps=getattr(self.cfg.optimizer, "muon_adamw_eps", 1e-8),
+            )
+        else:
+            trainable_params = [p for p in self.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=weight_decay)
+
         total_steps = self.trainer.estimated_stepping_batches
 
         lr_schedulers = [
