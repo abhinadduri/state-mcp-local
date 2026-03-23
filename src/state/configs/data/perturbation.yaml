@@ -22,7 +22,7 @@ kwargs:
   store_raw_basal: false
   int_counts: false
   barcode: true
-  use_consecutive_loading: false
+  use_consecutive_loading: true
   val_subsample_fraction: 1.0
 output_dir: null
 debug: true

@@ -1,0 +1,1457 @@
+import argparse as ap
+
+
+def add_arguments_evaluate(parser: ap.ArgumentParser):
+    """
+    CLI for evaluation using cell-eval metrics.
+    """
+
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        required=True,
+        help="Path to the output_dir containing the config.yaml file that was saved during training.",
+    )
+    parser.add_argument(
+        "--toml",
+        type=str,
+        default=None,
+        help="Optional path to a TOML data config to use instead of the training config.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="last.ckpt",
+        help="Checkpoint filename. Default is 'last.ckpt'. Relative to the output directory.",
+    )
+
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default="full",
+        choices=["full", "minimal", "de", "anndata"],
+        help="run all metrics, minimal, only de metrics, or only output adatas",
+    )
+
+    parser.add_argument(
+        "--predict-only",
+        action="store_true",
+        help="If set, only run prediction without evaluation metrics.",
+    )
+
+    parser.add_argument(
+        "--skip-adatas",
+        action="store_true",
+        help="If set, skip writing AnnData (.h5ad) outputs and only run metrics/evaluation.",
+    )
+    parser.add_argument(
+        "--skip-de",
+        action="store_true",
+        help="If set, skip DE computation in cell-eval and only compute AnnData-based metrics.",
+    )
+
+    parser.add_argument(
+        "--shared-only",
+        action="store_true",
+        help=("If set, restrict predictions/evaluation to perturbations shared between train and test (train ∩ test)."),
+    )
+
+    parser.add_argument(
+        "--eval-train-data",
+        action="store_true",
+        help="If set, evaluate the model on the training data rather than on the test data.",
+    )
+
+    parser.add_argument(
+        "--pseudobulk",
+        action="store_true",
+        help=(
+            "If set, aggregate predictions in a streaming fashion into running pseudobulks by "
+            "(context, perturbation) before cell-eval."
+        ),
+    )
+
+    parser.add_argument(
+        "--nb-dispersion-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "per_cell", "set_median"],
+        help=(
+            "NB inference-time dispersion handling. "
+            "'auto' reads model.kwargs.nb_inference_dispersion_mode (default per_cell)."
+        ),
+    )
+    parser.add_argument(
+        "--nb-output-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "mean", "sample"],
+        help=(
+            "NB inference-time count output mode. "
+            "'auto' reads model.kwargs.nb_inference_output_mode (default mean)."
+        ),
+    )
+    parser.add_argument(
+        "--nb-library-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "set_median", "per_cell", "predicted", "blend", "target_oracle"],
+        help=(
+            "NB inference-time library-size mode for mean rescaling. "
+            "'auto' reads model.kwargs.nb_inference_library_size_mode and falls back "
+            "to model.kwargs.nb_library_size_mode (default set_median)."
+        ),
+    )
+    parser.add_argument(
+        "--nb-eval-scale-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "legacy", "log1p"],
+        help=(
+            "NB eval-scale behavior. "
+            "'legacy' keeps current count-space eval for NB; "
+            "'log1p' converts count outputs to log1p for cell-eval."
+        ),
+    )
+    parser.add_argument(
+        "--nb-log1p-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "mean", "delta", "mc"],
+        help=(
+            "When NB eval scale is log1p, choose how predicted log1p values are derived. "
+            "'mean' uses log1p(mu). "
+            "'delta' uses a second-order NB expectation correction to reduce Jensen bias. "
+            "'mc' uses Monte Carlo E[log1p(X)] with X~NB(mu,theta). "
+            "'auto' reads evaluation.nb_log1p_mode and defaults to 'mean'."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Extracted helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_results_dir(output_dir: str, checkpoint: str, eval_train_data: bool) -> str:
+    """Compute and create the results directory."""
+    import os
+
+    prefix = "eval_train_" if eval_train_data else "eval_"
+    results_dir = os.path.join(output_dir, prefix + os.path.basename(checkpoint))
+    os.makedirs(results_dir, exist_ok=True)
+    return results_dir
+
+
+def _nb_log1p_eval_tensor(
+    nb_mean,
+    nb_dispersion,
+    mode: str,
+    eps: float = 1e-8,
+    mc_samples: int = 8,
+):
+    """Map NB parameters to log1p-space evaluation targets.
+
+    mode='mean': log1p(E[X]) = log1p(mu)
+    mode='delta': E[log1p(X)] approx via second-order delta method:
+      log1p(mu) - 0.5 * Var(X) / (1 + mu)^2, Var(X)=mu+mu^2/theta
+    mode='mc': Monte Carlo estimate of E[log1p(X)] using NB sampling.
+    """
+    import torch
+
+    mu = torch.clamp(nb_mean, min=0.0)
+    if mode == "mean" or nb_dispersion is None:
+        return torch.log1p(mu)
+
+    theta = torch.clamp(nb_dispersion, min=eps)
+    if mode == "mc":
+        draws = int(mc_samples)
+        if draws <= 0:
+            raise ValueError(f"mc_samples must be > 0; got {draws!r}.")
+        probs = mu / (theta + mu + eps)
+        nb_dist = torch.distributions.NegativeBinomial(total_count=theta, probs=probs)
+        sampled = nb_dist.sample((draws,))
+        return torch.log1p(sampled).mean(dim=0)
+
+    var = mu + (mu * mu) / theta
+    denom = torch.clamp((1.0 + mu) ** 2, min=eps)
+    out = torch.log1p(mu) - 0.5 * (var / denom)
+    return torch.clamp(out, min=0.0)
+
+
+def _nb_real_eval_needs_log1p_transform(resolved_exp_counts: bool, resolved_is_log1p: bool) -> bool:
+    """Whether real-expression eval matrices still need a log1p transform."""
+    return bool(resolved_exp_counts or (not resolved_is_log1p))
+
+
+def _build_metric_configs(embed_key) -> dict:
+    """Build metric_configs dict for MetricsEvaluator.compute()."""
+    if embed_key and embed_key != "X_hvg":
+        return {
+            "discrimination_score": {
+                "embed_key": embed_key,
+            },
+            "pearson_edistance": {
+                "embed_key": embed_key,
+                "n_jobs": -1,
+            },
+        }
+    return {}
+
+
+def _filter_shared_only(adata_pred, adata_real, data_module, logger, extra_pairs=None):
+    """
+    Filter adatas to perturbations shared between train and test.
+
+    extra_pairs is a list of (pred, real) tuples to also filter with the same mask.
+    Returns (adata_pred, adata_real, filtered_extra_pairs).
+    """
+    try:
+        shared_perts = data_module.get_shared_perturbations()
+        if len(shared_perts) == 0:
+            logger.warning("No shared perturbations between train and test; skipping filtering.")
+            return adata_pred, adata_real, extra_pairs
+
+        logger.info(
+            "Filtering to %d shared perturbations present in train ∩ test.",
+            len(shared_perts),
+        )
+        mask = adata_pred.obs[data_module.pert_col].isin(shared_perts)
+        before_n = adata_pred.n_obs
+        adata_pred = adata_pred[mask].copy()
+        adata_real = adata_real[mask].copy()
+
+        if extra_pairs is not None:
+            extra_pairs = [(p[mask].copy(), r[mask].copy()) for p, r in extra_pairs]
+
+        logger.info(
+            "Filtered cells: %d -> %d (kept only seen perturbations)",
+            before_n,
+            adata_pred.n_obs,
+        )
+        return adata_pred, adata_real, extra_pairs
+    except Exception as e:
+        logger.warning(
+            "Failed to filter by shared perturbations (%s). Proceeding without filter.",
+            str(e),
+        )
+        return adata_pred, adata_real, extra_pairs
+
+
+def _run_cell_eval(
+    adata_real,
+    adata_pred,
+    data_module,
+    results_dir,
+    profile,
+    pdex_kwargs,
+    embed_key,
+    skip_de=False,
+    write_csv=True,
+    allow_discrete=False,
+    deseq2_de_results=None,
+):
+    """
+    Run MetricsEvaluator per cell type.
+
+    When deseq2_de_results is provided, DE metrics come from precomputed DESeq2
+    results instead of pdex/Wilcoxon. Non-DE metrics still use the pseudobulk
+    anndata. The skip_de flag should be True when deseq2_de_results is provided
+    (non-DE eval runs with skip_de=True, then a second evaluator runs DE-only
+    with the precomputed DataFrames).
+
+    Returns dict of {celltype: (results_df, agg_df)}.
+    """
+    import logging
+
+    import polars as pl
+    from cell_eval import MetricsEvaluator
+    from cell_eval.utils import split_anndata_on_celltype
+
+    logger = logging.getLogger(__name__)
+
+    control_pert = data_module.get_control_pert()
+    ct_split_real = split_anndata_on_celltype(adata=adata_real, celltype_col=data_module.cell_type_key)
+    ct_split_pred = split_anndata_on_celltype(adata=adata_pred, celltype_col=data_module.cell_type_key)
+
+    assert len(ct_split_real) == len(ct_split_pred), (
+        f"Number of celltypes in real and pred anndata must match: {len(ct_split_real)} != {len(ct_split_pred)}"
+    )
+
+    metric_configs = _build_metric_configs(embed_key)
+    all_results = {}
+
+    for ct in ct_split_real.keys():
+        real_ct = ct_split_real[ct]
+        pred_ct = ct_split_pred[ct]
+
+        # First: compute non-DE metrics (always)
+        evaluator = MetricsEvaluator(
+            adata_pred=pred_ct,
+            adata_real=real_ct,
+            control_pert=control_pert,
+            pert_col=data_module.pert_col,
+            outdir=results_dir,
+            prefix=ct,
+            pdex_kwargs=pdex_kwargs,
+            batch_size=2048,
+            skip_de=True if deseq2_de_results else skip_de,
+            allow_discrete=allow_discrete,
+        )
+        results_df, agg_df = evaluator.compute(
+            profile=profile,
+            metric_configs=metric_configs,
+            skip_metrics=["pearson_edistance", "clustering_agreement"],
+            write_csv=False if deseq2_de_results else write_csv,
+        )
+
+        # Second: if DESeq2 results available, run DE-only evaluation and merge
+        if deseq2_de_results and ct in deseq2_de_results:
+            de_data = deseq2_de_results[ct]
+            try:
+                de_evaluator = MetricsEvaluator(
+                    adata_pred=pred_ct,
+                    adata_real=real_ct,
+                    de_pred=de_data["pred"],
+                    de_real=de_data["real"],
+                    control_pert=control_pert,
+                    pert_col=data_module.pert_col,
+                    outdir=results_dir,
+                    prefix=ct,
+                    pdex_kwargs=pdex_kwargs,
+                    batch_size=2048,
+                    skip_de=False,
+                    allow_discrete=allow_discrete,
+                )
+                de_results_df, de_agg_df = de_evaluator.compute(
+                    profile="de",
+                    metric_configs=metric_configs,
+                    skip_metrics=["pearson_edistance", "clustering_agreement"],
+                    write_csv=False,
+                )
+
+                # Merge: join DE columns into non-DE results
+                join_col = "perturbation"
+                if join_col not in results_df.columns:
+                    join_col = data_module.pert_col
+                if join_col in results_df.columns and join_col in de_results_df.columns:
+                    de_unique_cols = [c for c in de_results_df.columns if c not in results_df.columns or c == join_col]
+                    if len(de_unique_cols) > 1:
+                        results_df = results_df.join(de_results_df.select(de_unique_cols), on=join_col, how="left")
+                    # Merge agg: combine non-DE and DE agg results
+                    de_agg_cols = [c for c in de_agg_df.columns if c not in agg_df.columns]
+                    if de_agg_cols:
+                        agg_df = pl.concat([agg_df, de_agg_df.select(de_agg_cols)], how="horizontal")
+                logger.info("Cell type '%s': merged DESeq2 DE metrics with non-DE metrics.", ct)
+            except Exception as exc:
+                logger.warning("Cell type '%s': DESeq2 DE evaluation failed: %s. Writing non-DE only.", ct, exc)
+
+            # Write merged results
+            if write_csv:
+                import os
+                ct_safe = ct.replace("/", "-")
+                results_df.write_csv(os.path.join(results_dir, f"{ct_safe}_results.csv"))
+                agg_df.write_csv(os.path.join(results_dir, f"{ct_safe}_agg_results.csv"))
+
+        all_results[ct] = (results_df, agg_df)
+
+    return all_results
+
+
+
+# ---------------------------------------------------------------------------
+# Main predict entry point
+# ---------------------------------------------------------------------------
+
+
+def run_tx_evaluate(args: ap.ArgumentParser):
+    import json
+    import logging
+    import os
+    import sys
+
+    import anndata
+    import contextlib
+    import lightning.pytorch as pl
+    import numpy as np
+    import pandas as pd
+    from scipy import sparse as sp
+    import torch
+    import yaml
+
+    # Cell-eval for metrics computation
+    from cell_load.data_modules import PerturbationDataModule
+    from tqdm import tqdm
+    from ._utils import normalize_batch_labels
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
+    if args.predict_only and args.skip_adatas:
+        logger.warning("Both --predict-only and --skip-adatas were set; no prediction artifacts will be written.")
+    if args.profile == "anndata" and not args.skip_de:
+        logger.warning(
+            "--profile anndata does not disable DE computation by itself. "
+            "Add --skip-de to skip DE and reduce memory/runtime."
+        )
+    # --- Nested utility functions ---
+
+    def clip_anndata_values(adata: anndata.AnnData, max_value: float, min_value: float = 0.0) -> None:
+        """Clip adata.X values in-place to keep cell-eval scale checks happy."""
+        if sp.issparse(adata.X):
+            # Clip only the stored data to keep sparsity intact.
+            if adata.X.data.size:
+                np.clip(adata.X.data, min_value, max_value, out=adata.X.data)
+                if hasattr(adata.X, "eliminate_zeros"):
+                    adata.X.eliminate_zeros()
+        else:
+            np.clip(adata.X, min_value, max_value, out=adata.X)
+
+    def as_log1p_eval_view(adata: anndata.AnnData) -> anndata.AnnData:
+        """Return a copy with X transformed to log1p(max(x,0))."""
+        out = adata.copy()
+        if sp.issparse(out.X):
+            out.X = out.X.copy()
+            np.clip(out.X.data, 0.0, None, out=out.X.data)
+            np.log1p(out.X.data, out=out.X.data)
+        else:
+            arr = np.asarray(out.X)
+            arr = np.clip(arr, 0.0, None)
+            out.X = np.log1p(arr).astype(np.float32, copy=False)
+        return out
+
+    def get_batch_labels(candidates, batch_size: int):
+        batch_labels = None
+        for candidate in candidates:
+            batch_labels = normalize_batch_labels(candidate, batch_size)
+            if batch_labels is not None:
+                break
+        if batch_labels is None:
+            batch_labels = ["None"] * batch_size
+        return batch_labels
+
+    def resolve_context_labels(batch: dict, batch_size: int, fallback):
+        dataset_labels = None
+        for key in ("dataset_name", "dataset"):
+            if key in batch and batch.get(key) is not None:
+                dataset_labels = normalize_batch_labels(batch.get(key), batch_size)
+                if dataset_labels is not None:
+                    break
+        context_labels = normalize_batch_labels(fallback, batch_size) if fallback is not None else None
+
+        if dataset_labels is not None and context_labels is not None:
+            combined = [f"{ds}.{ct}" for ds, ct in zip(dataset_labels, context_labels)]
+            return combined, "dataset_name+cell_type"
+        if context_labels is not None:
+            return context_labels, "cell_type"
+        return None, None
+
+    def ensure_list(values, batch_size: int):
+        if isinstance(values, list):
+            return values
+        if isinstance(values, tuple):
+            return list(values)
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().float().numpy()
+        if isinstance(values, np.ndarray):
+            if values.ndim == 0:
+                return [values.item()] * batch_size
+            return values.tolist()
+        return [values] * batch_size
+
+    def suspected_discrete_np(x: np.ndarray, n_rows: int = 128) -> bool:
+        if x.size == 0:
+            return False
+        if x.ndim == 1:
+            rows = x.reshape(1, -1)
+        else:
+            rows = x.reshape(-1, x.shape[-1])
+        rows = rows[: min(rows.shape[0], n_rows)]
+        row_sums = rows.sum(axis=1)
+        frac = row_sums - np.floor(row_sums)
+        return bool(np.all(np.abs(frac) < 1e-6))
+
+    def suspected_log_np(x: np.ndarray) -> bool:
+        if x.size == 0:
+            return False
+        finite = x[np.isfinite(x)]
+        if finite.size == 0:
+            return False
+        return bool(np.max(finite) < 15.0)
+
+    def summarize_array_np(x: np.ndarray, sample_size: int = 200000, seed: int = 42) -> dict:
+        arr = np.asarray(x)
+        if arr.size == 0:
+            return {"empty": True}
+        finite_mask = np.isfinite(arr)
+        finite = arr[finite_mask]
+        if finite.size == 0:
+            return {
+                "empty": False,
+                "non_finite_fraction": 1.0,
+                "sample_size": 0,
+            }
+
+        rng = np.random.default_rng(seed)
+        if finite.size > sample_size:
+            idx = rng.choice(finite.size, size=sample_size, replace=False)
+            sample = finite[idx]
+        else:
+            sample = finite
+
+        return {
+            "empty": False,
+            "shape": list(arr.shape),
+            "sample_size": int(sample.size),
+            "total_size": int(arr.size),
+            "non_finite_fraction": float(1.0 - (finite.size / arr.size)),
+            "suspected_discrete": suspected_discrete_np(sample),
+            "suspected_log1p": suspected_log_np(sample),
+            "min": float(np.min(sample)),
+            "max": float(np.max(sample)),
+            "mean": float(np.mean(sample)),
+            "var": float(np.var(sample)),
+            "sparsity_zero_fraction": float(np.mean(np.isclose(sample, 0.0, atol=1e-8))),
+            "negative_fraction": float(np.mean(sample < 0.0)),
+            "quantiles": {
+                "q01": float(np.quantile(sample, 0.01)),
+                "q05": float(np.quantile(sample, 0.05)),
+                "q50": float(np.quantile(sample, 0.50)),
+                "q95": float(np.quantile(sample, 0.95)),
+                "q99": float(np.quantile(sample, 0.99)),
+            },
+        }
+
+    def collect_sample_values(arr: np.ndarray, cap: int = 100000, take: int = 4096) -> np.ndarray:
+        arr = np.asarray(arr)
+        if arr.size == 0:
+            return np.empty((0,), dtype=np.float32)
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            return np.empty((0,), dtype=np.float32)
+        rng = np.random.default_rng(42)
+        sample_n = min(int(take), finite.size)
+        idx = rng.choice(finite.size, size=sample_n, replace=False)
+        sampled = finite[idx].astype(np.float32, copy=False)
+        if sampled.size > cap:
+            sampled = sampled[:cap]
+        return sampled
+
+    # -----------------------------------------------------------------------
+    # 1. Load the config
+    # -----------------------------------------------------------------------
+    config_path = os.path.join(args.output_dir, "config.yaml")
+
+    def load_config(cfg_path: str) -> dict:
+        """Load config from the YAML file that was dumped during training."""
+        if not os.path.exists(cfg_path):
+            raise FileNotFoundError(f"Could not find config file: {cfg_path}")
+        with open(cfg_path, "r") as f:
+            cfg = yaml.safe_load(f)
+        return cfg
+
+    cfg = load_config(config_path)
+    logger.info(f"Loaded config from {config_path}")
+
+    if args.toml:
+        data_section = cfg.get("data")
+        if data_section is None or "kwargs" not in data_section:
+            raise KeyError("The loaded config does not contain data.kwargs, unable to override toml_config_path.")
+        cfg["data"]["kwargs"]["toml_config_path"] = args.toml
+        logger.info("Overriding data.kwargs.toml_config_path to %s", args.toml)
+
+    eval_cfg = cfg.get("evaluation", {})
+    if not isinstance(eval_cfg, dict):
+        eval_cfg = {}
+
+    # 2. Find run output directory & load data module
+    run_output_dir = os.path.join(cfg["output_dir"], cfg["name"])
+    data_module_path = os.path.join(run_output_dir, "data_module.torch")
+    if not os.path.exists(data_module_path):
+        raise FileNotFoundError(f"Could not find data module at {data_module_path}?")
+    data_module = PerturbationDataModule.load_state(data_module_path)
+    if args.toml:
+        if not os.path.exists(args.toml):
+            raise FileNotFoundError(f"Could not find TOML config file at {args.toml}")
+        from cell_load.config import ExperimentConfig
+
+        logger.info("Reloading data module configuration from %s", args.toml)
+        data_module.toml_config_path = args.toml
+        data_module.config = ExperimentConfig.from_toml(args.toml)
+        data_module.config.validate()
+        data_module.train_datasets = []
+        data_module.val_datasets = []
+        data_module.test_datasets = []
+        data_module._setup_global_maps()
+    data_module.setup(stage="test")
+    nb_loss_enabled = bool(cfg.get("model", {}).get("kwargs", {}).get("nb_loss", False))
+    _OUTPUT_SPACE_ALIASES = {"hvg": "gene", "transcriptome": "all"}
+    output_space = cfg.get("data", {}).get("kwargs", {}).get("output_space", "gene")
+    output_space = _OUTPUT_SPACE_ALIASES.get(output_space.strip().lower(), output_space)
+    if nb_loss_enabled and output_space == "embedding":
+        raise ValueError(
+            "model.kwargs.nb_loss=True is incompatible with data.kwargs.output_space='embedding'. "
+            "Use output_space='gene' or output_space='all'."
+        )
+    if nb_loss_enabled and output_space not in {"gene", "all"}:
+        raise ValueError(
+            f"model.kwargs.nb_loss=True requires data.kwargs.output_space in {{'gene', 'all'}}; got {output_space!r}."
+        )
+    if nb_loss_enabled:
+        resolved_is_log1p = bool(getattr(data_module, "is_log1p", cfg["data"]["kwargs"].get("is_log1p", False)))
+        nb_force_exp_counts = bool(cfg.get("model", {}).get("kwargs", {}).get("nb_force_exp_counts", False))
+        current_exp_counts = bool(getattr(data_module, "exp_counts", False))
+        if nb_force_exp_counts:
+            expected_exp_counts = resolved_is_log1p
+            if current_exp_counts != expected_exp_counts:
+                logger.warning(
+                    "nb_loss=True with nb_force_exp_counts=True requires exp_counts to follow is_log1p. "
+                    "Resolved is_log1p=%s, overriding exp_counts %s -> %s.",
+                    resolved_is_log1p,
+                    current_exp_counts,
+                    expected_exp_counts,
+                )
+                data_module.exp_counts = expected_exp_counts
+            else:
+                logger.info(
+                    "nb_loss=True with nb_force_exp_counts=True resolved is_log1p=%s and exp_counts=%s.",
+                    resolved_is_log1p,
+                    current_exp_counts,
+                )
+        else:
+            logger.info(
+                "nb_loss=True with nb_force_exp_counts=False preserves exp_counts=%s (resolved is_log1p=%s).",
+                current_exp_counts,
+                resolved_is_log1p,
+            )
+        if data_module.embed_key not in {None, "X_hvg"} and not bool(getattr(data_module, "store_raw_basal", False)):
+            logger.warning(
+                "nb_loss=True with embed_key=%r and store_raw_basal=False. "
+                "NB library-size estimation will fall back to ctrl_cell_emb.",
+                data_module.embed_key,
+            )
+        cfg["data"]["kwargs"]["is_log1p"] = resolved_is_log1p
+        cfg["data"]["kwargs"]["exp_counts"] = bool(getattr(data_module, "exp_counts", current_exp_counts))
+    cfg_nb_dispersion_mode = str(cfg.get("model", {}).get("kwargs", {}).get("nb_inference_dispersion_mode", "per_cell"))
+    cfg_nb_output_mode = str(cfg.get("model", {}).get("kwargs", {}).get("nb_inference_output_mode", "mean"))
+    cfg_nb_library_mode = str(
+        cfg.get("model", {})
+        .get("kwargs", {})
+        .get(
+            "nb_inference_library_size_mode",
+            cfg.get("model", {}).get("kwargs", {}).get("nb_library_size_mode", "set_median"),
+        )
+    )
+    nb_dispersion_mode = args.nb_dispersion_mode if args.nb_dispersion_mode != "auto" else cfg_nb_dispersion_mode
+    nb_output_mode = args.nb_output_mode if args.nb_output_mode != "auto" else cfg_nb_output_mode
+    nb_library_mode = args.nb_library_mode if args.nb_library_mode != "auto" else cfg_nb_library_mode
+    if nb_loss_enabled and nb_dispersion_mode not in {"per_cell", "set_median"}:
+        raise ValueError(f"Unsupported NB dispersion mode: {nb_dispersion_mode!r}")
+    if nb_loss_enabled and nb_output_mode not in {"mean", "sample"}:
+        raise ValueError(f"Unsupported NB output mode: {nb_output_mode!r}")
+    if nb_loss_enabled and nb_library_mode not in {
+        "per_cell",
+        "set_median",
+        "predicted",
+        "blend",
+        "target_oracle",
+    }:
+        raise ValueError(f"Unsupported NB library mode: {nb_library_mode!r}")
+
+    resolved_exp_counts = bool(getattr(data_module, "exp_counts", cfg["data"]["kwargs"].get("exp_counts", False)))
+    default_metrics_is_log1p = not (nb_loss_enabled or resolved_exp_counts)
+    nb_log1p_mode = "mean"
+    nb_log1p_mc_samples = 8
+    if nb_loss_enabled:
+        cfg_nb_eval_scale_mode = str(eval_cfg.get("nb_eval_scale_mode", "auto")).strip().lower()
+        if cfg_nb_eval_scale_mode not in {"auto", "legacy", "log1p"}:
+            raise ValueError(
+                "evaluation.nb_eval_scale_mode must be one of {'auto', 'legacy', 'log1p'}; "
+                f"got {cfg_nb_eval_scale_mode!r}."
+            )
+        if args.nb_eval_scale_mode != "auto":
+            nb_eval_scale_mode = args.nb_eval_scale_mode
+        elif cfg_nb_eval_scale_mode != "auto":
+            nb_eval_scale_mode = cfg_nb_eval_scale_mode
+        else:
+            # NB mean outputs are continuous expectations, so log1p-scale metrics are the
+            # consistent default. Sampled outputs remain count-like and stay in legacy mode.
+            nb_eval_scale_mode = "log1p" if nb_output_mode == "mean" else "legacy"
+        if nb_eval_scale_mode not in {"legacy", "log1p"}:
+            raise ValueError(
+                "nb_eval_scale_mode must be one of {'legacy', 'log1p'}; "
+                f"got {nb_eval_scale_mode!r}."
+            )
+        metrics_is_log1p = True if nb_eval_scale_mode == "log1p" else default_metrics_is_log1p
+        cfg_nb_log1p_mode = str(eval_cfg.get("nb_log1p_mode", "auto")).strip().lower()
+        if cfg_nb_log1p_mode not in {"auto", "mean", "delta", "mc"}:
+            raise ValueError(
+                "evaluation.nb_log1p_mode must be one of {'auto', 'mean', 'delta', 'mc'}; "
+                f"got {cfg_nb_log1p_mode!r}."
+            )
+        if args.nb_log1p_mode != "auto":
+            nb_log1p_mode = args.nb_log1p_mode
+        elif cfg_nb_log1p_mode != "auto":
+            nb_log1p_mode = cfg_nb_log1p_mode
+        else:
+            nb_log1p_mode = "mean"
+        if nb_eval_scale_mode != "log1p":
+            nb_log1p_mode = "mean"
+        if nb_log1p_mode not in {"mean", "delta", "mc"}:
+            raise ValueError(
+                "nb_log1p_mode must be one of {'mean', 'delta', 'mc'}; "
+                f"got {nb_log1p_mode!r}."
+            )
+        nb_log1p_mc_samples = int(eval_cfg.get("nb_log1p_mc_samples", 8))
+        if nb_log1p_mc_samples <= 0:
+            raise ValueError(
+                f"evaluation.nb_log1p_mc_samples must be > 0; got {nb_log1p_mc_samples!r}."
+            )
+    else:
+        nb_eval_scale_mode = "legacy"
+        metrics_is_log1p = default_metrics_is_log1p
+        nb_log1p_mode = "mean"
+        nb_log1p_mc_samples = 8
+    logger.info(
+        "Metrics config: setting pdex is_log1p=%s (nb_loss=%s, exp_counts=%s, nb_eval_scale_mode=%s)",
+        metrics_is_log1p,
+        nb_loss_enabled,
+        resolved_exp_counts,
+        nb_eval_scale_mode,
+    )
+    if nb_loss_enabled:
+        cfg_nb_library_blend_alpha = float(
+            cfg.get("model", {}).get("kwargs", {}).get("nb_inference_library_blend_alpha", 0.5)
+        )
+        logger.info(
+            "NB inference config: dispersion_mode=%s output_mode=%s library_mode=%s blend_alpha=%.3f log1p_mode=%s mc_samples=%d",
+            nb_dispersion_mode,
+            nb_output_mode,
+            nb_library_mode,
+            cfg_nb_library_blend_alpha,
+            nb_log1p_mode,
+            nb_log1p_mc_samples,
+        )
+        if nb_library_mode == "target_oracle":
+            logger.warning(
+                "nb_library_mode=target_oracle uses pert_cell_counts from evaluation batches "
+                "to set per-cell library sizes. This is diagnostic-only and should not be used "
+                "for deployment inference."
+            )
+        if args.pseudobulk and nb_log1p_mode != "mean":
+            logger.warning(
+                "nb_log1p_mode=%s currently applies only to cell-level path; "
+                "pseudobulk eval will fall back to mean log1p conversion.",
+                nb_log1p_mode,
+            )
+            nb_log1p_mode = "mean"
+    logger.info("Loaded data module from %s", data_module_path)
+
+    # Seed everything
+    pl.seed_everything(cfg["training"]["train_seed"])
+
+    # -----------------------------------------------------------------------
+    # 3. Load the trained model
+    # -----------------------------------------------------------------------
+    checkpoint_dir = os.path.join(run_output_dir, "checkpoints")
+    checkpoint_path = os.path.join(checkpoint_dir, args.checkpoint)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"Could not find checkpoint at {checkpoint_path}.\nSpecify a correct checkpoint filename with --checkpoint."
+        )
+    logger.info("Loading model from %s", checkpoint_path)
+
+    # Determine model class and load
+    model_class_name = cfg["model"]["name"]
+    model_kwargs = cfg["model"]["kwargs"]
+    if nb_loss_enabled:
+        model_kwargs = dict(model_kwargs)
+        model_kwargs["nb_inference_dispersion_mode"] = nb_dispersion_mode
+        model_kwargs["nb_inference_output_mode"] = nb_output_mode
+        model_kwargs["nb_inference_library_size_mode"] = nb_library_mode
+
+    # Import the correct model class
+    if model_class_name.lower() == "embedsum":
+        from ...tx.models.embed_sum import EmbedSumPerturbationModel
+
+        ModelClass = EmbedSumPerturbationModel
+    elif model_class_name.lower() in ["neuralot", "pertsets", "state"]:
+        from ...tx.models.state_transition import StateTransitionPerturbationModel
+
+        ModelClass = StateTransitionPerturbationModel
+
+    elif model_class_name.lower() in ["globalsimplesum", "perturb_mean"]:
+        from ...tx.models.perturb_mean import PerturbMeanPerturbationModel
+
+        ModelClass = PerturbMeanPerturbationModel
+    elif model_class_name.lower() in ["celltypemean", "context_mean"]:
+        from ...tx.models.context_mean import ContextMeanPerturbationModel
+
+        ModelClass = ContextMeanPerturbationModel
+    elif model_class_name.lower() == "decoder_only":
+        from ...tx.models.decoder_only import DecoderOnlyPerturbationModel
+
+        ModelClass = DecoderOnlyPerturbationModel
+    elif model_class_name.lower() == "pseudobulk":
+        from ...tx.models.pseudobulk import PseudobulkPerturbationModel
+
+        ModelClass = PseudobulkPerturbationModel
+    else:
+        raise ValueError(f"Unknown model class: {model_class_name}")
+
+    var_dims = data_module.get_var_dims()
+    model_init_kwargs = {
+        "input_dim": var_dims["input_dim"],
+        "hidden_dim": model_kwargs["hidden_dim"],
+        "gene_dim": var_dims["gene_dim"],
+        "hvg_dim": var_dims["hvg_dim"],
+        "output_dim": var_dims["output_dim"],
+        "pert_dim": var_dims["pert_dim"],
+        **model_kwargs,
+    }
+
+    model = ModelClass.load_from_checkpoint(checkpoint_path, weights_only=False, **model_init_kwargs)
+    model.eval()
+    logger.info("Model loaded successfully.")
+
+    # -----------------------------------------------------------------------
+    # 4. Run inference on test set
+    # -----------------------------------------------------------------------
+    data_module.setup(stage="test")
+    if args.eval_train_data:
+        test_loader = data_module.train_dataloader(test=True)
+    else:
+        test_loader = data_module.test_dataloader()
+
+    if test_loader is None or (isinstance(test_loader, list) and len(test_loader) == 0):
+        logger.warning("No test dataloader found. Exiting.")
+        sys.exit(0)
+
+    num_cells = test_loader.batch_sampler.tot_num
+    output_dim = var_dims["output_dim"]
+    gene_dim = var_dims["gene_dim"]
+    hvg_dim = var_dims["hvg_dim"]
+    gene_var_names = var_dims.get("gene_names")
+
+    logger.info("Generating predictions on test set using manual loop...")
+    device = next(model.parameters()).device
+
+    cfg_batch_col = cfg.get("data", {}).get("kwargs", {}).get("batch_col", None)
+    batch_obs_key = cfg_batch_col or data_module.batch_col
+    if batch_obs_key is None:
+        batch_obs_key = "batch"
+
+    store_raw_expression = (
+        data_module.embed_key is not None
+        and data_module.embed_key != "X_hvg"
+        and cfg["data"]["kwargs"]["output_space"] == "gene"
+    ) or (data_module.embed_key is not None and cfg["data"]["kwargs"]["output_space"] == "all")
+    use_count_outputs = store_raw_expression or nb_loss_enabled
+    if nb_loss_enabled and not store_raw_expression:
+        logger.info(
+            "nb_loss=True: forcing prediction artifacts to use NB count outputs even though "
+            "store_raw_expression would otherwise be disabled."
+        )
+
+    nb_dispersion_samples = []
+    nb_mean_samples = []
+
+    results_dir = _build_results_dir(args.output_dir, args.checkpoint, args.eval_train_data)
+
+    # -----------------------------------------------------------------------
+    # 4a. Pseudobulk inference path
+    # -----------------------------------------------------------------------
+    if args.pseudobulk:
+        logger.info("Pseudobulk enabled; aggregating by (context, perturbation).")
+
+        pseudo_x_dim = None
+        if use_count_outputs:
+            if output_space == "gene":
+                pseudo_x_dim = hvg_dim
+            elif output_space == "all":
+                pseudo_x_dim = gene_dim
+            else:
+                raise ValueError(f"Unsupported output_space for pseudobulk: {output_space}")
+
+        from ._pseudobulk import PseudobulkAccumulator, resolve_scale_flags, build_pseudobulk_anndata
+
+        aggregate_main_in_count_space, aggregate_gene_in_count_space = resolve_scale_flags(
+            metrics_is_log1p=metrics_is_log1p,
+            use_count_outputs=use_count_outputs,
+            resolved_exp_counts=resolved_exp_counts,
+            output_space=output_space,
+            nb_loss_enabled=nb_loss_enabled,
+        )
+        if aggregate_main_in_count_space or aggregate_gene_in_count_space:
+            logger.info(
+                "Pseudobulk scale handling: detected log1p outputs; accumulating sums in count space via expm1."
+            )
+        else:
+            logger.info("Pseudobulk scale handling: using direct summation (no expm1 conversion before aggregation).")
+
+        # --- DESeq2 replicate configuration ---
+        deseq2_n_reps = 2
+
+        accumulator = PseudobulkAccumulator(
+            output_dim=output_dim,
+            gene_dim=pseudo_x_dim,
+            use_count_outputs=use_count_outputs,
+            aggregate_main_in_count_space=aggregate_main_in_count_space,
+            aggregate_gene_in_count_space=aggregate_gene_in_count_space,
+            has_real=True,
+            enable_deseq2=True,
+            deseq2_n_reps=deseq2_n_reps,
+            nb_loss_enabled=nb_loss_enabled,
+            resolved_exp_counts=resolved_exp_counts,
+        )
+
+        context_mode = None
+
+        # Match training precision for inference autocast
+        training_precision = cfg.get("training", {}).get("precision", "32-true")
+        if "bf16" in training_precision:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+        elif "16" in training_precision:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.float16)
+        else:
+            autocast_ctx = contextlib.nullcontext()
+
+        with torch.no_grad(), autocast_ctx:
+            for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting", unit="batch", file=sys.stderr)):
+                batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+                batch_preds = model.predict_step(batch, batch_idx, padded=False)
+
+                if nb_loss_enabled and batch_preds.get("pert_cell_counts_dispersion") is not None:
+                    nb_dispersion_samples.append(
+                        collect_sample_values(
+                            batch_preds["pert_cell_counts_dispersion"].detach().cpu().float().numpy(),
+                            cap=100000,
+                            take=4096,
+                        )
+                    )
+                if nb_loss_enabled and batch_preds.get("pert_cell_counts_preds") is not None:
+                    batch_nb_mean = batch_preds.get("pert_cell_counts_mean", batch_preds["pert_cell_counts_preds"])
+                    nb_mean_samples.append(
+                        collect_sample_values(
+                            batch_nb_mean.detach().cpu().float().numpy(),
+                            cap=100000,
+                            take=4096,
+                        )
+                    )
+
+                batch_size = batch_preds["preds"].shape[0]
+                batch_labels = get_batch_labels(
+                    (
+                        batch.get("batch_name"),
+                        batch_preds.get("batch_name"),
+                        batch_preds.get("batch"),
+                    ),
+                    batch_size,
+                )
+
+                pert_names = [str(x) for x in ensure_list(batch_preds.get("pert_name"), batch_size)]
+                celltypes = [str(x) for x in ensure_list(batch_preds.get("celltype_name"), batch_size)]
+                if len(pert_names) != batch_size or len(celltypes) != batch_size:
+                    raise ValueError("Mismatch between batch size and pert/celltype metadata lengths.")
+
+                context_labels, detected_mode = resolve_context_labels(batch, batch_size, celltypes)
+                if context_labels is None:
+                    raise ValueError(
+                        "pseudobulk requires dataset_name + cell_type (preferred) or cell_type alone. "
+                        f"Check data.kwargs.cell_type_key (current: {data_module.cell_type_key})."
+                    )
+                context_labels = [str(x) for x in context_labels]
+                if context_mode is None:
+                    context_mode = detected_mode
+                    logger.info("Pseudobulk context source: %s", context_mode)
+                elif detected_mode != context_mode:
+                    raise ValueError(
+                        f"Inconsistent context source during prediction: saw '{detected_mode}' after '{context_mode}'."
+                    )
+
+                batch_pred_np = batch_preds["preds"].cpu().float().numpy()
+                batch_real_np = batch_preds["pert_cell_emb"].cpu().float().numpy()
+
+                batch_real_gene_np = None
+                batch_gene_pred_np = None
+                if use_count_outputs:
+                    batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().float().numpy()
+                    batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().float().numpy()
+
+                accumulator.accumulate_batch(
+                    batch_size=batch_size,
+                    context_labels=context_labels,
+                    pert_names=pert_names,
+                    celltypes=celltypes,
+                    batch_labels=[str(x) for x in batch_labels],
+                    pred_np=batch_pred_np,
+                    real_np=batch_real_np,
+                    gene_pred_np=batch_gene_pred_np,
+                    gene_real_np=batch_real_gene_np,
+                )
+
+        group_entries, total_cells_seen = accumulator.finalize()
+        # Keep pb_groups dict for DESeq2 code (which accesses entries by (context, pert) key)
+        pb_groups = accumulator._groups
+
+        if len(group_entries) == 0:
+            logger.warning("No pseudobulk groups were generated. Exiting.")
+            sys.exit(0)
+
+        logger.info(
+            "Built %d pseudobulk groups from %d cells.",
+            len(group_entries),
+            total_cells_seen,
+        )
+
+        result = build_pseudobulk_anndata(
+            group_entries,
+            output_dim=output_dim,
+            gene_dim=pseudo_x_dim,
+            use_count_outputs=use_count_outputs,
+            aggregate_main_in_count_space=aggregate_main_in_count_space,
+            aggregate_gene_in_count_space=aggregate_gene_in_count_space,
+            has_real=True,
+            pert_col=data_module.pert_col,
+            cell_type_key=data_module.cell_type_key,
+            batch_obs_key=batch_obs_key,
+            batch_col=data_module.batch_col,
+            embed_key=data_module.embed_key,
+            gene_var_names=gene_var_names,
+        )
+        adata_pred = result["adata_pred"]
+        adata_real = result["adata_real"]
+        adata_pred_eval = result["adata_pred_eval"]
+        adata_real_eval = result["adata_real_eval"]
+
+    # -------------------------------------------------------------------
+    # 4b. Cell-level inference path
+    # -------------------------------------------------------------------
+    else:
+        final_preds = np.empty((num_cells, output_dim), dtype=np.float32)
+        final_reals = np.empty((num_cells, output_dim), dtype=np.float32)
+
+        final_X_hvg = None
+        final_pert_cell_counts_preds = None
+        final_pert_cell_log1p_eval_preds = None
+        if use_count_outputs:
+            # Preallocate matrices of shape (num_cells, gene_dim) for decoded predictions.
+            if output_space == "gene":
+                final_X_hvg = np.empty((num_cells, hvg_dim), dtype=np.float32)
+                final_pert_cell_counts_preds = np.empty((num_cells, hvg_dim), dtype=np.float32)
+                if nb_loss_enabled and nb_eval_scale_mode == "log1p" and nb_log1p_mode != "mean":
+                    final_pert_cell_log1p_eval_preds = np.empty((num_cells, hvg_dim), dtype=np.float32)
+            if output_space == "all":
+                final_X_hvg = np.empty((num_cells, gene_dim), dtype=np.float32)
+                final_pert_cell_counts_preds = np.empty((num_cells, gene_dim), dtype=np.float32)
+                if nb_loss_enabled and nb_eval_scale_mode == "log1p" and nb_log1p_mode != "mean":
+                    final_pert_cell_log1p_eval_preds = np.empty((num_cells, gene_dim), dtype=np.float32)
+
+        current_idx = 0
+
+        # Initialize aggregation variables directly
+        all_pert_names = []
+        all_celltypes = []
+        all_gem_groups = []
+        all_pert_barcodes = []
+        all_ctrl_barcodes = []
+
+        # Match training precision for inference autocast (prevents CUBLAS errors with bf16-trained models)
+        training_precision = cfg.get("training", {}).get("precision", "32-true")
+        if "bf16" in training_precision:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16)
+        elif "16" in training_precision:
+            autocast_ctx = torch.autocast("cuda", dtype=torch.float16)
+        else:
+            autocast_ctx = contextlib.nullcontext()
+
+        with torch.no_grad(), autocast_ctx:
+            for batch_idx, batch in enumerate(
+                tqdm(test_loader, desc="Predicting", unit="batch", file=sys.stderr)
+            ):
+                # Move each tensor in the batch to the model's device
+                batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+
+                # Get predictions
+                batch_preds = model.predict_step(batch, batch_idx, padded=False)
+
+                if nb_loss_enabled and batch_preds.get("pert_cell_counts_dispersion") is not None:
+                    nb_dispersion_samples.append(
+                        collect_sample_values(
+                            batch_preds["pert_cell_counts_dispersion"].detach().cpu().float().numpy(),
+                            cap=100000,
+                            take=4096,
+                        )
+                    )
+                if nb_loss_enabled and batch_preds.get("pert_cell_counts_preds") is not None:
+                    batch_nb_mean = batch_preds.get("pert_cell_counts_mean", batch_preds["pert_cell_counts_preds"])
+                    nb_mean_samples.append(
+                        collect_sample_values(
+                            batch_nb_mean.detach().cpu().float().numpy(),
+                            cap=100000,
+                            take=4096,
+                        )
+                    )
+
+                # Extract metadata and data directly from batch_preds
+                # Handle pert_name
+                if isinstance(batch_preds["pert_name"], list):
+                    all_pert_names.extend(batch_preds["pert_name"])
+                else:
+                    all_pert_names.append(batch_preds["pert_name"])
+
+                if "pert_cell_barcode" in batch_preds:
+                    if isinstance(batch_preds["pert_cell_barcode"], list):
+                        all_pert_barcodes.extend(batch_preds["pert_cell_barcode"])
+                        all_ctrl_barcodes.extend(batch_preds["ctrl_cell_barcode"])
+                    else:
+                        all_pert_barcodes.append(batch_preds["pert_cell_barcode"])
+                        all_ctrl_barcodes.append(batch_preds["ctrl_cell_barcode"])
+
+                # Handle celltype_name
+                if isinstance(batch_preds["celltype_name"], list):
+                    all_celltypes.extend(batch_preds["celltype_name"])
+                else:
+                    all_celltypes.append(batch_preds["celltype_name"])
+
+                batch_size = batch_preds["preds"].shape[0]
+
+                # Handle gem_group - prefer human-readable batch names when available
+                batch_labels = get_batch_labels(
+                    (
+                        batch.get("batch_name"),
+                        batch_preds.get("batch_name"),
+                        batch_preds.get("batch"),
+                    ),
+                    batch_size,
+                )
+                all_gem_groups.extend(batch_labels)
+
+                batch_pred_np = batch_preds["preds"].cpu().float().numpy()
+                batch_real_np = batch_preds["pert_cell_emb"].cpu().float().numpy()
+                final_preds[current_idx : current_idx + batch_size, :] = batch_pred_np
+                final_reals[current_idx : current_idx + batch_size, :] = batch_real_np
+                current_idx += batch_size
+
+                # Handle X_hvg for HVG space ground truth
+                if final_X_hvg is not None:
+                    batch_real_gene_np = batch_preds["pert_cell_counts"].cpu().float().numpy()
+                    final_X_hvg[current_idx - batch_size : current_idx, :] = batch_real_gene_np
+
+                # Handle decoded gene predictions if available
+                if final_pert_cell_counts_preds is not None:
+                    batch_gene_pred_np = batch_preds["pert_cell_counts_preds"].cpu().float().numpy()
+                    final_pert_cell_counts_preds[current_idx - batch_size : current_idx, :] = batch_gene_pred_np
+                    if final_pert_cell_log1p_eval_preds is not None:
+                        batch_dispersion = batch_preds.get("pert_cell_counts_dispersion")
+                        if batch_dispersion is None:
+                            raise RuntimeError(
+                                "nb_log1p_mode requires pert_cell_counts_dispersion in predict_step outputs."
+                            )
+                        batch_nb_mean_for_eval = batch_preds.get(
+                            "pert_cell_counts_mean",
+                            batch_preds["pert_cell_counts_preds"],
+                        )
+                        batch_log1p_eval = _nb_log1p_eval_tensor(
+                            batch_nb_mean_for_eval,
+                            batch_dispersion,
+                            mode=nb_log1p_mode,
+                            mc_samples=nb_log1p_mc_samples,
+                        )
+                        final_pert_cell_log1p_eval_preds[
+                            current_idx - batch_size : current_idx, :
+                        ] = batch_log1p_eval.detach().cpu().float().numpy()
+
+        logger.info("Creating anndatas from predictions from manual loop...")
+
+        # Build pandas DataFrame for obs and var
+        logger.info("Resolved batch obs key: %s", batch_obs_key)
+        df_dict = {
+            data_module.pert_col: all_pert_names,
+            data_module.cell_type_key: all_celltypes,
+            batch_obs_key: all_gem_groups,
+        }
+        if data_module.batch_col and data_module.batch_col != batch_obs_key:
+            logger.info("Adding explicit batch column to output obs: %s", data_module.batch_col)
+            df_dict[data_module.batch_col] = all_gem_groups
+
+        if len(all_pert_barcodes) > 0:
+            df_dict["pert_cell_barcode"] = all_pert_barcodes
+            df_dict["ctrl_cell_barcode"] = all_ctrl_barcodes
+
+        obs = pd.DataFrame(df_dict)
+
+        gene_var_df = pd.DataFrame(index=gene_var_names) if gene_var_names is not None else None
+        if final_X_hvg is not None:
+            # Guard: gene_var_df may have more entries than HVG output columns
+            # (e.g. when h5ad lacks highly_variable metadata and get_gene_names
+            # returns all gene names instead of just HVGs)
+            _hvg_var = gene_var_df if (gene_var_df is not None and len(gene_var_df) == final_pert_cell_counts_preds.shape[1]) else None
+            # Create adata for predictions - using the decoded gene expression values
+            adata_pred = anndata.AnnData(X=final_pert_cell_counts_preds, obs=obs, var=_hvg_var)
+            # Create adata for real - using the true gene expression values
+            adata_real = anndata.AnnData(X=final_X_hvg, obs=obs, var=_hvg_var)
+
+            # add the embedding predictions
+            if data_module.embed_key is not None:
+                adata_pred.obsm[data_module.embed_key] = final_preds
+                adata_real.obsm[data_module.embed_key] = final_reals
+                logger.info(f"Added predicted embeddings to adata.obsm['{data_module.embed_key}']")
+        else:
+            # Create adata for predictions - model was trained on gene expression space already
+            _var = gene_var_df if (gene_var_df is not None and len(gene_var_df) == final_preds.shape[1]) else None
+            adata_pred = anndata.AnnData(X=final_preds, obs=obs, var=_var)
+            # Create adata for real - using the true gene expression values
+            adata_real = anndata.AnnData(X=final_reals, obs=obs, var=_var)
+
+        # Cell-level: eval adatas usually mirror persisted outputs.
+        if nb_loss_enabled and nb_eval_scale_mode == "log1p" and use_count_outputs:
+            if final_pert_cell_log1p_eval_preds is not None:
+                logger.info(
+                    "NB eval scale mode=log1p with nb_log1p_mode=%s: using distribution-aware log1p estimates.",
+                    nb_log1p_mode,
+                )
+                _var = adata_pred.var.copy() if adata_pred.var is not None else None
+                adata_pred_eval = anndata.AnnData(
+                    X=final_pert_cell_log1p_eval_preds,
+                    obs=adata_pred.obs.copy(),
+                    var=_var,
+                )
+                if data_module.embed_key is not None and data_module.embed_key in adata_pred.obsm:
+                    adata_pred_eval.obsm[data_module.embed_key] = adata_pred.obsm[data_module.embed_key]
+            else:
+                logger.info("NB eval scale mode=log1p: converting cell-level count outputs to log1p for metrics.")
+                adata_pred_eval = as_log1p_eval_view(adata_pred)
+            if _nb_real_eval_needs_log1p_transform(resolved_exp_counts, resolved_is_log1p):
+                logger.info(
+                    "NB eval scale mode=log1p: converting real cell-level outputs to log1p for metrics "
+                    "(exp_counts=%s, is_log1p=%s).",
+                    resolved_exp_counts,
+                    resolved_is_log1p,
+                )
+                adata_real_eval = as_log1p_eval_view(adata_real)
+            else:
+                logger.info(
+                    "NB eval scale mode=log1p: real cell-level outputs are already log1p-scaled "
+                    "(exp_counts=%s, is_log1p=%s); skipping additional transform.",
+                    resolved_exp_counts,
+                    resolved_is_log1p,
+                )
+                adata_real_eval = adata_real.copy()
+        else:
+            adata_pred_eval = adata_pred
+            adata_real_eval = adata_real
+
+    # ===================================================================
+    # 5. Shared post-processing: clip, filter, save, evaluate
+    # ===================================================================
+
+    # --- Clip ---
+    should_clip_for_metrics = (not nb_loss_enabled) or (nb_loss_enabled and nb_eval_scale_mode == "log1p")
+    if should_clip_for_metrics:
+        clip_anndata_values(adata_pred_eval, max_value=14.0)
+        clip_anndata_values(adata_real_eval, max_value=14.0)
+        logger.info("Clipped eval data X values to [0.0, 14.0] for cell-eval metrics.")
+    else:
+        logger.info("Skipping metric clipping for this eval configuration.")
+
+    # --- Filter shared_only ---
+    if args.shared_only:
+        if args.pseudobulk:
+            adata_pred, adata_real, extra = _filter_shared_only(
+                adata_pred, adata_real, data_module, logger,
+                extra_pairs=[(adata_pred_eval, adata_real_eval)],
+            )
+            if extra is not None:
+                adata_pred_eval, adata_real_eval = extra[0]
+        else:
+            adata_pred, adata_real, _ = _filter_shared_only(
+                adata_pred, adata_real, data_module, logger,
+            )
+            adata_pred_eval = adata_pred
+            adata_real_eval = adata_real
+
+    # --- Save AnnDatas ---
+    adata_pred_path = os.path.join(results_dir, "adata_pred.h5ad")
+    adata_real_path = os.path.join(results_dir, "adata_real.h5ad")
+    if args.skip_adatas:
+        logger.info("Skipping AnnData writes (--skip-adatas).")
+    else:
+        adata_pred.write_h5ad(adata_pred_path)
+        adata_real.write_h5ad(adata_real_path)
+        logger.info(f"Saved adata_pred to {adata_pred_path}")
+        logger.info(f"Saved adata_real to {adata_real_path}")
+
+    # --- Diagnostics ---
+    diagnostics = {
+        "nb_loss_enabled": bool(nb_loss_enabled),
+        "nb_dispersion_mode": nb_dispersion_mode if nb_loss_enabled else None,
+        "nb_output_mode": nb_output_mode if nb_loss_enabled else None,
+        "nb_library_mode": nb_library_mode if nb_loss_enabled else None,
+        "nb_eval_scale_mode": nb_eval_scale_mode if nb_loss_enabled else None,
+        "nb_log1p_mode": nb_log1p_mode if nb_loss_enabled else None,
+        "metrics_is_log1p": bool(metrics_is_log1p),
+        "resolved_exp_counts": bool(resolved_exp_counts),
+        "use_count_outputs": bool(use_count_outputs),
+        "store_raw_expression": bool(store_raw_expression),
+        "clipping_applied": bool(should_clip_for_metrics),
+        "array_summaries": {},
+    }
+    try:
+        pred_eval_X = adata_pred_eval.X.toarray() if sp.issparse(adata_pred_eval.X) else np.asarray(adata_pred_eval.X)
+        real_eval_X = adata_real_eval.X.toarray() if sp.issparse(adata_real_eval.X) else np.asarray(adata_real_eval.X)
+        diagnostics["array_summaries"]["pred_eval_X"] = summarize_array_np(pred_eval_X)
+        diagnostics["array_summaries"]["real_eval_X"] = summarize_array_np(real_eval_X)
+
+        if nb_loss_enabled and nb_mean_samples:
+            nb_mean_concat = np.concatenate(nb_mean_samples, axis=0)
+            diagnostics["array_summaries"]["nb_mean_sample"] = summarize_array_np(nb_mean_concat)
+        if nb_loss_enabled and nb_dispersion_samples:
+            nb_disp_concat = np.concatenate(nb_dispersion_samples, axis=0)
+            diagnostics["array_summaries"]["nb_dispersion_sample"] = summarize_array_np(nb_disp_concat)
+
+        diag_path = os.path.join(results_dir, "nb_diagnostics.json")
+        with open(diag_path, "w") as f:
+            json.dump(diagnostics, f, indent=2)
+        logger.info("Wrote NB diagnostics to %s", diag_path)
+    except Exception as exc:
+        logger.warning("Failed to write diagnostics summary: %s", exc)
+
+    # --- Evaluate ---
+    if not args.predict_only:
+        logger.info("Computing metrics using cell-eval...")
+
+        slurm_cpus_per_task = os.environ.get("SLURM_CPUS_PER_TASK")
+        pdex_num_workers: int
+        if slurm_cpus_per_task:
+            try:
+                pdex_num_workers = max(1, int(slurm_cpus_per_task))
+            except ValueError:
+                pdex_num_workers = max(1, os.cpu_count() or 1)
+        else:
+            pdex_num_workers = max(1, os.cpu_count() or 1)
+
+        pdex_kwargs = dict(exp_post_agg=True, is_log1p=metrics_is_log1p, num_workers=pdex_num_workers)
+        allow_discrete_eval = not metrics_is_log1p
+        logger.info(
+            "Cell-eval config: allow_discrete=%s (pdex is_log1p=%s, num_workers=%d)",
+            allow_discrete_eval,
+            metrics_is_log1p,
+            pdex_num_workers,
+        )
+
+        # --- Inline DESeq2 for pseudobulk DE ---
+        deseq2_de_results = {}
+        if args.pseudobulk and not args.skip_de:
+            try:
+                from deseq2_pipeline import run_from_precomputed
+                _has_deseq2 = True
+            except ImportError:
+                logger.warning(
+                    "deseq2-pipeline not installed. Falling back to skip_de=True for pseudobulk. "
+                    "Install with: pip install deseq2-pipeline"
+                )
+                _has_deseq2 = False
+
+            if _has_deseq2:
+                import polars as pl
+
+                control_pert = data_module.get_control_pert()
+                # Determine gene names for DESeq2 output
+                _deseq2_dim = pseudo_x_dim if use_count_outputs else output_dim
+                _deseq2_var = gene_var_names
+                if _deseq2_var is None or len(_deseq2_var) != _deseq2_dim:
+                    _deseq2_var = [f"gene_{i}" for i in range(_deseq2_dim)]
+
+                # Group pb_groups entries by cell type
+                ct_groups: dict[str, dict[str, dict]] = {}
+                ct_ctrl: dict[str, dict] = {}
+                for (ctx, pname), entry in pb_groups.items():
+                    ct = entry["celltype_name"]
+                    if ct not in ct_groups:
+                        ct_groups[ct] = {}
+                        ct_ctrl[ct] = None
+                    if pname == control_pert:
+                        ct_ctrl[ct] = entry
+                    else:
+                        ct_groups[ct][pname] = entry
+
+                for ct in sorted(ct_groups.keys()):
+                    ctrl_entry = ct_ctrl.get(ct)
+                    if ctrl_entry is None:
+                        logger.warning("Cell type '%s': no control entry found, skipping DESeq2.", ct)
+                        continue
+
+                    pert_entries = ct_groups[ct]
+                    if not pert_entries:
+                        continue
+
+                    ctrl_rep_counts = np.stack(ctrl_entry["real_rep_sums"]).astype(np.int64)
+                    ct_safe = ct.replace("/", "-")
+
+                    # Run DESeq2 for predicted
+                    pred_pert_counts = {
+                        p: np.stack(e["pred_rep_sums"]).astype(np.int64)
+                        for p, e in pert_entries.items()
+                    }
+                    pred_ctrl = np.stack(ctrl_entry["pred_rep_sums"]).astype(np.int64)
+                    pred_outdir = os.path.join(results_dir, f"deseq2_{ct_safe}_pred")
+                    logger.info("Running DESeq2 for cell type '%s' (pred, %d perts)...", ct, len(pred_pert_counts))
+                    # R workers are single-threaded subprocesses (OMP_NUM_THREADS=1);
+                    # safe to over-subscribe CPU since each worker is short-lived (~6s).
+                    deseq2_n_workers = max(pdex_num_workers, 50)
+                    pred_de_df = run_from_precomputed(
+                        pred_pert_counts, pred_ctrl, _deseq2_var,
+                        outdir=pred_outdir, n_workers_r=deseq2_n_workers,
+                    )
+
+                    # Run DESeq2 for real
+                    real_pert_counts = {
+                        p: np.stack(e["real_rep_sums"]).astype(np.int64)
+                        for p, e in pert_entries.items()
+                    }
+                    real_outdir = os.path.join(results_dir, f"deseq2_{ct_safe}_real")
+                    logger.info("Running DESeq2 for cell type '%s' (real, %d perts)...", ct, len(real_pert_counts))
+                    real_de_df = run_from_precomputed(
+                        real_pert_counts, ctrl_rep_counts, _deseq2_var,
+                        outdir=real_outdir, n_workers_r=deseq2_n_workers,
+                    )
+
+                    # Convert to cell-eval format: target, feature, fold_change, p_value, fdr
+                    def _deseq2_to_celleval(df: pd.DataFrame) -> pl.DataFrame:
+                        renamed = df.rename(columns={
+                            "perturbation": "target",
+                            "gene": "feature",
+                            "pvalue": "p_value",
+                        })
+                        # Select only the columns cell-eval needs
+                        keep = ["target", "feature", "fold_change", "p_value", "fdr"]
+                        keep = [c for c in keep if c in renamed.columns]
+                        return pl.from_pandas(renamed[keep])
+
+                    deseq2_de_results[ct] = {
+                        "pred": _deseq2_to_celleval(pred_de_df),
+                        "real": _deseq2_to_celleval(real_de_df),
+                    }
+                    logger.info("DESeq2 complete for cell type '%s'.", ct)
+
+        # --- Run cell-eval ---
+        if args.pseudobulk and deseq2_de_results:
+            # DESeq2 mode: non-DE metrics from pseudobulk, DE metrics from precomputed DESeq2
+            _run_cell_eval(
+                adata_real_eval, adata_pred_eval, data_module, results_dir,
+                args.profile, pdex_kwargs, data_module.embed_key,
+                skip_de=True,
+                allow_discrete=allow_discrete_eval,
+                deseq2_de_results=deseq2_de_results,
+            )
+        else:
+            # Standard evaluation (all metrics together, or skip_de)
+            _run_cell_eval(
+                adata_real_eval, adata_pred_eval, data_module, results_dir,
+                args.profile, pdex_kwargs, data_module.embed_key,
+                skip_de=args.skip_de,
+                allow_discrete=allow_discrete_eval,
+            )

@@ -1,7 +1,6 @@
 import logging
 import math
 
-import anndata as ad
 import numpy as np
 import torch
 import torch.nn as nn
@@ -10,90 +9,79 @@ import torch.nn.functional as F
 from geomloss import SamplesLoss
 from typing import Dict, Optional, Tuple
 
+from ..optim import MuonWithAuxAdamW
 from .base import PerturbationModel
-from .decoders import FinetuneVCICountsDecoder
 from .utils import build_mlp, get_activation_class, get_transformer_backbone, apply_lora
 
 
 logger = logging.getLogger(__name__)
 
 
-class CombinedLoss(nn.Module):
-    """Combined Sinkhorn + Energy loss."""
-
-    def __init__(self, sinkhorn_weight=0.001, energy_weight=1.0, blur=0.05):
-        super().__init__()
-        self.sinkhorn_weight = sinkhorn_weight
-        self.energy_weight = energy_weight
-        self.sinkhorn_loss = SamplesLoss(loss="sinkhorn", blur=blur)
-        self.energy_loss = SamplesLoss(loss="energy", blur=blur)
-
-    def forward(self, pred, target):
-        sinkhorn_val = self.sinkhorn_loss(pred, target)
-        energy_val = self.energy_loss(pred, target)
-        return self.sinkhorn_weight * sinkhorn_val + self.energy_weight * energy_val
+_MUON_EXCLUDED_MODULE_TYPES = (
+    nn.Embedding,
+    nn.LayerNorm,
+    nn.BatchNorm1d,
+    nn.BatchNorm2d,
+    nn.BatchNorm3d,
+    nn.GroupNorm,
+    nn.InstanceNorm1d,
+    nn.InstanceNorm2d,
+    nn.InstanceNorm3d,
+)
 
 
-class ConfidenceToken(nn.Module):
-    """
-    Learnable confidence token that gets appended to the input sequence
-    and learns to predict the expected loss value.
-    """
+def _extract_transformer_hidden(output: object) -> Optional[torch.Tensor]:
+    hidden = getattr(output, "last_hidden_state", output)
+    return hidden if torch.is_tensor(hidden) else None
 
-    def __init__(self, hidden_dim: int, dropout: float = 0.1):
-        super().__init__()
-        # Learnable confidence token embedding
-        self.confidence_token = nn.Parameter(torch.randn(1, 1, hidden_dim))
 
-        # Projection head to map confidence token output to scalar loss prediction
-        self.confidence_projection = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.LayerNorm(hidden_dim // 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 4, 1),
-            nn.ReLU(),  # Ensure positive loss prediction
-        )
+def _sample_residual_tokens(hidden_states: torch.Tensor, max_tokens: int) -> torch.Tensor:
+    flat = hidden_states.detach().reshape(-1, hidden_states.shape[-1])
+    sample_size = min(flat.shape[0], max(1, int(max_tokens)))
+    return flat[:sample_size]
 
-    def append_confidence_token(self, seq_input: torch.Tensor) -> torch.Tensor:
-        """
-        Append confidence token to the sequence input.
 
-        Args:
-            seq_input: Input tensor of shape [B, S, E]
+def _summarize_residual_sample(
+    input_sample: torch.Tensor,
+    output_sample: torch.Tensor,
+    eps: float = 1e-8,
+) -> dict[str, torch.Tensor]:
+    input32 = input_sample.float()
+    output32 = output_sample.float()
+    delta32 = output32 - input32
+    input_rms = input32.square().mean().sqrt()
+    output_rms = output32.square().mean().sqrt()
+    delta_rms = delta32.square().mean().sqrt()
+    denom = input_rms.clamp_min(eps)
+    return {
+        "train/residual_input_rms": input_rms,
+        "train/residual_output_rms": output_rms,
+        "train/residual_delta_rms": delta_rms,
+        "train/residual_output_gain": output_rms / denom,
+        "train/residual_delta_ratio": delta_rms / denom,
+    }
 
-        Returns:
-            Extended tensor of shape [B, S+1, E]
-        """
-        batch_size = seq_input.size(0)
-        # Expand confidence token to batch size
-        confidence_tokens = self.confidence_token.expand(batch_size, -1, -1)
-        # Concatenate along sequence dimension
-        return torch.cat([seq_input, confidence_tokens], dim=1)
 
-    def extract_confidence_prediction(self, transformer_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Extract main output and confidence prediction from transformer output.
+def _split_muon_parameters(module: nn.Module) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    excluded_prefixes: set[str] = set()
+    for module_name, child in module.named_modules():
+        if isinstance(child, _MUON_EXCLUDED_MODULE_TYPES):
+            prefix = f"{module_name}." if module_name else ""
+            excluded_prefixes.add(prefix)
 
-        Args:
-            transformer_output: Output tensor of shape [B, S+1, E]
-
-        Returns:
-            main_output: Tensor of shape [B, S, E]
-            confidence_pred: Tensor of shape [B, 1]
-        """
-        # Split the output
-        main_output = transformer_output[:, :-1, :]  # [B, S, E]
-        confidence_output = transformer_output[:, -1:, :]  # [B, 1, E]
-
-        # Project confidence token output to scalar
-        confidence_pred = self.confidence_projection(confidence_output).squeeze(-1)  # [B, 1]
-
-        return main_output, confidence_pred
+    muon_params: list[torch.nn.Parameter] = []
+    adamw_params: list[torch.nn.Parameter] = []
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim < 2 or name.endswith(".bias"):
+            adamw_params.append(param)
+            continue
+        if any(name.startswith(prefix) for prefix in excluded_prefixes):
+            adamw_params.append(param)
+            continue
+        muon_params.append(param)
+    return muon_params, adamw_params
 
 
 class StateTransitionPerturbationModel(PerturbationModel):
@@ -105,6 +93,18 @@ class StateTransitionPerturbationModel(PerturbationModel):
       a sample-to-sample single-cell map.
     """
 
+    @staticmethod
+    def _resolve_nb_embed_loss_weight(embed_key: Optional[str], kwargs: Dict[str, object]) -> Tuple[float, bool]:
+        """Resolve NB embedding auxiliary-loss weight.
+
+        Returns:
+            (weight, used_default)
+        """
+        if "nb_embed_loss_weight" in kwargs:
+            return float(kwargs["nb_embed_loss_weight"]), False
+        # Default to NB-only training objective. Explicitly opt in to embedding auxiliary loss.
+        return 0.0, True
+
     def __init__(
         self,
         input_dim: int,
@@ -115,7 +115,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         basal_mapping_strategy: str = "random",
         predict_residual: bool = True,
         distributional_loss: str = "energy",
-        transformer_backbone_key: str = "GPT2",
+        transformer_backbone_key: str = "llama",
         transformer_backbone_kwargs: dict = None,
         output_space: str = "gene",
         gene_dim: Optional[int] = None,
@@ -127,7 +127,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
             hidden_dim: not necessarily used, but required by PerturbationModel signature.
             output_dim: dimension of the output space (genes or latent).
             pert_dim: dimension of perturbation embedding.
-            gpt: e.g. "TranslationTransformerSamplesModel".
+            transformer_backbone_key: transformer family key; defaults to Llama.
             model_kwargs: dictionary passed to that model's constructor.
             loss: choice of distributional metric ("sinkhorn", "energy", etc.).
             **kwargs: anything else to pass up to PerturbationModel or not used.
@@ -147,12 +147,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
         # Save or store relevant hyperparams
         self.predict_residual = predict_residual
         self.output_space = output_space
-        self.n_encoder_layers = kwargs.get("n_encoder_layers", 2)
-        self.n_decoder_layers = kwargs.get("n_decoder_layers", 2)
+        self.n_encoder_layers = kwargs.get("n_encoder_layers", 1)
+        self.n_decoder_layers = kwargs.get("n_decoder_layers", 1)
         self.activation_class = get_activation_class(kwargs.get("activation", "gelu"))
         self.cell_sentence_len = kwargs.get("cell_set_len", 256)
         self.decoder_loss_weight = kwargs.get("decoder_weight", 1.0)
-        self.regularization = kwargs.get("regularization", 0.0)
         self.detach_decoder = kwargs.get("detach_decoder", False)
 
         self.transformer_backbone_key = transformer_backbone_key
@@ -161,8 +160,106 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         self.distributional_loss = distributional_loss
         self.gene_dim = gene_dim
-        self.mmd_num_chunks = max(int(kwargs.get("mmd_num_chunks", 1)), 1)
-        self.randomize_mmd_chunks = bool(kwargs.get("randomize_mmd_chunks", False))
+        self.nb_loss = bool(kwargs.get("nb_loss", False))
+        self.nb_eps = float(kwargs.get("nb_eps", 1e-8))
+        self.nb_embed_loss_weight, used_default_nb_embed_weight = self._resolve_nb_embed_loss_weight(
+            self.embed_key,
+            kwargs,
+        )
+        self.nb_log1p_mse_weight = float(kwargs.get("nb_log1p_mse_weight", 0.0))
+        self.nb_library_mse_weight = float(kwargs.get("nb_library_mse_weight", 0.0))
+        self.nb_inference_dispersion_mode = str(kwargs.get("nb_inference_dispersion_mode", "per_cell")).strip().lower()
+        self.nb_inference_output_mode = str(kwargs.get("nb_inference_output_mode", "mean")).strip().lower()
+        self.nb_library_size_mode = str(kwargs.get("nb_library_size_mode", "set_median")).strip().lower()
+        self.nb_inference_library_size_mode = str(kwargs.get("nb_inference_library_size_mode", "auto")).strip().lower()
+        self.nb_inference_library_blend_alpha = float(kwargs.get("nb_inference_library_blend_alpha", 0.5))
+        self.nb_px_scale_activation = str(kwargs.get("nb_px_scale_activation", "softmax")).strip().lower()
+        self.nb_count_round_mode = str(kwargs.get("nb_count_round_mode", "auto")).strip().lower()
+        valid_dispersion_modes = {"per_cell", "set_median"}
+        valid_output_modes = {"mean", "sample"}
+        valid_library_modes = {"per_cell", "set_median", "predicted"}
+        valid_inference_library_modes = {"auto", "target_oracle", "per_cell", "set_median", "predicted", "blend"}
+        valid_px_scale_activations = {"softmax", "sparsemax"}
+        valid_count_round_modes = {"auto", "always", "never"}
+        if self.nb_inference_dispersion_mode not in valid_dispersion_modes:
+            raise ValueError(
+                "nb_inference_dispersion_mode must be one of "
+                f"{sorted(valid_dispersion_modes)}; got {self.nb_inference_dispersion_mode!r}."
+            )
+        if self.nb_inference_output_mode not in valid_output_modes:
+            raise ValueError(
+                "nb_inference_output_mode must be one of "
+                f"{sorted(valid_output_modes)}; got {self.nb_inference_output_mode!r}."
+            )
+        if self.nb_library_size_mode not in valid_library_modes:
+            raise ValueError(
+                "nb_library_size_mode must be one of "
+                f"{sorted(valid_library_modes)}; got {self.nb_library_size_mode!r}."
+            )
+        if self.nb_inference_library_size_mode not in valid_inference_library_modes:
+            raise ValueError(
+                "nb_inference_library_size_mode must be one of "
+                f"{sorted(valid_inference_library_modes)}; got {self.nb_inference_library_size_mode!r}."
+            )
+        if not (0.0 <= self.nb_inference_library_blend_alpha <= 1.0):
+            raise ValueError(
+                "nb_inference_library_blend_alpha must be in [0, 1]; "
+                f"got {self.nb_inference_library_blend_alpha!r}."
+            )
+        if self.nb_px_scale_activation not in valid_px_scale_activations:
+            raise ValueError(
+                "nb_px_scale_activation must be one of "
+                f"{sorted(valid_px_scale_activations)}; got {self.nb_px_scale_activation!r}."
+            )
+        if self.nb_count_round_mode not in valid_count_round_modes:
+            raise ValueError(
+                "nb_count_round_mode must be one of "
+                f"{sorted(valid_count_round_modes)}; got {self.nb_count_round_mode!r}."
+            )
+        if self.nb_loss and self.output_space == "embedding":
+            raise ValueError(
+                "nb_loss=True is incompatible with output_space='embedding'. "
+                "Use output_space='gene' or output_space='all'."
+            )
+        if self.nb_loss and self.output_space not in {"gene", "all"}:
+            raise ValueError(f"nb_loss=True requires output_space in {{'gene', 'all'}}; got {self.output_space!r}.")
+        if self.nb_loss and used_default_nb_embed_weight:
+            logger.info(
+                "nb_loss=True: using default nb_embed_loss_weight=0.0 "
+                "(set model.kwargs.nb_embed_loss_weight>0 to enable auxiliary embedding loss)."
+            )
+        if self.nb_loss and self.nb_embed_loss_weight > 0.0:
+            logger.warning(
+                "nb_loss=True with nb_embed_loss_weight=%.3f enables an auxiliary embedding-space loss "
+                "that can dominate NB optimization for full-transcriptome objectives.",
+                self.nb_embed_loss_weight,
+            )
+        if self.nb_loss and self.nb_log1p_mse_weight > 0.0:
+            logger.warning(
+                "nb_loss=True with nb_log1p_mse_weight=%.3f enables auxiliary log1p-mean calibration.",
+                self.nb_log1p_mse_weight,
+            )
+        if self.nb_loss and self.nb_library_mse_weight > 0.0:
+            logger.warning(
+                "nb_loss=True with nb_library_mse_weight=%.3f enables auxiliary library-size calibration.",
+                self.nb_library_mse_weight,
+            )
+        if self.nb_loss and self.nb_count_round_mode != "always":
+            logger.warning(
+                "nb_loss=True with nb_count_round_mode=%s uses non-integer transformed targets for log1p inputs.",
+                self.nb_count_round_mode,
+            )
+        if self.nb_loss:
+            if self.gene_decoder is not None:
+                logger.info("nb_loss=True: disabling gene_decoder and decoder loss branches.")
+            self.gene_decoder = None
+            self.gene_decoder_bool = False
+            self.decoder_cfg = None
+            try:
+                self.hparams["gene_decoder_bool"] = False  # type: ignore[index]
+                self.hparams["decoder_cfg"] = None  # type: ignore[index]
+            except Exception:
+                pass
 
         # Build the distributional loss from geomloss
         blur = kwargs.get("blur", 0.05)
@@ -172,18 +269,53 @@ class StateTransitionPerturbationModel(PerturbationModel):
         elif loss_name == "mse":
             self.loss_fn = nn.MSELoss()
         elif loss_name == "se":
-            sinkhorn_weight = kwargs.get("sinkhorn_weight", 0.01)
-            energy_weight = kwargs.get("energy_weight", 1.0)
-            self.loss_fn = CombinedLoss(sinkhorn_weight=sinkhorn_weight, energy_weight=energy_weight, blur=blur)
+            raise ValueError(
+                "loss='se' (combined sinkhorn+energy) has been removed. "
+                "Use loss='energy', loss='sinkhorn', or loss='mse'."
+            )
         elif loss_name == "sinkhorn":
             self.loss_fn = SamplesLoss(loss="sinkhorn", blur=blur)
         else:
             raise ValueError(f"Unknown loss function: {loss_name}")
 
         self.use_basal_projection = kwargs.get("use_basal_projection", True)
+        self.bottleneck_ratio = int(kwargs.get("bottleneck_ratio", 8))
 
         # Build the underlying neural OT network
         self._build_networks(lora_cfg=kwargs.get("lora", None))
+        self.nb_parameter_head: Optional[nn.Module] = None
+        self.nb_library_head: Optional[nn.Module] = None
+        self.nb_target_dim = int(self.output_dim)
+        if self.nb_loss:
+            if self.output_space == "all":
+                self.nb_target_dim = int(self.gene_dim if self.gene_dim is not None else self.output_dim)
+            elif self.embed_key is not None and self.embed_key != "X_hvg":
+                self.nb_target_dim = int(self.hvg_dim if self.hvg_dim is not None else self.output_dim)
+
+            self.nb_parameter_head = build_mlp(
+                in_dim=self.output_dim,
+                out_dim=self.nb_target_dim * 2,
+                hidden_dim=self.hidden_dim,
+                n_layers=self.n_decoder_layers,
+                dropout=self.dropout,
+                activation=self.activation_class,
+            )
+            if self.nb_library_size_mode == "predicted":
+                self.nb_library_head = build_mlp(
+                    in_dim=self.output_dim,
+                    out_dim=1,
+                    hidden_dim=self.hidden_dim,
+                    n_layers=self.n_decoder_layers,
+                    dropout=self.dropout,
+                    activation=self.activation_class,
+                )
+            logger.info(
+                "NB loss enabled for state transition model "
+                "(nb_target_dim=%d, nb_embed_loss_weight=%.3f, nb_px_scale_activation=%s).",
+                self.nb_target_dim,
+                self.nb_embed_loss_weight,
+                self.nb_px_scale_activation,
+            )
 
         # Add an optional encoder that introduces a batch variable
         self.batch_encoder = None
@@ -196,102 +328,23 @@ class StateTransitionPerturbationModel(PerturbationModel):
             )
             self.batch_dim = batch_dim
 
-        # Optional batch predictor ablation: learns a single batch token added to every position,
-        # and adds an auxiliary per-token batch classification head + CE loss.
-        self.batch_predictor = bool(kwargs.get("batch_predictor", False))
-        # If batch_encoder is enabled, disable batch_predictor per request
-        if self.batch_encoder is not None and self.batch_predictor:
-            logger.warning(
-                "Both model.kwargs.batch_encoder and model.kwargs.batch_predictor are True. "
-                "Disabling batch_predictor and proceeding with batch_encoder."
-            )
-            self.batch_predictor = False
-            try:
-                # Keep hparams in sync if available
-                self.hparams["batch_predictor"] = False  # type: ignore[index]
-            except Exception:
-                pass
-
-        self.batch_predictor_weight = float(kwargs.get("batch_predictor_weight", 0.1))
-        self.batch_predictor_num_classes: Optional[int] = batch_dim if self.batch_predictor else None
-        if self.batch_predictor:
-            if self.batch_predictor_num_classes is None:
-                raise ValueError("batch_predictor=True requires a valid `batch_dim` (number of batch classes).")
-            # A single learnable batch token that is added to each position
-            self.batch_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
-            # Simple per-token classifier from transformer hidden to batch classes
-            self.batch_classifier = build_mlp(
-                in_dim=self.hidden_dim,
-                out_dim=self.batch_predictor_num_classes,
-                hidden_dim=self.hidden_dim,
-                n_layers=4,
-                dropout=self.dropout,
-                activation=self.activation_class,
-            )
-        else:
-            self.batch_token = None
-            self.batch_classifier = None
-        # Internal cache for last token features (B, S, H) from transformer for aux loss
-        self._token_features: Optional[torch.Tensor] = None
-
         # if the model is outputting to counts space, apply relu
         # otherwise its in embedding space and we don't want to
         is_gene_space = kwargs["embed_key"] == "X_hvg" or kwargs["embed_key"] is None
         if is_gene_space or self.gene_decoder is None:
             self.relu = torch.nn.ReLU()
 
-        self.use_batch_token = kwargs.get("use_batch_token", False)
-        self.basal_mapping_strategy = basal_mapping_strategy
-        # Disable batch token only for truly incompatible cases
-        disable_reasons = []
-        if self.batch_encoder and self.use_batch_token:
-            disable_reasons.append("batch encoder is used")
-        if basal_mapping_strategy == "random" and self.use_batch_token:
-            disable_reasons.append("basal mapping strategy is random")
-
-        if disable_reasons:
-            self.use_batch_token = False
+        if kwargs.get("use_batch_token", False) or kwargs.get("batch_predictor", False):
             logger.warning(
-                f"Batch token is not supported when {' or '.join(disable_reasons)}, setting use_batch_token to False"
+                "Batch-token logic has been removed from StateTransitionPerturbationModel. "
+                "Ignoring model.kwargs.use_batch_token and model.kwargs.batch_predictor."
             )
-            try:
-                self.hparams["use_batch_token"] = False
-            except Exception:
-                pass
 
-        self.batch_token_weight = kwargs.get("batch_token_weight", 0.1)
-        self.batch_token_num_classes: Optional[int] = batch_dim if self.use_batch_token else None
-
-        if self.use_batch_token:
-            if self.batch_token_num_classes is None:
-                raise ValueError("batch_token_num_classes must be set when use_batch_token is True")
-            self.batch_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))
-            self.batch_classifier = build_mlp(
-                in_dim=self.hidden_dim,
-                out_dim=self.batch_token_num_classes,
-                hidden_dim=self.hidden_dim,
-                n_layers=1,
-                dropout=self.dropout,
-                activation=self.activation_class,
-            )
-        else:
-            self.batch_token = None
-            self.batch_classifier = None
-
-        # Internal cache for last token features (B, S, H) from transformer for aux loss
-        self._batch_token_cache: Optional[torch.Tensor] = None
-
-        # initialize a confidence token
-        self.confidence_token = None
-        self.confidence_loss_fn = None
         if kwargs.get("confidence_token", False):
-            self.confidence_token = ConfidenceToken(hidden_dim=self.hidden_dim, dropout=self.dropout)
-            self.confidence_loss_fn = nn.MSELoss()
-            self.confidence_target_scale = float(kwargs.get("confidence_target_scale", 10.0))
-            self.confidence_weight = float(kwargs.get("confidence_weight", 0.01))
-        else:
-            self.confidence_target_scale = None
-            self.confidence_weight = 0.0
+            logger.warning(
+                "Confidence-token logic has been removed from StateTransitionPerturbationModel. "
+                "Ignoring model.kwargs.confidence_token."
+            )
 
         # Backward-compat: accept legacy key `freeze_pert`
         self.freeze_pert_backbone = kwargs.get("freeze_pert_backbone", kwargs.get("freeze_pert", False))
@@ -306,30 +359,24 @@ class StateTransitionPerturbationModel(PerturbationModel):
             for param in self.project_out.parameters():
                 param.requires_grad = False
 
-        control_pert = kwargs.get("control_pert", "non-targeting")
-        if kwargs.get("finetune_vci_decoder", False):  # TODO: This will go very soon
-            # Prefer the gene names supplied by the data module (aligned to training output)
-            gene_names = self.gene_names
-            if gene_names is None:
-                raise ValueError(
-                    "finetune_vci_decoder=True but model.gene_names is None. "
-                    "Please provide gene_names via data module var_dims."
-                )
-
-            n_genes = len(gene_names)
-            logger.info(
-                f"Initializing FinetuneVCICountsDecoder with {n_genes} genes (output_space={output_space}; "
-                + ("HVG subset" if output_space == "gene" else "all genes")
-                + ")"
+        if kwargs.get("finetune_vci_decoder", False):
+            logger.warning(
+                "model.kwargs.finetune_vci_decoder is no longer supported. "
+                "Ignoring it and using the standard latent-to-gene decoder path."
             )
-            self.gene_decoder = FinetuneVCICountsDecoder(
-                genes=gene_names,
-            )
-        print(self)
+        self._residual_monitor_interval = max(int(kwargs.get("residual_monitor_interval", 50)), 0)
+        self._residual_monitor_max_tokens = max(int(kwargs.get("residual_monitor_max_tokens", 1024)), 1)
+        self._residual_pending_input: Optional[torch.Tensor] = None
+        self._residual_pending_step: Optional[int] = None
+        self._residual_last_captured_step: Optional[int] = None
+        self._residual_last_logged_step: Optional[int] = None
+        self._residual_metrics: Optional[dict[str, torch.Tensor]] = None
+        self._install_residual_monitor_hooks()
+        logger.debug("%s", self)
 
     def _build_networks(self, lora_cfg=None):
         """
-        Here we instantiate the actual GPT2-based model.
+        Here we instantiate the configured transformer backbone.
         """
         self.pert_encoder = build_mlp(
             in_dim=self.pert_dim,
@@ -366,9 +413,6 @@ class StateTransitionPerturbationModel(PerturbationModel):
                 lora_cfg,
             )
 
-        # Project from input_dim to hidden_dim for transformer input
-        # self.project_to_hidden = nn.Linear(self.input_dim, self.hidden_dim)
-
         self.project_out = build_mlp(
             in_dim=self.hidden_dim,
             out_dim=self.output_dim,
@@ -379,10 +423,15 @@ class StateTransitionPerturbationModel(PerturbationModel):
         )
 
         if self.output_space == "all":
+            bottleneck_dim = max(self.output_dim // self.bottleneck_ratio, 64)
+            logger.info(
+                "output_space='all': bottleneck %d → %d → %d (ratio=%d)",
+                self.output_dim, bottleneck_dim, self.output_dim, self.bottleneck_ratio,
+            )
             self.final_down_then_up = nn.Sequential(
-                nn.Linear(self.output_dim, self.output_dim // 8),
+                nn.Linear(self.output_dim, bottleneck_dim),
                 nn.GELU(),
-                nn.Linear(self.output_dim // 8, self.output_dim),
+                nn.Linear(bottleneck_dim, self.output_dim),
             )
 
     def encode_perturbation(self, pert: torch.Tensor) -> torch.Tensor:
@@ -393,7 +442,328 @@ class StateTransitionPerturbationModel(PerturbationModel):
         """Define how we embed basal state input, if needed."""
         return self.basal_encoder(expr)
 
-    def forward(self, batch: dict, padded=True) -> torch.Tensor:
+    def _should_capture_residual_metrics(self) -> tuple[bool, int]:
+        step = int(getattr(self, "global_step", 0))
+        if not self.training or self._residual_monitor_interval <= 0:
+            return False, step
+        if step % self._residual_monitor_interval != 0:
+            return False, step
+        if self._residual_last_captured_step == step:
+            return False, step
+        return True, step
+
+    def _clear_pending_residual_capture(self) -> None:
+        self._residual_pending_input = None
+        self._residual_pending_step = None
+
+    def _install_residual_monitor_hooks(self) -> None:
+        if self._residual_monitor_interval <= 0:
+            return
+        try:
+            self.transformer_backbone.register_forward_pre_hook(
+                self._capture_transformer_input_sample,
+                with_kwargs=True,
+            )
+            self.transformer_backbone.register_forward_hook(
+                self._capture_transformer_output_sample,
+                with_kwargs=True,
+            )
+        except TypeError:
+            self.transformer_backbone.register_forward_pre_hook(
+                lambda module, args: self._capture_transformer_input_sample(module, args, None)
+            )
+            self.transformer_backbone.register_forward_hook(
+                lambda module, args, output: self._capture_transformer_output_sample(module, args, None, output)
+            )
+
+    def _capture_transformer_input_sample(
+        self,
+        module: nn.Module,
+        args: tuple[object, ...],
+        kwargs: Optional[dict[str, object]] = None,
+    ) -> None:
+        should_capture, step = self._should_capture_residual_metrics()
+        if not should_capture:
+            return
+
+        inputs_embeds = None
+        if kwargs is not None:
+            inputs_embeds = kwargs.get("inputs_embeds")
+        if inputs_embeds is None and args:
+            inputs_embeds = args[0]
+        if not torch.is_tensor(inputs_embeds):
+            return
+
+        with torch.no_grad():
+            self._residual_pending_input = _sample_residual_tokens(inputs_embeds, self._residual_monitor_max_tokens)
+        self._residual_pending_step = step
+        self._residual_last_captured_step = step
+
+    def _capture_transformer_output_sample(
+        self,
+        module: nn.Module,
+        args: tuple[object, ...],
+        kwargs: Optional[dict[str, object]],
+        output: object,
+    ) -> None:
+        if self._residual_pending_input is None or self._residual_pending_step is None:
+            return
+
+        hidden = _extract_transformer_hidden(output)
+        if hidden is None:
+            self._clear_pending_residual_capture()
+            return
+
+        with torch.no_grad():
+            output_sample = _sample_residual_tokens(hidden, self._residual_monitor_max_tokens)
+            if output_sample.shape != self._residual_pending_input.shape:
+                self._clear_pending_residual_capture()
+                return
+            self._residual_metrics = _summarize_residual_sample(self._residual_pending_input, output_sample)
+        self._clear_pending_residual_capture()
+
+    def _log_residual_metrics_if_ready(self) -> None:
+        if not isinstance(self._residual_metrics, dict):
+            return
+        step = int(getattr(self, "global_step", 0))
+        if self._residual_last_logged_step == step:
+            return
+        for metric_name, metric_value in self._residual_metrics.items():
+            self.log(metric_name, metric_value, on_step=True, on_epoch=False)
+        self._residual_last_logged_step = step
+
+    def _main_loss_is_expression(self) -> bool:
+        if self.nb_loss:
+            return True
+        return super()._main_loss_is_expression()
+
+    @staticmethod
+    def _suspected_discrete_torch(x: torch.Tensor, n_cells: int = 100) -> bool:
+        if x.numel() == 0:
+            return False
+        flat = x.reshape(-1, x.shape[-1])
+        top_n = min(flat.shape[0], n_cells)
+        rowsum = flat[:top_n].sum(dim=1)
+        frac_part = rowsum - rowsum.floor()
+        return bool(torch.all(torch.abs(frac_part) < 1e-7))
+
+    @staticmethod
+    def _suspected_log_torch(x: torch.Tensor) -> bool:
+        if x.numel() == 0:
+            return False
+        return bool(x.max().item() < 15.0)
+
+    def _to_count_space(self, x: torch.Tensor) -> torch.Tensor:
+        round_mode = str(getattr(self, "nb_count_round_mode", "auto")).strip().lower()
+        x_float = x.float()
+        is_discrete = self._suspected_discrete_torch(x_float)
+        is_log = self._suspected_log_torch(x_float)
+
+        transformed_from_log = (not is_discrete) and is_log
+        if transformed_from_log:
+            counts = torch.expm1(x_float)
+        else:
+            counts = x_float
+
+        counts = torch.nan_to_num(counts, nan=0.0, posinf=0.0, neginf=0.0)
+        counts = counts.clamp_min(0.0)
+
+        if round_mode == "always":
+            return counts.round()
+        if round_mode == "never":
+            return counts
+        # auto: preserve continuity for transformed log1p inputs, keep raw-count paths integer-like.
+        if transformed_from_log:
+            return counts
+        return counts.round()
+
+    def _compute_per_cell_library_sizes_from_control(self, ctrl_cells: torch.Tensor) -> torch.Tensor:
+        ctrl_counts = self._to_count_space(ctrl_cells)
+        per_cell_library_sizes = ctrl_counts.sum(dim=-1)
+        per_cell_library_sizes = torch.nan_to_num(per_cell_library_sizes, nan=0.0, posinf=0.0, neginf=0.0)
+        return per_cell_library_sizes.unsqueeze(-1).clamp_min(1.0)
+
+    def _compute_library_sizes_from_control(self, ctrl_cells: torch.Tensor, mode: str) -> torch.Tensor:
+        per_cell_library_sizes = self._compute_per_cell_library_sizes_from_control(ctrl_cells)
+        if mode == "set_median":
+            return per_cell_library_sizes.median(dim=1, keepdim=True).values
+        if mode == "per_cell":
+            return per_cell_library_sizes
+        raise ValueError(f"Unsupported control-derived NB library mode: {mode!r}")
+
+    @staticmethod
+    def _compute_nb_library_sizes_from_mean(nb_mean: torch.Tensor) -> torch.Tensor:
+        return nb_mean.sum(dim=-1, keepdim=True).clamp_min(1.0)
+
+    @staticmethod
+    def _blend_nb_library_sizes(
+        set_median_library_sizes: torch.Tensor,
+        per_cell_library_sizes: torch.Tensor,
+        alpha: float,
+    ) -> torch.Tensor:
+        alpha_f = float(alpha)
+        return (1.0 - alpha_f) * set_median_library_sizes + alpha_f * per_cell_library_sizes
+
+    @staticmethod
+    def _rescale_nb_mean_between_library_modes(
+        nb_mean: torch.Tensor,
+        source_library_sizes: torch.Tensor,
+        target_library_sizes: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        source = source_library_sizes.clamp_min(eps)
+        scale = target_library_sizes / source
+        return nb_mean * scale
+
+    def _reshape_sequence_tensor(self, x: torch.Tensor, padded: bool) -> torch.Tensor:
+        if padded:
+            return x.reshape(-1, self.cell_sentence_len, x.shape[-1])
+        return x.reshape(1, -1, x.shape[-1])
+
+    def _get_nb_target_tensor(
+        self, batch: Dict[str, torch.Tensor], fallback_target: torch.Tensor, padded: bool
+    ) -> torch.Tensor:
+        pert_counts = batch.get("pert_cell_counts", None)
+        if pert_counts is not None:
+            return self._reshape_sequence_tensor(pert_counts.to(fallback_target.device), padded)
+        return fallback_target
+
+    def _get_nb_control_tensor_for_library(
+        self,
+        batch: Dict[str, torch.Tensor],
+        fallback_ctrl: torch.Tensor,
+        padded: bool,
+    ) -> torch.Tensor:
+        ctrl_counts = batch.get("ctrl_cell_counts", None)
+        if ctrl_counts is not None:
+            return self._reshape_sequence_tensor(ctrl_counts.to(fallback_ctrl.device), padded)
+        return fallback_ctrl
+
+    def _get_nb_target_library_sizes_for_inference(self, batch: Dict[str, torch.Tensor], padded: bool) -> torch.Tensor:
+        """Return per-cell target library sizes from perturbation counts (diagnostic-only mode)."""
+        pert_counts = batch.get("pert_cell_counts", None)
+        if pert_counts is None:
+            raise RuntimeError(
+                "nb_inference_library_size_mode='target_oracle' requires pert_cell_counts in predict batches."
+            )
+        target_counts = self._reshape_sequence_tensor(pert_counts, padded)
+        return self._compute_library_sizes_from_control(target_counts, mode="per_cell")
+
+    def _get_nb_source_library_sizes_for_inference(
+        self,
+        batch: Dict[str, torch.Tensor],
+        nb_mean: torch.Tensor,
+        padded: bool,
+    ) -> torch.Tensor:
+        if self.nb_library_size_mode == "predicted":
+            return self._compute_nb_library_sizes_from_mean(nb_mean)
+        ctrl_for_library = self._get_nb_control_tensor_for_library(
+            batch,
+            batch["ctrl_cell_emb"],
+            padded,
+        )
+        return self._compute_library_sizes_from_control(
+            ctrl_for_library,
+            self.nb_library_size_mode,
+        )
+
+    def _compute_nb_nll_loss(
+        self,
+        nb_mean: torch.Tensor,
+        nb_dispersion: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        target_counts = self._to_count_space(target).to(nb_mean.dtype)
+        if nb_mean.shape != nb_dispersion.shape:
+            raise RuntimeError(
+                f"NB parameter shape mismatch: mean={tuple(nb_mean.shape)} dispersion={tuple(nb_dispersion.shape)}"
+            )
+        if target_counts.shape[-1] != nb_mean.shape[-1]:
+            raise RuntimeError(
+                "NB target dimension mismatch: "
+                f"target={target_counts.shape[-1]} vs nb_params={nb_mean.shape[-1]}. "
+                "Ensure pert_cell_counts has the expected gene dimension for NB training."
+            )
+        mu = nb_mean.clamp_min(self.nb_eps)
+        theta = nb_dispersion.clamp_min(self.nb_eps)
+        log_theta_mu_eps = torch.log(theta + mu + self.nb_eps)
+        log_nb = (
+            theta * (torch.log(theta + self.nb_eps) - log_theta_mu_eps)
+            + target_counts * (torch.log(mu + self.nb_eps) - log_theta_mu_eps)
+            + torch.lgamma(target_counts + theta)
+            - torch.lgamma(theta)
+            - torch.lgamma(target_counts + 1)
+        )
+        recon_loss_all = -log_nb
+        return torch.nanmean(recon_loss_all.reshape(recon_loss_all.shape[0], -1), dim=1)
+
+    def _compute_nb_log1p_mse_per_set(
+        self,
+        nb_mean: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        target_counts = self._to_count_space(target).to(nb_mean.dtype)
+        pred_log = torch.log1p(nb_mean.clamp_min(0.0))
+        target_log = torch.log1p(target_counts.clamp_min(0.0))
+        sq_err = (pred_log - target_log) ** 2
+        return torch.nanmean(sq_err.reshape(sq_err.shape[0], -1), dim=1)
+
+    def _compute_nb_library_mse_per_set(
+        self,
+        nb_mean: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        target_counts = self._to_count_space(target).to(nb_mean.dtype)
+        pred_library = self._compute_nb_library_sizes_from_mean(nb_mean)
+        target_library = target_counts.sum(dim=-1, keepdim=True).clamp_min(0.0)
+        sq_err = (pred_library - target_library) ** 2
+        return torch.nanmean(sq_err.reshape(sq_err.shape[0], -1), dim=1)
+
+    @staticmethod
+    def _reduce_dispersion_for_inference(nb_dispersion: torch.Tensor, mode: str) -> torch.Tensor:
+        if mode == "set_median":
+            return nb_dispersion.median(dim=1, keepdim=True).values.expand_as(nb_dispersion)
+        return nb_dispersion
+
+    @staticmethod
+    def _sparsemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """Sparsemax projection (Martins & Astudillo, 2016)."""
+        z = logits - logits.max(dim=dim, keepdim=True).values
+        z_sorted, _ = torch.sort(z, descending=True, dim=dim)
+
+        d = z.size(dim)
+        rhos = torch.arange(1, d + 1, device=z.device, dtype=z.dtype)
+        view = [1] * z.dim()
+        view[dim] = d
+        rhos = rhos.view(view)
+
+        z_cumsum = torch.cumsum(z_sorted, dim=dim)
+        support = (1 + rhos * z_sorted) > z_cumsum
+        support_size = support.to(z.dtype).sum(dim=dim, keepdim=True).clamp_min(1.0)
+        tau = (z_cumsum.gather(dim, (support_size.long() - 1)) - 1.0) / support_size
+        return torch.clamp(z - tau, min=0.0)
+
+    def _apply_nb_scale_activation(self, px_scale_logits: torch.Tensor) -> torch.Tensor:
+        if self.nb_px_scale_activation == "sparsemax":
+            return self._sparsemax(px_scale_logits, dim=-1)
+        return F.softmax(px_scale_logits, dim=-1)
+
+    def _sample_nb_counts(self, nb_mean: torch.Tensor, nb_dispersion: torch.Tensor) -> torch.Tensor:
+        mu = nb_mean.clamp_min(self.nb_eps)
+        theta = nb_dispersion.clamp_min(self.nb_eps)
+        # PyTorch NB(mean) convention: mean = total_count * probs / (1 - probs).
+        # To sample counts with target mean=mu and inverse-dispersion=theta:
+        # probs = mu / (theta + mu).
+        probs = mu / (theta + mu + self.nb_eps)
+        nb_dist = torch.distributions.NegativeBinomial(total_count=theta, probs=probs)
+        return nb_dist.sample()
+
+    def forward(
+        self,
+        batch: dict,
+        padded=True,
+        return_nb_params: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         The main forward call. Batch is a flattened sequence of cell sentences,
         which we reshape into sequences of length cell_sentence_len.
@@ -440,24 +810,13 @@ class StateTransitionPerturbationModel(PerturbationModel):
             batch_embeddings = self.batch_encoder(batch_indices.long())  # Shape: [B, S, hidden_dim]
             seq_input = seq_input + batch_embeddings
 
-        if self.use_batch_token and self.batch_token is not None:
-            batch_size, _, _ = seq_input.shape
-            # Prepend the batch token to the sequence along the sequence dimension
-            # [B, S, H] -> [B, S+1, H], batch token at position 0
-            seq_input = torch.cat([self.batch_token.expand(batch_size, -1, -1), seq_input], dim=1)
-
-        confidence_pred = None
-        if self.confidence_token is not None:
-            # Append confidence token: [B, S, E] -> [B, S+1, E] (might be one more if we have the batch token)
-            seq_input = self.confidence_token.append_confidence_token(seq_input)
-
         # forward pass + extract CLS last hidden state
         if self.hparams.get("mask_attn", False):
             batch_size, seq_length, _ = seq_input.shape
             device = seq_input.device
             self.transformer_backbone._attn_implementation = "eager"  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
 
-            # create a [1,1,S,S] mask (now S+1 if confidence token is used)
+            # create a [1,1,S,S] mask
             base = torch.eye(seq_length, device=device, dtype=torch.bool).view(1, 1, seq_length, seq_length)
 
             # Get number of attention heads from model config
@@ -472,36 +831,11 @@ class StateTransitionPerturbationModel(PerturbationModel):
             outputs = self.transformer_backbone(inputs_embeds=seq_input)
             transformer_output = outputs.last_hidden_state
 
-        # Extract outputs accounting for optional prepended batch token and optional confidence token at the end
-        if self.confidence_token is not None and self.use_batch_token and self.batch_token is not None:
-            # transformer_output: [B, 1 + S + 1, H] -> batch token at 0, cells 1..S, confidence at -1
-            batch_token_pred = transformer_output[:, :1, :]  # [B, 1, H]
-            res_pred, confidence_pred = self.confidence_token.extract_confidence_prediction(
-                transformer_output[:, 1:, :]
-            )
-            # res_pred currently excludes the confidence token and starts from former index 1
-            self._batch_token_cache = batch_token_pred
-        elif self.confidence_token is not None:
-            # Only confidence token appended at the end
-            res_pred, confidence_pred = self.confidence_token.extract_confidence_prediction(transformer_output)
-            self._batch_token_cache = None
-        elif self.use_batch_token and self.batch_token is not None:
-            # Only batch token prepended at the beginning
-            batch_token_pred = transformer_output[:, :1, :]  # [B, 1, H]
-            res_pred = transformer_output[:, 1:, :]  # [B, S, H]
-            self._batch_token_cache = batch_token_pred
-        else:
-            # Neither special token used
-            res_pred = transformer_output
-            self._batch_token_cache = None
-
-        # Cache token features for auxiliary batch prediction loss (B, S, H)
-        self._token_features = res_pred
+        res_pred = transformer_output
 
         # add to basal if predicting residual
         if self.predict_residual and self.output_space == "all":
             # Project control_cells to hidden_dim space to match res_pred
-            # control_cells_hidden = self.project_to_hidden(control_cells)
             # treat the actual prediction as a residual sum to basal
             out_pred = self.project_out(res_pred) + basal
             out_pred = self.final_down_then_up(out_pred)
@@ -512,42 +846,49 @@ class StateTransitionPerturbationModel(PerturbationModel):
 
         # apply relu if specified and we output to HVG space
         is_gene_space = self.hparams["embed_key"] == "X_hvg" or self.hparams["embed_key"] is None
-        if is_gene_space or self.gene_decoder is None:
+        if is_gene_space or (self.gene_decoder is None and not self.nb_loss):
             out_pred = self.relu(out_pred)
+
+        nb_mean = None
+        nb_dispersion = None
+        if self.nb_loss:
+            if self.nb_parameter_head is None:
+                raise RuntimeError("nb_loss=True but nb_parameter_head was not initialized.")
+            nb_params = self.nb_parameter_head(out_pred)
+            px_scale_logits, nb_dispersion_logits = torch.chunk(nb_params, chunks=2, dim=-1)
+            px_scale = self._apply_nb_scale_activation(px_scale_logits)
+            if self.nb_library_size_mode == "predicted":
+                if self.nb_library_head is None:
+                    raise RuntimeError(
+                        "nb_library_size_mode='predicted' requires nb_library_head to be initialized."
+                    )
+                library_sizes = F.softplus(self.nb_library_head(out_pred)) + 1.0
+            else:
+                ctrl_for_library = self._get_nb_control_tensor_for_library(batch, basal, padded)
+                library_sizes = self._compute_library_sizes_from_control(ctrl_for_library, self.nb_library_size_mode)
+            nb_mean = px_scale * library_sizes
+            nb_dispersion = F.softplus(nb_dispersion_logits) + self.nb_eps
 
         output = out_pred.reshape(-1, self.output_dim)
 
-        if confidence_pred is not None:
-            return output, confidence_pred
-        else:
+        if not self.nb_loss or not return_nb_params:
             return output
+        if nb_mean is None or nb_dispersion is None:
+            raise RuntimeError("nb_loss=True but NB parameters were not produced in forward().")
+        return output, nb_mean.reshape(-1, self.nb_target_dim), nb_dispersion.reshape(-1, self.nb_target_dim)
 
     def _compute_distribution_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Apply the primary distributional loss, optionally chunking feature dimensions for SamplesLoss."""
-
-        if isinstance(self.loss_fn, SamplesLoss) and self.mmd_num_chunks > 1:
-            feature_dim = pred.shape[-1]
-            num_chunks = min(self.mmd_num_chunks, feature_dim)
-            if num_chunks > 1 and feature_dim > 0:
-                if self.randomize_mmd_chunks and self.training:
-                    perm = torch.randperm(feature_dim, device=pred.device)
-                    pred = pred.index_select(-1, perm)
-                    target = target.index_select(-1, perm)
-                pred_chunks = torch.chunk(pred, num_chunks, dim=-1)
-                target_chunks = torch.chunk(target, num_chunks, dim=-1)
-                chunk_losses = [self.loss_fn(p_chunk, t_chunk) for p_chunk, t_chunk in zip(pred_chunks, target_chunks)]
-                return torch.stack(chunk_losses, dim=0).nanmean(dim=0)
-
+        """Apply the primary distributional loss."""
         return self.loss_fn(pred, target)
 
     def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int, padded=True) -> torch.Tensor:
         """Training step logic for both main model and decoder."""
         # Get model predictions (in latent space)
-        confidence_pred = None
-        if self.confidence_token is not None:
-            pred, confidence_pred = self.forward(batch, padded=padded)
+        if self.nb_loss:
+            pred, nb_mean_flat, nb_dispersion_flat = self.forward(batch, padded=padded, return_nb_params=True)
         else:
             pred = self.forward(batch, padded=padded)
+        self._log_residual_metrics_if_ready()
 
         target = batch["pert_cell_emb"]
 
@@ -558,73 +899,49 @@ class StateTransitionPerturbationModel(PerturbationModel):
             pred = pred.reshape(1, -1, self.output_dim)
             target = target.reshape(1, -1, self.output_dim)
 
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
-        main_loss = torch.nanmean(per_set_main_losses)
-        self.log("train_loss", main_loss)
+        embedding_aux_loss = None
+        nb_log1p_mse_aux_loss = None
+        nb_library_mse_aux_loss = None
+        if self.nb_loss:
+            if padded:
+                nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+                nb_dispersion = nb_dispersion_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            else:
+                nb_mean = nb_mean_flat.reshape(1, -1, self.nb_target_dim)
+                nb_dispersion = nb_dispersion_flat.reshape(1, -1, self.nb_target_dim)
 
-        # Log individual loss components if using combined loss
-        if hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
-            sinkhorn_component = self.loss_fn.sinkhorn_loss(pred, target).nanmean()
-            energy_component = self.loss_fn.energy_loss(pred, target).nanmean()
-            self.log("train/sinkhorn_loss", sinkhorn_component)
-            self.log("train/energy_loss", energy_component)
+            nb_target = self._get_nb_target_tensor(batch, target, padded)
+            per_set_main_losses = self._compute_nb_nll_loss(nb_mean, nb_dispersion, nb_target)
+            if self.nb_embed_loss_weight > 0.0:
+                embedding_aux_losses = self._compute_distribution_loss(pred, target)
+                embedding_aux_loss = torch.nanmean(embedding_aux_losses)
+                self.log("train/embedding_loss", embedding_aux_loss)
+            if self.nb_log1p_mse_weight > 0.0:
+                nb_log1p_mse_per_set = self._compute_nb_log1p_mse_per_set(nb_mean, nb_target)
+                nb_log1p_mse_aux_loss = torch.nanmean(nb_log1p_mse_per_set)
+                self.log("train/nb_log1p_mse_loss", nb_log1p_mse_aux_loss)
+            nb_library_mse_per_set = self._compute_nb_library_mse_per_set(nb_mean, nb_target)
+            nb_library_mse_metric = torch.nanmean(nb_library_mse_per_set)
+            self.log("train/nb_library_mse", nb_library_mse_metric)
+            if self.nb_library_mse_weight > 0.0:
+                nb_library_mse_aux_loss = nb_library_mse_metric
+        else:
+            per_set_main_losses = self._compute_distribution_loss(pred, target)
+        main_loss = torch.nanmean(per_set_main_losses)
+        self.log(self._train_main_loss_key(), main_loss)
 
         # Process decoder if available
         decoder_loss = None
         total_loss = main_loss
+        if embedding_aux_loss is not None:
+            total_loss = total_loss + self.nb_embed_loss_weight * embedding_aux_loss
+        if nb_log1p_mse_aux_loss is not None:
+            total_loss = total_loss + self.nb_log1p_mse_weight * nb_log1p_mse_aux_loss
+        if nb_library_mse_aux_loss is not None:
+            total_loss = total_loss + self.nb_library_mse_weight * nb_library_mse_aux_loss
 
-        if self.use_batch_token and self.batch_classifier is not None and self._batch_token_cache is not None:
-            logits = self.batch_classifier(self._batch_token_cache)  # [B, 1, C]
-            batch_token_targets = batch["batch"]
-
-            B = logits.shape[0]
-            C = logits.size(-1)
-
-            # Prepare one label per sequence (all S cells share the same batch)
-            if batch_token_targets.dim() > 1 and batch_token_targets.size(-1) == C:
-                # One-hot labels; reshape to [B, S, C]
-                if padded:
-                    target_oh = batch_token_targets.reshape(-1, self.cell_sentence_len, C)
-                else:
-                    target_oh = batch_token_targets.reshape(1, -1, C)
-                sentence_batch_labels = target_oh.argmax(-1)
-            else:
-                # Integer labels; reshape to [B, S]
-                if padded:
-                    sentence_batch_labels = batch_token_targets.reshape(-1, self.cell_sentence_len)
-                else:
-                    sentence_batch_labels = batch_token_targets.reshape(1, -1)
-
-            if sentence_batch_labels.shape[0] != B:
-                sentence_batch_labels = sentence_batch_labels.reshape(B, -1)
-
-            if self.basal_mapping_strategy == "batch":
-                uniform_mask = sentence_batch_labels.eq(sentence_batch_labels[:, :1]).all(dim=1)
-                if not torch.all(uniform_mask):
-                    bad_indices = torch.where(~uniform_mask)[0]
-                    label_strings = []
-                    for idx in bad_indices:
-                        labels = sentence_batch_labels[idx].detach().cpu().tolist()
-                        logger.error("Batch labels for sentence %d: %s", idx.item(), labels)
-                        label_strings.append(f"sentence {idx.item()}: {labels}")
-                    raise ValueError(
-                        "Expected all cells in a sentence to share the same batch when "
-                        "basal_mapping_strategy is 'batch'. "
-                        f"Found mixed batch labels: {', '.join(label_strings)}"
-                    )
-
-            target_idx = sentence_batch_labels[:, 0]
-
-            # Safety: ensure exactly one target per sequence
-            if target_idx.numel() != B:
-                target_idx = target_idx.reshape(-1)[:B]
-
-            ce_loss = F.cross_entropy(logits.reshape(B, -1, C).squeeze(1), target_idx.long())
-            self.log("train/batch_token_loss", ce_loss)
-            total_loss = total_loss + self.batch_token_weight * ce_loss
-
-        # Auxiliary batch prediction loss (per token), if enabled
-        if self.gene_decoder is not None and "pert_cell_counts" in batch:
+        # Decoder loss in gene space, if a decoder is configured.
+        if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
             # Train decoder to map latent predictions to gene space
 
@@ -647,63 +964,56 @@ class StateTransitionPerturbationModel(PerturbationModel):
             decoder_loss = decoder_per_set.mean()
 
             # Log decoder loss
-            self.log("decoder_loss", decoder_loss)
+            self.log(self._train_expression_loss_key(), decoder_loss)
 
             total_loss = total_loss + self.decoder_loss_weight * decoder_loss
-
-        if confidence_pred is not None:
-            confidence_pred_vals = confidence_pred
-            if confidence_pred_vals.dim() > 1:
-                confidence_pred_vals = confidence_pred_vals.squeeze(-1)
-            confidence_targets = per_set_main_losses.detach()
-            if self.confidence_target_scale is not None:
-                confidence_targets = confidence_targets * self.confidence_target_scale
-            confidence_targets = confidence_targets.to(confidence_pred_vals.device)
-
-            confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
-            self.log("train/confidence_loss", confidence_loss)
-            self.log("train/actual_loss", confidence_targets.mean())
-
-            total_loss = total_loss + confidence_loss
-
-        if self.regularization > 0.0:
-            ctrl_cell_emb = batch["ctrl_cell_emb"].reshape_as(pred)
-            delta = pred - ctrl_cell_emb
-
-            # compute l1 loss
-            l1_loss = torch.abs(delta).mean()
-
-            # Log the regularization loss
-            self.log("train/l1_regularization", l1_loss)
-
-            # Add regularization to total loss
-            total_loss = total_loss + self.regularization * l1_loss
 
         return total_loss
 
     def validation_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
         """Validation step logic."""
-        if self.confidence_token is None:
-            pred, confidence_pred = self.forward(batch), None
+        if self.nb_loss:
+            pred, nb_mean_flat, nb_dispersion_flat = self.forward(batch, return_nb_params=True)
         else:
-            pred, confidence_pred = self.forward(batch)
+            pred = self.forward(batch)
 
         pred = pred.reshape(-1, self.cell_sentence_len, self.output_dim)
         target = batch["pert_cell_emb"]
         target = target.reshape(-1, self.cell_sentence_len, self.output_dim)
 
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
+        embedding_aux_loss = None
+        nb_log1p_mse_aux_loss = None
+        nb_library_mse_aux_loss = None
+        if self.nb_loss:
+            nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            nb_dispersion = nb_dispersion_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            nb_target = self._get_nb_target_tensor(batch, target, padded=True)
+            per_set_main_losses = self._compute_nb_nll_loss(nb_mean, nb_dispersion, nb_target)
+            if self.nb_embed_loss_weight > 0.0:
+                embedding_aux_losses = self._compute_distribution_loss(pred, target)
+                embedding_aux_loss = torch.nanmean(embedding_aux_losses)
+                self.log("val/embedding_loss", embedding_aux_loss)
+            if self.nb_log1p_mse_weight > 0.0:
+                nb_log1p_mse_per_set = self._compute_nb_log1p_mse_per_set(nb_mean, nb_target)
+                nb_log1p_mse_aux_loss = torch.nanmean(nb_log1p_mse_per_set)
+                self.log("val/nb_log1p_mse_loss", nb_log1p_mse_aux_loss)
+            nb_library_mse_per_set = self._compute_nb_library_mse_per_set(nb_mean, nb_target)
+            nb_library_mse_metric = torch.nanmean(nb_library_mse_per_set)
+            self.log("val/nb_library_mse", nb_library_mse_metric)
+            if self.nb_library_mse_weight > 0.0:
+                nb_library_mse_aux_loss = nb_library_mse_metric
+        else:
+            per_set_main_losses = self._compute_distribution_loss(pred, target)
         loss = torch.nanmean(per_set_main_losses)
-        self.log("val_loss", loss)
+        if embedding_aux_loss is not None:
+            loss = loss + self.nb_embed_loss_weight * embedding_aux_loss
+        if nb_log1p_mse_aux_loss is not None:
+            loss = loss + self.nb_log1p_mse_weight * nb_log1p_mse_aux_loss
+        if nb_library_mse_aux_loss is not None:
+            loss = loss + self.nb_library_mse_weight * nb_library_mse_aux_loss
+        self.log(self._val_main_loss_key(), loss)
 
-        # Log individual loss components if using combined loss
-        if hasattr(self.loss_fn, "sinkhorn_loss") and hasattr(self.loss_fn, "energy_loss"):
-            sinkhorn_component = self.loss_fn.sinkhorn_loss(pred, target).mean()
-            energy_component = self.loss_fn.energy_loss(pred, target).mean()
-            self.log("val/sinkhorn_loss", sinkhorn_component)
-            self.log("val/energy_loss", energy_component)
-
-        if self.gene_decoder is not None and "pert_cell_counts" in batch:
+        if (not self.nb_loss) and self.gene_decoder is not None and "pert_cell_counts" in batch:
             gene_targets = batch["pert_cell_counts"]
 
             # Get model predictions from validation step
@@ -718,59 +1028,50 @@ class StateTransitionPerturbationModel(PerturbationModel):
             decoder_loss = decoder_per_set.mean()
 
             # Log the validation metric
-            self.log("val/decoder_loss", decoder_loss)
+            self.log(self._val_expression_loss_key(), decoder_loss)
             loss = loss + self.decoder_loss_weight * decoder_loss
-
-        if confidence_pred is not None:
-            confidence_pred_vals = confidence_pred
-            if confidence_pred_vals.dim() > 1:
-                confidence_pred_vals = confidence_pred_vals.squeeze(-1)
-            confidence_targets = per_set_main_losses.detach()
-            if self.confidence_target_scale is not None:
-                confidence_targets = confidence_targets * self.confidence_target_scale
-            confidence_targets = confidence_targets.to(confidence_pred_vals.device)
-
-            confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
-            self.log("val/confidence_loss", confidence_loss)
-            self.log("val/actual_loss", confidence_targets.mean())
 
         return {"loss": loss, "predictions": pred}
 
     def test_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> None:
-        if self.confidence_token is None:
-            pred, confidence_pred = self.forward(batch, padded=False), None
-        else:
-            pred, confidence_pred = self.forward(batch, padded=False)
-
-        target = batch["pert_cell_emb"]
-        pred = pred.reshape(1, -1, self.output_dim)
-        target = target.reshape(1, -1, self.output_dim)
-        per_set_main_losses = self._compute_distribution_loss(pred, target)
-        loss = torch.nanmean(per_set_main_losses)
-        self.log("test_loss", loss)
-
-        if confidence_pred is not None:
-            confidence_pred_vals = confidence_pred
-            if confidence_pred_vals.dim() > 1:
-                confidence_pred_vals = confidence_pred_vals.squeeze(-1)
-            confidence_targets = per_set_main_losses.detach()
-            if self.confidence_target_scale is not None:
-                confidence_targets = confidence_targets * self.confidence_target_scale
-            confidence_targets = confidence_targets.to(confidence_pred_vals.device)
-
-            confidence_loss = self.confidence_weight * self.confidence_loss_fn(confidence_pred_vals, confidence_targets)
-            self.log("test/confidence_loss", confidence_loss)
+        if self.nb_loss:
+            pred, nb_mean_flat, nb_dispersion_flat = self.forward(batch, padded=False, return_nb_params=True)
+            target = batch["pert_cell_emb"]
+            pred = pred.reshape(1, -1, self.output_dim)
+            target = target.reshape(1, -1, self.output_dim)
+            nb_mean = nb_mean_flat.reshape(1, -1, self.nb_target_dim)
+            nb_dispersion = nb_dispersion_flat.reshape(1, -1, self.nb_target_dim)
+            nb_target = self._get_nb_target_tensor(batch, target, padded=False)
+            per_set_main_losses = self._compute_nb_nll_loss(nb_mean, nb_dispersion, nb_target)
+            loss = torch.nanmean(per_set_main_losses)
+            if self.nb_embed_loss_weight > 0.0:
+                embedding_aux_losses = self._compute_distribution_loss(pred, target)
+                loss = loss + self.nb_embed_loss_weight * torch.nanmean(embedding_aux_losses)
+            if self.nb_log1p_mse_weight > 0.0:
+                nb_log1p_mse_per_set = self._compute_nb_log1p_mse_per_set(nb_mean, nb_target)
+                loss = loss + self.nb_log1p_mse_weight * torch.nanmean(nb_log1p_mse_per_set)
+            nb_library_mse_per_set = self._compute_nb_library_mse_per_set(nb_mean, nb_target)
+            nb_library_mse_metric = torch.nanmean(nb_library_mse_per_set)
+            self.log("test/nb_library_mse", nb_library_mse_metric)
+            if self.nb_library_mse_weight > 0.0:
+                loss = loss + self.nb_library_mse_weight * nb_library_mse_metric
+            self.log("test_loss", loss)
+            return
+        _ = self.forward(batch, padded=False)
 
     def predict_step(self, batch, batch_idx, padded=True, **kwargs):
         """
         Typically used for final inference. We'll replicate old logic:s
          returning 'preds', 'X', 'pert_name', etc.
         """
-        if self.confidence_token is None:
-            latent_output = self.forward(batch, padded=padded)  # shape [B, ...]
-            confidence_pred = None
+        if self.nb_loss:
+            latent_output, nb_mean_flat, nb_dispersion_flat = self.forward(
+                batch,
+                padded=padded,
+                return_nb_params=True,
+            )
         else:
-            latent_output, confidence_pred = self.forward(batch, padded=padded)
+            latent_output = self.forward(batch, padded=padded)  # shape [B, ...]
 
         output_dict = {
             "preds": latent_output,
@@ -784,13 +1085,181 @@ class StateTransitionPerturbationModel(PerturbationModel):
             "ctrl_cell_barcode": batch.get("ctrl_cell_barcode", None),
         }
 
-        # Add confidence prediction to output if available
-        if confidence_pred is not None:
-            output_dict["confidence_pred"] = confidence_pred
+        if self.nb_loss:
+            if padded:
+                nb_mean = nb_mean_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+                nb_dispersion = nb_dispersion_flat.reshape(-1, self.cell_sentence_len, self.nb_target_dim)
+            else:
+                nb_mean = nb_mean_flat.reshape(1, -1, self.nb_target_dim)
+                nb_dispersion = nb_dispersion_flat.reshape(1, -1, self.nb_target_dim)
 
-        if self.gene_decoder is not None:
+            nb_inference_library_mode = self.nb_inference_library_size_mode
+            if nb_inference_library_mode == "auto":
+                nb_inference_library_mode = self.nb_library_size_mode
+            if nb_inference_library_mode == "target_oracle":
+                source_library_sizes = self._get_nb_source_library_sizes_for_inference(
+                    batch,
+                    nb_mean,
+                    padded,
+                ).to(nb_mean.dtype)
+                target_library_sizes = self._get_nb_target_library_sizes_for_inference(
+                    batch,
+                    padded,
+                ).to(nb_mean.dtype)
+                nb_mean = self._rescale_nb_mean_between_library_modes(
+                    nb_mean,
+                    source_library_sizes,
+                    target_library_sizes,
+                    self.nb_eps,
+                )
+            elif nb_inference_library_mode != self.nb_library_size_mode:
+                source_library_sizes = self._get_nb_source_library_sizes_for_inference(
+                    batch,
+                    nb_mean,
+                    padded,
+                ).to(nb_mean.dtype)
+                if nb_inference_library_mode == "predicted":
+                    target_library_sizes = self._compute_nb_library_sizes_from_mean(nb_mean).to(nb_mean.dtype)
+                else:
+                    ctrl_for_library = self._get_nb_control_tensor_for_library(
+                        batch,
+                        batch["ctrl_cell_emb"],
+                        padded,
+                    )
+                    if nb_inference_library_mode == "blend":
+                        per_cell_library_sizes = self._compute_library_sizes_from_control(
+                            ctrl_for_library,
+                            mode="per_cell",
+                        )
+                        set_median_library_sizes = self._compute_library_sizes_from_control(
+                            ctrl_for_library,
+                            mode="set_median",
+                        )
+                        target_library_sizes = self._blend_nb_library_sizes(
+                            set_median_library_sizes,
+                            per_cell_library_sizes,
+                            self.nb_inference_library_blend_alpha,
+                        ).to(nb_mean.dtype)
+                    else:
+                        target_library_sizes = self._compute_library_sizes_from_control(
+                            ctrl_for_library,
+                            nb_inference_library_mode,
+                        ).to(nb_mean.dtype)
+                nb_mean = self._rescale_nb_mean_between_library_modes(
+                    nb_mean,
+                    source_library_sizes,
+                    target_library_sizes,
+                    self.nb_eps,
+                )
+
+            nb_dispersion_for_pred = self._reduce_dispersion_for_inference(
+                nb_dispersion,
+                self.nb_inference_dispersion_mode,
+            )
+            if self.nb_inference_output_mode == "sample":
+                nb_pred_counts = self._sample_nb_counts(nb_mean, nb_dispersion_for_pred)
+            else:
+                nb_pred_counts = nb_mean
+
+            output_dict["pert_cell_counts_mean"] = nb_mean.reshape(-1, self.nb_target_dim)
+            output_dict["pert_cell_counts_preds"] = nb_pred_counts.reshape(-1, self.nb_target_dim)
+            output_dict["pert_cell_counts_dispersion"] = nb_dispersion_for_pred.reshape(-1, self.nb_target_dim)
+        elif self.gene_decoder is not None:
             pert_cell_counts_preds = self.gene_decoder(latent_output)
-
             output_dict["pert_cell_counts_preds"] = pert_cell_counts_preds
 
         return output_dict
+
+    def configure_optimizers(self):
+        """
+        Configure optimizer and optional cosine LR decay.
+
+        This is intentionally scoped to StateTransitionPerturbationModel only.
+        """
+        optimizer_name = str(self.hparams.get("optimizer", "adam")).lower()
+        base_lr = float(self.hparams.get("lr", self.lr))
+        weight_decay = float(self.hparams.get("weight_decay", 0.0))
+
+        if optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(self.parameters(), lr=base_lr, weight_decay=weight_decay)
+        elif optimizer_name == "adam":
+            optimizer = torch.optim.Adam(self.parameters(), lr=base_lr, weight_decay=weight_decay)
+        elif optimizer_name == "muon":
+            muon_params, adamw_params = _split_muon_parameters(self)
+            muon_param_count = sum(param.numel() for param in muon_params)
+            adamw_param_count = sum(param.numel() for param in adamw_params)
+            if not muon_params:
+                logger.warning(
+                    "optimizer=muon requested but no eligible matrix parameters were found; falling back to AdamW."
+                )
+                optimizer = torch.optim.AdamW(self.parameters(), lr=base_lr, weight_decay=weight_decay)
+            else:
+                optimizer = MuonWithAuxAdamW(
+                    muon_params,
+                    adamw_params,
+                    lr=base_lr,
+                    weight_decay=weight_decay,
+                    momentum=float(self.hparams.get("muon_momentum", 0.95)),
+                    nesterov=bool(self.hparams.get("muon_nesterov", True)),
+                    ns_steps=int(self.hparams.get("muon_ns_steps", 5)),
+                    muon_eps=float(self.hparams.get("muon_eps", 1e-7)),
+                    adamw_lr=(
+                        None
+                        if self.hparams.get("muon_adamw_lr", None) is None
+                        else float(self.hparams.get("muon_adamw_lr"))
+                    ),
+                    adamw_betas=(
+                        float(self.hparams.get("muon_adamw_beta1", 0.9)),
+                        float(self.hparams.get("muon_adamw_beta2", 0.95)),
+                    ),
+                    adamw_eps=float(self.hparams.get("muon_adamw_eps", 1e-8)),
+                )
+                logger.info(
+                    "Using MuonWithAuxAdamW with %d Muon params and %d AdamW params.",
+                    muon_param_count,
+                    adamw_param_count,
+                )
+        else:
+            raise ValueError(f"Unsupported optimizer '{optimizer_name}'. Expected one of: adam, adamw, muon.")
+
+        if not bool(self.hparams.get("use_cosine_decay", False)):
+            return optimizer
+
+        max_lr_cfg = self.hparams.get("max_lr", None)
+        max_lr = float(max_lr_cfg) if max_lr_cfg is not None else base_lr
+        if max_lr <= 0:
+            raise ValueError(f"max_lr must be > 0 when cosine decay is enabled. Received: {max_lr}")
+
+        decay_steps_cfg = self.hparams.get("lr_decay_steps", None)
+        if decay_steps_cfg is None:
+            decay_steps = int(self.hparams.get("max_steps", 0))
+        else:
+            decay_steps = int(decay_steps_cfg)
+        if decay_steps <= 0:
+            raise ValueError(
+                "lr_decay_steps must be a positive integer when cosine decay is enabled "
+                "(or training.max_steps must be set > 0)."
+            )
+
+        max_lr_fraction = float(self.hparams.get("max_lr_fraction", 0.1))
+        if not (0 < max_lr_fraction <= 1.0):
+            raise ValueError(f"max_lr_fraction must be in (0, 1]. Received: {max_lr_fraction}")
+
+        min_lr = max_lr * max_lr_fraction
+        for param_group in optimizer.param_groups:
+            group_lr = float(param_group.get("lr", base_lr))
+            param_group["lr"] = group_lr * (max_lr / base_lr)
+
+        def _lr_lambda(step: int) -> float:
+            if step >= decay_steps:
+                return max_lr_fraction
+            decay_ratio = step / decay_steps
+            coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+            lr = min_lr + coeff * (max_lr - min_lr)
+            return lr / max_lr
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }

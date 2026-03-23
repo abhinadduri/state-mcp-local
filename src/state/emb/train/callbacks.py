@@ -123,27 +123,6 @@ class ResumeCallback(L.Callback):
                     logging.info(f"Reset learning rate from {original_lr} to {param_group['lr']}")
 
 
-class EMACallback(L.Callback):
-    def __init__(self, decay: float = 0.999):
-        super().__init__()
-        self.beta = decay
-        self.velocity = {}
-
-    def on_before_optimizer_step(self, trainer: L.Trainer, pl_module: L.LightningModule, optimizer):
-        # Check if EMA is enabled via the config flag.
-        if pl_module.cfg.model.get("ema", False):
-            with torch.no_grad():
-                for param in pl_module.parameters():
-                    if param.grad is None:
-                        continue
-
-                    param_id = id(param)
-                    if param_id not in self.velocity:
-                        self.velocity[param_id] = torch.zeros_like(param.grad)
-
-                    self.velocity[param_id] = self.beta * self.velocity[param_id] + (1 - self.beta) * param.grad
-                    param.grad = self.velocity[param_id].clone()
-
 
 class CumulativeFLOPSCallback(L.Callback):
     """

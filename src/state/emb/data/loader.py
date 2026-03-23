@@ -1,17 +1,34 @@
-import h5py
-import logging
-import torch
-import torch.utils.data as data
-import torch.nn.functional as F
 import functools
-import numpy as np
+import logging
+import os
 
-from typing import Dict, Optional
+import h5py
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.utils.data as data
+
+from typing import Dict, NamedTuple, Optional
 
 from torch.utils.data import DataLoader
 from .. import utils
 
 log = logging.getLogger(__file__)
+
+
+class CollatedBatch(NamedTuple):
+    """Output of VCIDatasetSentenceCollator.__call__."""
+
+    batch_sentences: torch.Tensor  # [B, pad_length] gene indices for cell sentence
+    task_genes: torch.Tensor  # [B, P+N(+S)] gene indices for task
+    task_counts: torch.Tensor  # [B, P+N(+S)] log1p counts for task genes
+    cell_indices: torch.Tensor  # [B] original cell index in dataset
+    batch_weights: torch.Tensor  # [B, max_genes] expression weights
+    masks: torch.Tensor  # [B, pad_length] padding mask
+    total_counts: Optional[torch.Tensor]  # [B] total task counts (rda)
+    sentence_counts: Optional[torch.Tensor]  # [B, pad_length] expression pct per slot
+    dataset_nums: Optional[torch.Tensor]  # [B] dataset index (dataset_correction)
+
 
 # Threshold for flagging implausibly high UMIs when we undo a log1p
 EXPONENTIATED_UMIS_LIMIT = 5_000_000
@@ -22,7 +39,7 @@ RAW_COUNT_HEURISTIC_THRESHOLD = 35
 # THIS SHOULD ONLY BE USED FOR INFERENCE
 def create_dataloader(
     cfg,
-    workers=1,
+    workers=None,
     data_dir=None,
     datasets=None,
     shape_dict=None,
@@ -46,6 +63,10 @@ def create_dataloader(
 
     if data_dir:
         utils.get_dataset_cfg(cfg).data_dir = data_dir
+
+    if workers is None:
+        workers = int(os.getenv("STATE_EMB_NUM_WORKERS", "1"))
+    workers = max(int(workers), 0)
 
     dataset = FilteredGenesCounts(
         cfg,
@@ -74,7 +95,7 @@ def create_dataloader(
         shuffle=shuffle,
         collate_fn=sentence_collator,
         num_workers=workers,
-        persistent_workers=True,
+        persistent_workers=workers > 0,
     )
     return dataloader
 
@@ -207,25 +228,19 @@ class FilteredGenesCounts(H5adSentenceDataset):
         self.ds_emb_map = {}
 
         emb_cfg = utils.get_embedding_cfg(self.cfg)
-        # for inference, let's make sure this dataset's valid mask is available
+        esm_data = self.protein_embeds or torch.load(emb_cfg["all_embeddings"], weights_only=False)
+
         if adata_name is not None:
-            # append it to self.datasets
+            # Inference path: compute ds_emb_map and derive valid_gene_index from it
             self.datasets.append(adata_name)
             self.shapes_dict[adata_name] = adata.shape
 
-            # compute its embedding‐index vector
-            esm_data = self.protein_embeds or torch.load(emb_cfg["all_embeddings"], weights_only=False)
             valid_genes_list = list(esm_data.keys())
-            # make a gene→global‐index lookup
             global_pos = {g: i for i, g in enumerate(valid_genes_list)}
 
-            # grab var_names from the AnnData
             gene_names = np.array(adata.var_names)
-
-            # for each gene in this dataset, find its global idx or -1 if missing
             new_mapping = np.array([global_pos.get(g, -1) for g in gene_names])
             if (new_mapping == -1).all():
-                # probably it contains ensembl id's instead
                 assert self.gene_column in adata.var.keys(), (
                     f"Column '{self.gene_column}' not found in adata.var. Available columns: {list(adata.var.keys())}"
                 )
@@ -234,36 +249,22 @@ class FilteredGenesCounts(H5adSentenceDataset):
 
             log.info(f"{(new_mapping != -1).sum()} genes mapped to embedding file (out of {len(new_mapping)})")
             self.ds_emb_map[adata_name] = new_mapping
+            self.valid_gene_index[adata_name] = new_mapping != -1
 
-        print(
-            f"!!! {(self.ds_emb_map[adata_name] != -1).sum()} genes mapped to embedding file (out of {len(self.ds_emb_map[adata_name])})"
-        )
-
-        esm_data = self.protein_embeds or torch.load(emb_cfg["all_embeddings"], weights_only=False)
+        # For file-based datasets (training path), compute valid_gene_index from h5 files
         valid_genes_list = list(esm_data.keys())
         for name in self.datasets:
-            if adata is None:
+            if name not in self.valid_gene_index:
                 a = self.dataset_file(name)
                 try:
                     gene_names = np.array(
                         [g.decode("utf-8") for g in a[f"/var/{self.gene_column}"][:]]
-                    )  # Decode byte strings
-                except:
+                    )
+                except Exception:
                     gene_categories = a[f"/var/{self.gene_column}/categories"][:]
                     gene_codes = np.array(a[f"/var/{self.gene_column}/codes"][:])
                     gene_names = np.array([g.decode("utf-8") for g in gene_categories[gene_codes]])
-                valid_mask = np.isin(gene_names, valid_genes_list)
-                self.valid_gene_index[name] = valid_mask
-            else:
-                gene_names = np.array(adata.var_names)
-                valid_mask = np.isin(gene_names, valid_genes_list)
-
-                if not valid_mask.any():
-                    # none of the genes were valid, probably ensembl id's
-                    gene_names = adata.var[self.gene_column].values
-                    valid_mask = np.isin(gene_names, valid_genes_list)
-
-                self.valid_gene_index[name] = valid_mask
+                self.valid_gene_index[name] = np.isin(gene_names, valid_genes_list)
 
     def __getitem__(self, idx):
         counts, idx, dataset, dataset_num = super().__getitem__(idx)
@@ -304,19 +305,27 @@ class VCIDatasetSentenceCollator(object):
             )
 
         self.global_size = utils.get_embedding_cfg(self.cfg).num
-        self.global_to_local = {}
-        for dataset_name, ds_emb_idxs in self.dataset_to_protein_embeddings.items():
-            # make sure tensor with long data type
-            ds_emb_idxs = torch.tensor(ds_emb_idxs, dtype=torch.long)
-            # assert ds_emb_idxs.unique().numel() == ds_emb_idxs.numel(), f"duplicate global IDs in dataset {dataset_name}!"
+        self._is_tabular = self.cfg.loss.name == "tabular"
+        # Pre-compute per-dataset tensors once (avoids re-creating them per cell)
+        self._ds_emb_idxs_filtered = {}  # filtered by valid_gene_mask: dataset -> LongTensor[num_valid]
+        self.global_to_local = {}        # only populated for tabular loss
+        for dataset_name, raw_idxs in self.dataset_to_protein_embeddings.items():
+            ds_emb_idxs = torch.tensor(raw_idxs, dtype=torch.long)
 
-            # Create a tensor filled with -1 (indicating not present in this dataset)
-            reverse_mapping = torch.full((self.global_size,), -1, dtype=torch.int64)
+            # Pre-apply valid_gene_mask if available
+            if self.valid_gene_mask is not None and dataset_name in self.valid_gene_mask:
+                self._ds_emb_idxs_filtered[dataset_name] = ds_emb_idxs[self.valid_gene_mask[dataset_name]]
+            else:
+                self._ds_emb_idxs_filtered[dataset_name] = ds_emb_idxs
 
-            local_indices = torch.arange(ds_emb_idxs.size(0), dtype=torch.int64)
-            mask = (ds_emb_idxs >= 0) & (ds_emb_idxs < self.global_size)
-            reverse_mapping[ds_emb_idxs[mask]] = local_indices[mask]
-            self.global_to_local[dataset_name] = reverse_mapping
+            # Build reverse mapping (global_idx -> local_idx) only for tabular loss
+            # (shared genes are sampled in global space and need reverse-mapping to get counts)
+            if self._is_tabular:
+                reverse_mapping = torch.full((self.global_size,), -1, dtype=torch.int64)
+                local_indices = torch.arange(ds_emb_idxs.size(0), dtype=torch.int64)
+                mask = (ds_emb_idxs >= 0) & (ds_emb_idxs < self.global_size)
+                reverse_mapping[ds_emb_idxs[mask]] = local_indices[mask]
+                self.global_to_local[dataset_name] = reverse_mapping
 
     def __call__(self, batch):
         num_aug = getattr(self.cfg.model, "num_downsample", 1)
@@ -403,8 +412,6 @@ class VCIDatasetSentenceCollator(object):
 
         # Cast tensors to specified precision if provided
         if self.precision is not None:
-            # batch_sentences = batch_sentences.to(dtype=self.precision)
-            # Xs = Xs.to(dtype=self.precision)
             Ys = Ys.to(dtype=self.precision)
             batch_weights = batch_weights.to(dtype=self.precision)
             if total_counts_all is not None:
@@ -412,16 +419,16 @@ class VCIDatasetSentenceCollator(object):
             if batch_sentences_counts is not None:
                 batch_sentences_counts = batch_sentences_counts.to(dtype=self.precision)
 
-        return (
-            batch_sentences[:, :max_len],
-            Xs,
-            Ys,
-            idxs,
-            batch_weights,
-            masks,
-            total_counts_all if self.cfg.model.rda else None,
-            batch_sentences_counts if self.cfg.model.counts else None,
-            dataset_nums if self.use_dataset_info else None,
+        return CollatedBatch(
+            batch_sentences=batch_sentences[:, :max_len],
+            task_genes=Xs,
+            task_counts=Ys,
+            cell_indices=idxs,
+            batch_weights=batch_weights,
+            masks=masks,
+            total_counts=total_counts_all if self.cfg.model.rda else None,
+            sentence_counts=batch_sentences_counts if self.cfg.model.counts else None,
+            dataset_nums=dataset_nums if self.use_dataset_info else None,
         )
 
     def softmax(self, x):
@@ -470,35 +477,23 @@ class VCIDatasetSentenceCollator(object):
             total_umis = int(exp_log_counts.sum(axis=1).item())
             count_expr_dist = exp_log_counts / exp_log_counts.sum(axis=1, keepdim=True)
 
-        ### At this point, counts_raw is assumed to be log counts ###
+        ### At this point, counts_raw holds log1p counts for ALL genes ###
 
-        # store the raw counts here, we need them as targets
-        original_counts_raw = counts_raw.clone()
+        # Only clone unfiltered counts when tabular loss needs them
+        # (shared genes are looked up by original dataset position)
+        counts_all_genes = counts_raw.clone() if self._is_tabular else None
 
-        # logic to sample a single cell sentence and task sentence here
-        ds_emb_idxs = torch.tensor(self.dataset_to_protein_embeddings[dataset], dtype=torch.long)
+        # Filter to valid genes only (genes that have protein embeddings)
+        ds_emb_idxs = self._ds_emb_idxs_filtered.get(dataset)
+        if valid_gene_mask is not None and counts_raw.shape[1] == valid_gene_mask.shape[0]:
+            counts = counts_raw[:, valid_gene_mask]
+            counts_for_targets = counts_all_genes[:, valid_gene_mask] if counts_all_genes is not None else counts
+        else:
+            counts = counts_raw
+            counts_for_targets = counts
 
-        original_counts = original_counts_raw
-        counts = counts_raw
-        if valid_gene_mask is not None:
-            if ds_emb_idxs.shape[0] == valid_gene_mask.shape[0]:
-                # Filter the dataset embedding indices based on the valid gene mask
-                ds_emb_idxs = ds_emb_idxs[valid_gene_mask]
-            else:
-                # Our preprocessing is such that sometimes the ds emb idxs are already filtered
-                # in this case we do nothing to (no subsetting) but assert that the mask matches
-                assert valid_gene_mask.sum() == ds_emb_idxs.shape[0], (
-                    f"Something wrong with filtering or mask for dataset {dataset}"
-                )
-
-            # Counts are never filtered in our preprocessing step, so we always need to apply the valid genes mask
-            if counts_raw.shape[1] == valid_gene_mask.shape[0]:
-                counts = counts_raw[:, valid_gene_mask]
-                original_counts = original_counts_raw[:, valid_gene_mask]
-
-        # so counts are filtered. wtf is happening with the tabular loss then? and why do we error out?
         if counts.sum() == 0:
-            expression_weights = F.softmax(counts, dim=1)
+            expression_weights = torch.ones_like(counts) / counts.shape[1]
         else:
             expression_weights = counts / torch.sum(counts, dim=1, keepdim=True)
 
@@ -577,7 +572,7 @@ class VCIDatasetSentenceCollator(object):
 
             # set counts for unshared genes
             task_idxs = task_sentence[c, :unshared_num].to(torch.int32)
-            task_counts[c, :unshared_num] = original_counts[c, task_idxs]
+            task_counts[c, :unshared_num] = counts_for_targets[c, task_idxs]
 
             # convert from dataset specific gene indices to global gene indices
             # only do this for everything up to shared genes, which are already global indices
@@ -587,19 +582,17 @@ class VCIDatasetSentenceCollator(object):
             if shared_genes is not None:
                 # Overwrite the final positions of task_sentence
 
-                task_sentence[c, unshared_num:] = shared_genes  # in the old impl these are global gene indices
-                # task_sentence[c, unshared_num:] = ds_emb_idxs[shared_genes.to(torch.int32)] # in the new impl these are local gene indices
+                task_sentence[c, unshared_num:] = shared_genes
 
                 # convert the shared_genes, which are global indices, to the dataset specific indices
                 local_indices = self.global_to_local[dataset][shared_genes].to(
                     cell.device
-                )  # in the old impl these are global gene indices
-                # local_indices = shared_genes # in the new impl these are local gene indices
+                )
 
                 shared_counts = torch.zeros(local_indices.shape, dtype=cell.dtype, device=cell.device)
                 valid_mask = local_indices != -1
                 if valid_mask.any():
-                    shared_counts[valid_mask] = original_counts_raw[c, local_indices[valid_mask]]
+                    shared_counts[valid_mask] = counts_all_genes[c, local_indices[valid_mask]]
 
                 # for indices which are -1, count is 0, else index into cell
                 task_counts[c, unshared_num:] = shared_counts

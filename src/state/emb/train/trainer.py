@@ -11,12 +11,12 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
 
 from ..nn.model import StateEmbeddingModel
-from ..data import H5adSentenceDataset, VCIDatasetSentenceCollator
+from ..nn.tokenizer import SentenceTokenizer, LatentTokenizer
+from ..data import H5adSentenceDataset
 from ..train.callbacks import (
     LogLR,
     ProfilerCallback,
     ResumeCallback,
-    EMACallback,
     PerfProfilerCallback,
     CumulativeFLOPSCallback,
 )
@@ -35,17 +35,47 @@ def get_embeddings(cfg):
 
 def main(cfg):
     print(f"Starting training with Embedding {cfg.embeddings.current} and dataset {cfg.dataset.current}")
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    torch.set_float32_matmul_precision("high")
     os.environ["NCCL_LAUNCH_TIMEOUT"] = str(cfg.experiment.ddp_timeout)
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
     TOTAL_N_CELL = cfg.dataset.num_cells
     EPOCH_LENGTH = int(TOTAL_N_CELL // cfg.model.batch_size // 24)
-    # ? not sure why this needs to be included but seems empirical?? no clue why this is 6
     warmup_steps = EPOCH_LENGTH * 6
 
-    train_dataset_sentence_collator = VCIDatasetSentenceCollator(cfg, is_train=True)
-    # validation should not do augmentations
-    val_dataset_sentence_collator = VCIDatasetSentenceCollator(cfg, is_train=False)
+    # --- Build tokenizer ---
+    tokenizer_type = getattr(cfg.model, "tokenizer", "sentence")
+    if tokenizer_type == "latent":
+        n_latent = getattr(cfg.model, "n_latent", 128)
+        tokenizer = LatentTokenizer(
+            n_genes=get_embedding_cfg(cfg).num,
+            n_latent=n_latent,
+            token_dim=get_embedding_cfg(cfg).size,
+            d_model=cfg.model.emsize,
+            nhead=cfg.model.nhead,
+            d_hid=cfg.model.d_hid,
+            nlayers=cfg.model.nlayers,
+            output_dim=cfg.model.output_dim,
+            dropout=cfg.model.dropout,
+            compiled=False,
+            cfg=cfg,
+        )
+        print(f"Using LatentTokenizer: n_genes={get_embedding_cfg(cfg).num}, n_latent={n_latent}")
+    else:
+        tokenizer = SentenceTokenizer(
+            token_dim=get_embedding_cfg(cfg).size,
+            d_model=cfg.model.emsize,
+            nhead=cfg.model.nhead,
+            d_hid=cfg.model.d_hid,
+            nlayers=cfg.model.nlayers,
+            output_dim=cfg.model.output_dim,
+            dropout=cfg.model.dropout,
+            compiled=False,
+            cfg=cfg,
+        )
+
+    # --- Build collators from tokenizer ---
+    train_collator = tokenizer.make_collator(cfg, is_train=True)
+    val_collator = tokenizer.make_collator(cfg, is_train=False)
 
     generator = torch.Generator()
     generator.manual_seed(cfg.dataset.seed)
@@ -61,7 +91,7 @@ def main(cfg):
         train_dataset,
         batch_size=cfg.model.batch_size,
         shuffle=True,
-        collate_fn=train_dataset_sentence_collator,
+        collate_fn=train_collator,
         num_workers=cfg.dataset.num_train_workers,
         persistent_workers=True,
         pin_memory=True,
@@ -74,9 +104,11 @@ def main(cfg):
         val_dataset,
         batch_size=cfg.model.batch_size,
         shuffle=True,
-        collate_fn=val_dataset_sentence_collator,
+        collate_fn=val_collator,
         num_workers=cfg.dataset.num_val_workers,
         persistent_workers=True,
+        pin_memory=True,
+        prefetch_factor=4,
         generator=generator,
     )
 
@@ -92,21 +124,23 @@ def main(cfg):
         compiled=False,
         max_lr=cfg.optimizer.max_lr,
         emb_size=get_embedding_cfg(cfg).size,
-        collater=val_dataset_sentence_collator,
+        collater=val_collator,
         cfg=cfg,
+        tokenizer=tokenizer,
     )
     # Ensure model always uses the current config, even after checkpoint loading
     model.update_config(cfg)
-    # Also update datasets and collaters with current config
     train_dataset.cfg = cfg
     val_dataset.cfg = cfg
-    train_dataset_sentence_collator.cfg = cfg
-    val_dataset_sentence_collator.cfg = cfg
-    model.collater = val_dataset_sentence_collator
+    train_collator.cfg = cfg
+    val_collator.cfg = cfg
+    model.collater = val_collator
     model = model.cuda()
+
+    # Load frozen protein embeddings onto the tokenizer
     all_pe = get_embeddings(cfg)
     all_pe.requires_grad = False
-    model.pe_embedding = nn.Embedding.from_pretrained(all_pe)
+    model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
 
     model = model.train()
 
@@ -138,10 +172,6 @@ def main(cfg):
         exp_logger = None
 
     callbacks = [checkpoint_callback, LogLR(100), ResumeCallback(cfg), PerfProfilerCallback()]
-
-    if getattr(cfg.model, "ema", False):
-        ema_decay = getattr(cfg.model, "ema_decay", 0.999)
-        callbacks.append(EMACallback(decay=ema_decay))
 
     # Add cumulative FLOPS callback
     callbacks.append(CumulativeFLOPSCallback(use_backward=cfg.experiment.cumulative_flops_use_backward))

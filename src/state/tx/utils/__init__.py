@@ -8,6 +8,8 @@ import os
 from lightning.pytorch.callbacks import ModelCheckpoint
 from os.path import join
 
+logger = logging.getLogger(__name__)
+
 
 class RobustCSVLogger(BaseCSVLogger):
     """
@@ -112,22 +114,28 @@ def get_loggers(
                 wandb_logger.experiment.config.update(cfg)
             loggers.append(wandb_logger)
         except ImportError:
-            print("Warning: wandb is not installed. Skipping wandb logging.")
-            print("To enable wandb logging, install it with: pip install wandb")
+            logger.warning("wandb is not installed. Skipping wandb logging.")
+            logger.warning("To enable wandb logging, install it with: pip install wandb")
         except Exception as e:
-            print(f"Warning: Failed to initialize wandb logger: {e}")
-            print("Continuing without wandb logging.")
+            logger.warning("Failed to initialize wandb logger: %s", e)
+            logger.warning("Continuing without wandb logging.")
 
     # Ensure at least one logger is present
     if not loggers:
-        print("Warning: No loggers configured. Adding robust CSV logger as fallback.")
+        logger.warning("No loggers configured. Adding robust CSV logger as fallback.")
         csv_logger = RobustCSVLogger(save_dir=output_dir, name=name, version=0)
         loggers.append(csv_logger)
 
     return loggers
 
 
-def get_checkpoint_callbacks(output_dir: str, name: str, val_freq: int, _ckpt_every_n_steps: int):
+def get_checkpoint_callbacks(
+    output_dir: str,
+    name: str,
+    val_freq: int,
+    _ckpt_every_n_steps: int,
+    monitor_metric: str = "val/expression_loss",
+):
     """
     Create checkpoint callbacks based on validation frequency.
 
@@ -136,12 +144,12 @@ def get_checkpoint_callbacks(output_dir: str, name: str, val_freq: int, _ckpt_ev
     checkpoint_dir = join(output_dir, name, "checkpoints")
     callbacks = []
 
-    # Save only the best checkpoint (by val_loss) plus the latest checkpoint
+    # Save only the best checkpoint (by monitor_metric) plus the latest checkpoint
     best_ckpt = ModelCheckpoint(
         dirpath=checkpoint_dir,
         filename="best",
         save_last=True,
-        monitor="val_loss",
+        monitor=monitor_metric,
         mode="min",
         save_top_k=1,
         every_n_train_steps=val_freq,
@@ -170,18 +178,6 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
         from ...tx.models.embed_sum import EmbedSumPerturbationModel
 
         return EmbedSumPerturbationModel(
-            input_dim=var_dims["input_dim"],
-            gene_dim=gene_dim,
-            hvg_dim=var_dims["hvg_dim"],
-            output_dim=var_dims["output_dim"],
-            pert_dim=var_dims["pert_dim"],
-            batch_dim=var_dims["batch_dim"],
-            **module_config,
-        )
-    elif model_type.lower() == "old_neuralot":
-        from ...tx.models.old_neural_ot import OldNeuralOTPerturbationModel
-
-        return OldNeuralOTPerturbationModel(
             input_dim=var_dims["input_dim"],
             gene_dim=gene_dim,
             hvg_dim=var_dims["hvg_dim"],
@@ -251,93 +247,5 @@ def get_lightning_module(model_type: str, data_config: dict, model_config: dict,
             batch_dim=var_dims["batch_dim"],
             **module_config,
         )
-    elif model_type.lower() == "cpa":
-        from ...tx.models.cpa import CPAPerturbationModel
-
-        return CPAPerturbationModel(
-            input_dim=var_dims["input_dim"],
-            output_dim=var_dims["output_dim"],
-            pert_dim=var_dims["pert_dim"],
-            gene_dim=gene_dim,
-            **module_config,
-        )
-    elif model_type.lower() == "scvi":
-        from ...tx.models.scvi import SCVIPerturbationModel
-
-        return SCVIPerturbationModel(
-            input_dim=var_dims["input_dim"],
-            gene_dim=gene_dim,
-            hvg_dim=var_dims["hvg_dim"],
-            output_dim=var_dims["output_dim"],
-            pert_dim=var_dims["pert_dim"],
-            batch_dim=var_dims["batch_dim"],
-            **module_config,
-        )
-    elif model_type.lower() == "scgpt-chemical" or model_type.lower() == "scgpt-genetic":
-        from ...tx.models.scgpt import scGPTForPerturbation
-
-        pretrained_path = module_config["pretrained_path"]
-        assert pretrained_path is not None, "pretrained_path must be provided for scGPT"
-
-        model_dir = Path(pretrained_path)
-        model_file = model_dir / "best_model.pt"
-
-        model = scGPTForPerturbation(
-            ntoken=module_config["ntoken"],
-            n_drug_tokens=module_config["n_perts"],  # only used for chemical perturbations
-            d_model=module_config["d_model"],
-            nhead=module_config["nhead"],
-            d_hid=module_config["d_hid"],
-            nlayers=module_config["nlayers"],
-            nlayers_cls=module_config["n_layers_cls"],
-            n_cls=1,
-            dropout=module_config["dropout"],
-            pad_token_id=module_config["pad_token_id"],
-            pad_value=module_config["pad_value"],
-            pert_pad_id=module_config["pert_pad_id"],
-            do_mvc=module_config["do_MVC"],
-            cell_emb_style=module_config["cell_emb_style"],
-            mvc_decoder_style=module_config["mvc_decoder_style"],
-            use_fast_transformer=module_config["use_fast_transformer"],
-            lr=module_config["lr"],
-            step_size_lr=module_config["step_size_lr"],
-            include_zero_gene=module_config["include_zero_gene"],
-            embed_key=module_config["embed_key"],
-            perturbation_type=module_config["perturbation_type"],
-        )
-
-        load_param_prefixes = module_config["load_param_prefixes"]
-
-        if load_param_prefixes is not None:
-            model_dict = model.model.state_dict()
-            pretrained_dict = torch.load(model_file)
-            pretrained_dict = {
-                k: v
-                for k, v in pretrained_dict.items()
-                if any([k.startswith(prefix) for prefix in module_config["load_param_prefixes"]])
-            }
-            for k, v in pretrained_dict.items():
-                print(f"Loading params {k} with shape {v.shape}")
-
-            model_dict.update(pretrained_dict)
-            model.model.load_state_dict(model_dict)
-        else:
-            try:
-                model.model.load_state_dict(torch.load(model_file))
-                print(f"Loading all model params from {model_file}")
-            except:
-                # only load params that are in the model and match the size
-                model_dict = model.model.state_dict()
-                pretrained_dict = torch.load(model_file)
-                pretrained_dict = {
-                    k: v for k, v in pretrained_dict.items() if k in model_dict and v.shape == model_dict[k].shape
-                }
-                for k, v in pretrained_dict.items():
-                    print(f"Loading params {k} with shape {v.shape}")
-
-                model_dict.update(pretrained_dict)
-                model.model.load_state_dict(model_dict)
-
-        return model
     else:
         raise ValueError(f"Unknown model type: {model_type}")

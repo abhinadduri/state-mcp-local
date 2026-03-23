@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "state": {
+      "type": "http",
+      "url": "http://127.0.0.1:8777/mcp"
+    },
+    "biocontext_kb": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp/"
+    }
+  }
+}

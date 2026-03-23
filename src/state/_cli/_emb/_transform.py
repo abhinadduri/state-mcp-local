@@ -83,15 +83,34 @@ def run_emb_transform(args: ap.ArgumentParser):
         logger.error("Either --output or --lancedb must be provided")
         raise ValueError("Either --output or --lancedb must be provided")
 
-    # Resolve checkpoint path, allowing either --checkpoint, --model-folder, or both
+    # Resolve checkpoint path, allowing either --checkpoint, --model-folder, or both.
+    # Prefer safetensors artifacts when present.
     checkpoint_path = args.checkpoint
     if args.model_folder:
-        model_files = glob.glob(os.path.join(args.model_folder, "*.ckpt"))
+        ckpt_files = sorted(glob.glob(os.path.join(args.model_folder, "*.ckpt")))
+        safetensors_files = sorted(glob.glob(os.path.join(args.model_folder, "*.safetensors")))
+        model_files = ckpt_files + safetensors_files
         if not model_files and not checkpoint_path:
             logger.error(f"No model checkpoint found in {args.model_folder}")
             raise FileNotFoundError(f"No model checkpoint found in {args.model_folder}")
         if not checkpoint_path and model_files:
-            checkpoint_path = model_files[-1]
+            basename_to_path = {os.path.basename(p): p for p in model_files}
+            for preferred_name in (
+                "model.safetensors",
+                "checkpoint.safetensors",
+                "last.ckpt",
+                "best.ckpt",
+                "final.ckpt",
+                "checkpoint.ckpt",
+            ):
+                if preferred_name in basename_to_path:
+                    checkpoint_path = basename_to_path[preferred_name]
+                    break
+            if checkpoint_path is None:
+                if safetensors_files:
+                    checkpoint_path = safetensors_files[-1]
+                else:
+                    checkpoint_path = ckpt_files[-1]
     if not checkpoint_path:
         logger.error("Either --checkpoint or --model-folder must be provided")
         raise ValueError("Either --checkpoint or --model-folder must be provided")

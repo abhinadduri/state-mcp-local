@@ -7,6 +7,7 @@ kwargs:
   blur: 0.05
   hidden_dim: 672  # hidden dimension going into the transformer backbone
   loss: energy
+  nb_embed_loss_weight: 0.0
   confidence_head: False
   n_encoder_layers: 4
   n_decoder_layers: 4
@@ -15,7 +16,6 @@ kwargs:
   freeze_pert_backbone: False
   transformer_decoder: False
   finetune_vci_decoder: False
-  residual_decoder: False
   batch_encoder: False
   mask_attn: False
   use_effect_gating_token: False
@@ -23,8 +23,6 @@ kwargs:
   distributional_loss: energy
   gene_decoder_bool: False
   init_from: null
-  mmd_num_chunks: 1
-  randomize_mmd_chunks: false
   transformer_backbone_key: llama
   transformer_backbone_kwargs:
       bidirectional_attention: true

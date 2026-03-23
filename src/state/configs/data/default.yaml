@@ -18,5 +18,6 @@ kwargs:
   jurkat_name: replogle_jurkat_filtered
   hepg2_name: replogle_hepg2_filtered
   use_consecutive_loading: false
+  collate_dtype: float16
 output_dir: null
 debug: true

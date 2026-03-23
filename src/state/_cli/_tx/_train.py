@@ -11,20 +11,17 @@ def add_arguments_train(parser: ap.ArgumentParser):
 
 
 def run_tx_train(cfg: DictConfig):
-    import json
     import logging
     import os
     import pickle
     import shutil
     from os.path import exists, join
-    from pathlib import Path
 
     import lightning.pytorch as pl
     import torch
     from cell_load.data_modules import PerturbationDataModule
     from cell_load.utils.modules import get_datamodule
     from lightning.pytorch.loggers import WandbLogger
-    from lightning.pytorch.plugins.precision import MixedPrecision
 
     from ...tx.callbacks import (
         BatchSpeedMonitorCallback,
@@ -37,22 +34,18 @@ def run_tx_train(cfg: DictConfig):
     logger = logging.getLogger(__name__)
     torch.set_float32_matmul_precision("medium")
 
-    cfg_yaml = OmegaConf.to_yaml(cfg, resolve=True)
     cfg = OmegaConf.to_container(cfg, resolve=True)
 
     # Setup output directory
     run_output_dir = join(cfg["output_dir"], cfg["name"])
     if os.path.exists(run_output_dir) and cfg["overwrite"]:
-        print(f"Output dir {run_output_dir} already exists, overwriting")
+        logger.warning("Output dir %s already exists, overwriting", run_output_dir)
         shutil.rmtree(run_output_dir)
     os.makedirs(run_output_dir, exist_ok=True)
 
     # Set up wandb directory if needed
     if cfg["use_wandb"]:
         os.makedirs(cfg["wandb"]["local_wandb_dir"], exist_ok=True)
-
-    with open(join(run_output_dir, "config.yaml"), "w") as f:
-        f.write(cfg_yaml)
 
     # Set random seeds
     pl.seed_everything(cfg["training"]["train_seed"])
@@ -66,52 +59,50 @@ def run_tx_train(cfg: DictConfig):
     try:
         sentence_len = cfg["model"]["cell_set_len"]
     except KeyError:
-        if cfg["model"]["name"].lower() in ["cpa", "scvi"] or cfg["model"]["name"].lower().startswith("scgpt"):
-            if "cell_sentence_len" in cfg["model"]["kwargs"] and cfg["model"]["kwargs"]["cell_sentence_len"] > 1:
-                sentence_len = cfg["model"]["kwargs"]["cell_sentence_len"]
-                cfg["training"]["batch_size"] = 1
-            else:
-                sentence_len = 1
-        else:
-            try:
-                sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["n_positions"]
-            except:
-                sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
+        try:
+            sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["n_positions"]
+        except:
+            sentence_len = cfg["model"]["kwargs"]["transformer_backbone_kwargs"]["max_position_embeddings"]
 
-    if cfg["model"]["name"].lower().startswith("scgpt"):  # scGPT uses log-normalized expression
-        cfg["data"]["kwargs"]["transform"] = "log-normalize"
-        cfg["data"]["kwargs"]["hvg_names_uns_key"] = (
-            "hvg_names" if cfg["data"]["kwargs"]["train_task"] != "replogle" else None
-        )  # TODO: better to not hardcode this
-
-        cfg["data"]["kwargs"]["dataset_cls"] = "scGPTPerturbationDataset"
-
-        model_dir = Path(cfg["model"]["kwargs"]["pretrained_path"])
-
-        vocab_file = model_dir / "vocab.json"
-
-        vocab = json.load(open(vocab_file, "r"))
-        cfg["model"]["kwargs"]["pad_token_id"] = vocab["<pad>"]
-        for s in cfg["model"]["kwargs"]["special_tokens"]:
-            if s not in vocab:
-                vocab[s] = len(vocab)
-
-        cfg["data"]["kwargs"]["vocab"] = vocab
-        cfg["data"]["kwargs"]["perturbation_type"] = cfg["model"]["kwargs"]["perturbation_type"]
-        cfg["model"]["kwargs"]["ntoken"] = len(vocab)
-        cfg["model"]["kwargs"]["d_model"] = cfg["model"]["kwargs"]["embsize"]
-
-        logger.info("Added vocab and hvg_names_uns_key to data kwargs for scGPT")
-
-    elif cfg["model"]["name"].lower() == "cpa" and cfg["model"]["kwargs"]["recon_loss"] == "gauss":
-        cfg["data"]["kwargs"]["transform"] = "log-normalize"
-    elif cfg["model"]["name"].lower() == "scvi":
-        cfg["data"]["kwargs"]["transform"] = None
-
+    _OUTPUT_SPACE_ALIASES = {"hvg": "gene", "transcriptome": "all"}
     output_space = cfg["data"]["kwargs"].get("output_space", "gene")
+    output_space = _OUTPUT_SPACE_ALIASES.get(output_space.strip().lower(), output_space)
+    cfg["data"]["kwargs"]["output_space"] = output_space
     assert output_space in {"embedding", "gene", "all"}, (
         f"data.kwargs.output_space must be one of 'embedding', 'gene', or 'all'; got {output_space!r}"
     )
+    nb_loss_enabled = bool(cfg["model"]["kwargs"].get("nb_loss", False))
+    if nb_loss_enabled and output_space == "embedding":
+        raise ValueError(
+            "model.kwargs.nb_loss=True is incompatible with data.kwargs.output_space='embedding'. "
+            "Use output_space='gene' or output_space='all'."
+        )
+    if nb_loss_enabled and output_space not in {"gene", "all"}:
+        raise ValueError(
+            f"model.kwargs.nb_loss=True requires data.kwargs.output_space in {{'gene', 'all'}}; got {output_space!r}."
+        )
+    embed_key = cfg["data"]["kwargs"].get("embed_key", None)
+    if nb_loss_enabled and embed_key not in {None, "X_hvg"}:
+        if not bool(cfg["data"]["kwargs"].get("store_raw_basal", False)):
+            logger.warning(
+                "nb_loss=True with embed_key=%r requires control counts for library-size estimation; "
+                "setting data.kwargs.store_raw_basal=True.",
+                embed_key,
+            )
+            cfg["data"]["kwargs"]["store_raw_basal"] = True
+
+    checkpoint_monitor_metric = cfg["training"].get("checkpoint_monitor", None)
+    if checkpoint_monitor_metric is None:
+        if output_space == "embedding":
+            checkpoint_monitor_metric = "val/embedding_loss"
+        else:
+            checkpoint_monitor_metric = "val/expression_loss"
+
+    # bf16-mixed has limited mantissa — enforce float32 collation, rely on GPU autocast only
+    precision_val = cfg["training"].get("precision")
+    if precision_val == "bf16-mixed":
+        cfg["data"]["kwargs"]["collate_dtype"] = "float32"
+        logger.info("bf16-mixed precision: enforcing collate_dtype=float32")
 
     data_module: PerturbationDataModule = get_datamodule(
         cfg["data"]["name"],
@@ -120,21 +111,51 @@ def run_tx_train(cfg: DictConfig):
         cell_sentence_len=sentence_len,
     )
 
+    data_module.setup(stage="fit")
+    if nb_loss_enabled:
+        resolved_is_log1p = bool(getattr(data_module, "is_log1p", cfg["data"]["kwargs"].get("is_log1p", False)))
+        nb_force_exp_counts = bool(cfg["model"]["kwargs"].get("nb_force_exp_counts", False))
+        current_exp_counts = bool(getattr(data_module, "exp_counts", False))
+        if nb_force_exp_counts:
+            expected_exp_counts = resolved_is_log1p
+            if current_exp_counts != expected_exp_counts:
+                logger.warning(
+                    "nb_loss=True with nb_force_exp_counts=True requires exp_counts to follow is_log1p. "
+                    "Resolved is_log1p=%s, overriding exp_counts %s -> %s.",
+                    resolved_is_log1p,
+                    current_exp_counts,
+                    expected_exp_counts,
+                )
+                data_module.exp_counts = expected_exp_counts
+            else:
+                logger.info(
+                    "nb_loss=True with nb_force_exp_counts=True resolved is_log1p=%s and exp_counts=%s.",
+                    resolved_is_log1p,
+                    current_exp_counts,
+                )
+        else:
+            logger.info(
+                "nb_loss=True with nb_force_exp_counts=False preserves exp_counts=%s (resolved is_log1p=%s).",
+                current_exp_counts,
+                resolved_is_log1p,
+            )
+        cfg["data"]["kwargs"]["is_log1p"] = resolved_is_log1p
+        cfg["data"]["kwargs"]["exp_counts"] = bool(getattr(data_module, "exp_counts", current_exp_counts))
+
     with open(join(run_output_dir, "data_module.torch"), "wb") as f:
         # TODO-Abhi: only save necessary data
         data_module.save_state(f)
 
-    data_module.setup(stage="fit")
     dl = data_module.train_dataloader()
-    print("num_workers:", dl.num_workers)
-    print("batch size:", dl.batch_size)
+    logger.info("num_workers: %s", dl.num_workers)
+    logger.info("batch size: %s", dl.batch_size)
 
     var_dims = data_module.get_var_dims()  # {"gene_dim": …, "hvg_dim": …}
     if output_space == "gene":
-        gene_dim = var_dims.get("hvg_dim", 2000)  # fallback if key missing
+        gene_dim = int(var_dims.get("hvg_dim", 2000))  # fallback if key missing
     else:
-        gene_dim = var_dims.get("gene_dim", 2000)  # fallback if key missing
-    latent_dim = var_dims["output_dim"]  # same as model.output_dim
+        gene_dim = int(var_dims.get("gene_dim", 2000))  # fallback if key missing
+    latent_dim = int(var_dims["output_dim"])  # same as model.output_dim
     hidden_dims = cfg["model"]["kwargs"].get("decoder_hidden_dims", [1024, 1024, 512])
 
     if output_space in {"gene", "all"}:
@@ -143,7 +164,6 @@ def run_tx_train(cfg: DictConfig):
             gene_dim=gene_dim,
             hidden_dims=hidden_dims,
             dropout=cfg["model"]["kwargs"].get("decoder_dropout", 0.1),
-            residual_decoder=cfg["model"]["kwargs"].get("residual_decoder", False),
         )
 
         # tuck it into the kwargs that will reach the LightningModule
@@ -151,6 +171,11 @@ def run_tx_train(cfg: DictConfig):
     else:
         cfg["model"]["kwargs"].pop("decoder_cfg", None)
         cfg["model"]["kwargs"]["gene_decoder_bool"] = False
+
+    # Persist the effective resolved config after runtime adjustments (e.g. NB data guards).
+    resolved_cfg_yaml = OmegaConf.to_yaml(OmegaConf.create(cfg), resolve=True)
+    with open(join(run_output_dir, "config.yaml"), "w") as f:
+        f.write(resolved_cfg_yaml)
 
     # Save one-hot maps as artifacts instead of storing them in config
     cell_type_onehot_map_path = join(run_output_dir, "cell_type_onehot_map.torch")
@@ -164,11 +189,6 @@ def run_tx_train(cfg: DictConfig):
     with open(var_dims_path, "wb") as f:
         pickle.dump(var_dims, f)
 
-    if cfg["model"]["name"].lower() in ["cpa", "scvi"] or cfg["model"]["name"].lower().startswith("scgpt"):
-        cfg["model"]["kwargs"]["n_cell_types"] = len(data_module.celltype_onehot_map)
-        cfg["model"]["kwargs"]["n_perts"] = len(data_module.pert_onehot_map)
-        cfg["model"]["kwargs"]["n_batches"] = len(data_module.batch_onehot_map)
-
     # Create model
     model = get_lightning_module(
         cfg["model"]["name"],
@@ -178,8 +198,9 @@ def run_tx_train(cfg: DictConfig):
         data_module.get_var_dims(),
     )
 
-    print(
-        f"Model created. Estimated params size: {sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3:.2f} GB"
+    logger.info(
+        "Model created. Estimated params size: %.2f GB",
+        sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3,
     )
     loggers = get_loggers(
         output_dir=cfg["output_dir"],
@@ -206,6 +227,7 @@ def run_tx_train(cfg: DictConfig):
         cfg["name"],
         cfg["training"]["val_freq"],
         cfg["training"].get("ckpt_every_n_steps", 4000),
+        monitor_metric=checkpoint_monitor_metric,
     )
     # Add BatchSpeedMonitorCallback to log batches per second to wandb
     batch_speed_monitor = BatchSpeedMonitorCallback()
@@ -214,7 +236,7 @@ def run_tx_train(cfg: DictConfig):
 
     # Track gradient norm only for state transition model
     if cfg["model"]["name"] == "state":
-        callbacks.append(GradNormCallback())
+        callbacks.append(GradNormCallback(log_interval=int(cfg["training"].get("gradnorm_log_interval", 50))))
 
     # Add ModelFLOPSUtilizationCallback to track and log MFU. currently only works for state transition model
     if cfg["training"]["use_mfu"] and cfg["model"]["name"] == "state":
@@ -239,15 +261,7 @@ def run_tx_train(cfg: DictConfig):
 
     logger.info("Loggers and callbacks set up.")
 
-    if cfg["model"]["name"].lower().startswith("scgpt"):
-        plugins = [
-            MixedPrecision(
-                precision="bf16-mixed",
-                device="cuda",
-            )
-        ]
-    else:
-        plugins = []
+    plugins = []
 
     if torch.cuda.is_available():
         accelerator = "gpu"
@@ -272,19 +286,23 @@ def run_tx_train(cfg: DictConfig):
         logger=loggers,
         plugins=plugins,
         callbacks=callbacks,
-        gradient_clip_val=cfg["training"]["gradient_clip_val"] if cfg["model"]["name"].lower() != "cpa" else None,
+        gradient_clip_val=cfg["training"]["gradient_clip_val"],
         accumulate_grad_batches=cfg["training"].get("gradient_accumulation_steps", 1),
         use_distributed_sampler=False,
     )
+
+    # Optional mixed precision
+    if cfg["training"].get("precision"):
+        trainer_kwargs["precision"] = cfg["training"]["precision"]
 
     # Align logging cadence with rolling MFU window (and W&B logging)
     if "log_every_n_steps" in cfg["training"]:
         trainer_kwargs["log_every_n_steps"] = cfg["training"]["log_every_n_steps"]
 
     # Build trainer
-    print(f"Building trainer with kwargs: {trainer_kwargs}")
+    logger.info("Building trainer with kwargs: %s", trainer_kwargs)
     trainer = pl.Trainer(**trainer_kwargs)
-    print("Trainer built successfully")
+    logger.info("Trainer built successfully")
 
     # Load checkpoint if exists
     checkpoint_path = join(ckpt_callbacks[0].dirpath, "last.ckpt")
@@ -293,9 +311,12 @@ def run_tx_train(cfg: DictConfig):
     else:
         logging.info(f"!! Resuming training from {checkpoint_path} !!")
 
-    print(f"Model device: {next(model.parameters()).device}")
-    print(f"CUDA memory allocated: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
-    print(f"CUDA memory reserved: {torch.cuda.memory_reserved() / 1024**3:.2f} GB")
+    logger.info("Model device: %s", next(model.parameters()).device)
+    if torch.cuda.is_available():
+        logger.info("CUDA memory allocated: %.2f GB", torch.cuda.memory_allocated() / 1024**3)
+        logger.info("CUDA memory reserved: %.2f GB", torch.cuda.memory_reserved() / 1024**3)
+    else:
+        logger.info("CUDA unavailable; skipping CUDA memory logging.")
 
     logger.info("Starting trainer fit.")
 
@@ -303,7 +324,7 @@ def run_tx_train(cfg: DictConfig):
     # this is mainly used for pretrain -> finetune workflows
     manual_init = cfg["model"]["kwargs"].get("init_from", None)
     if checkpoint_path is None and manual_init is not None:
-        print(f"Loading manual checkpoint from {manual_init}")
+        logger.info("Loading manual checkpoint from %s", manual_init)
         checkpoint_path = manual_init
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -315,12 +336,16 @@ def run_tx_train(cfg: DictConfig):
         current_output_space = cfg["data"]["kwargs"]["output_space"]
 
         if checkpoint_output_space != current_output_space:
-            print(
-                f"Output space mismatch: checkpoint has '{checkpoint_output_space}', current config has '{current_output_space}'"
+            logger.info(
+                "Output space mismatch: checkpoint has %r, current config has %r",
+                checkpoint_output_space,
+                current_output_space,
             )
-            print("Creating new decoder for the specified output space...")
+            logger.info("Creating new decoder for the specified output space...")
 
-            if cfg["model"]["kwargs"].get("gene_decoder_bool", True) == False:
+            if cfg["model"]["kwargs"].get("gene_decoder_bool", True) == False or cfg["model"]["kwargs"].get(
+                "nb_loss", False
+            ):
                 model._decoder_externally_configured = False
             else:
                 # Override the decoder_cfg to match the new output_space
@@ -334,14 +359,17 @@ def run_tx_train(cfg: DictConfig):
                     gene_dim=new_gene_dim,
                     hidden_dims=cfg["model"]["kwargs"].get("decoder_hidden_dims", [1024, 1024, 512]),
                     dropout=cfg["model"]["kwargs"].get("decoder_dropout", 0.1),
-                    residual_decoder=cfg["model"]["kwargs"].get("residual_decoder", False),
                 )
 
                 # Update the model's decoder_cfg and rebuild decoder
                 model.decoder_cfg = new_decoder_cfg
                 model._build_decoder()
                 model._decoder_externally_configured = True  # Mark that decoder was configured externally
-                print(f"Created new decoder for output_space='{current_output_space}' with gene_dim={new_gene_dim}")
+                logger.info(
+                    "Created new decoder for output_space=%r with gene_dim=%s",
+                    current_output_space,
+                    new_gene_dim,
+                )
 
         pert_encoder_weight_key = "pert_encoder.0.weight"
         if pert_encoder_weight_key in checkpoint_state:
@@ -349,8 +377,11 @@ def run_tx_train(cfg: DictConfig):
 
             # if the cell embedding dim doesn't match, or if it was HVGs, rebuild for transfer learning
             if checkpoint_pert_dim != model.pert_dim or cfg["data"]["kwargs"]["embed_key"] == "X_hvg":
-                print(
-                    f"pert_encoder input dimension mismatch: model.pert_dim = {model.pert_dim} but checkpoint expects {checkpoint_pert_dim}. Overriding model's pert_dim and rebuilding pert_encoder."
+                logger.info(
+                    "pert_encoder input dimension mismatch: model.pert_dim=%s, checkpoint expects %s. "
+                    "Overriding model pert dim and rebuilding pert_encoder.",
+                    model.pert_dim,
+                    checkpoint_pert_dim,
                 )
                 # Rebuild the pert_encoder with the new pert input dimension
                 from ...tx.models.utils import build_mlp
@@ -364,7 +395,7 @@ def run_tx_train(cfg: DictConfig):
                     activation=model.activation_class,
                 )
             else:
-                print("WARNING: pert_encoder will not be rebuilt since input dimension matches")
+                logger.warning("pert_encoder will not be rebuilt since input dimension matches")
 
         # Filter out mismatched size parameters
         filtered_state = {}
@@ -373,15 +404,18 @@ def run_tx_train(cfg: DictConfig):
                 if param.shape == model_state[name].shape:
                     filtered_state[name] = param
                 else:
-                    print(
-                        f"Skipping parameter {name} due to shape mismatch: checkpoint={param.shape}, model={model_state[name].shape}"
+                    logger.info(
+                        "Skipping parameter %s due to shape mismatch: checkpoint=%s, model=%s",
+                        name,
+                        param.shape,
+                        model_state[name].shape,
                     )
             else:
-                print(f"Skipping parameter {name} as it doesn't exist in the current model")
+                logger.info("Skipping parameter %s as it doesn't exist in the current model", name)
 
         # Load the filtered state dict
         model.load_state_dict(filtered_state, strict=False)
-        print("About to call trainer.fit() with manual checkpoint...")
+        logger.info("About to call trainer.fit() with manual checkpoint...")
 
         # Train - for clarity we pass None
         trainer.fit(
@@ -389,18 +423,19 @@ def run_tx_train(cfg: DictConfig):
             datamodule=data_module,
             ckpt_path=None,
         )
-        print("trainer.fit() completed with manual checkpoint")
+        logger.info("trainer.fit() completed with manual checkpoint")
     else:
-        print(f"About to call trainer.fit() with checkpoint_path={checkpoint_path}")
+        logger.info("About to call trainer.fit() with checkpoint_path=%s", checkpoint_path)
         # Train
         trainer.fit(
             model,
             datamodule=data_module,
             ckpt_path=checkpoint_path,
+            weights_only=False,
         )
-        print("trainer.fit() completed")
+        logger.info("trainer.fit() completed")
 
-    print("Training completed, saving final checkpoint...")
+    logger.info("Training completed, saving final checkpoint...")
 
     # at this point if checkpoint_path does not exist, manually create one
     checkpoint_path = join(ckpt_callbacks[0].dirpath, "final.ckpt")

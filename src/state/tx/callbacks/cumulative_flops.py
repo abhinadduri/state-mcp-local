@@ -90,16 +90,16 @@ class CumulativeFLOPSCallback(Callback):
         self._batch_count += 1
         self._cumulative_flops += self._flops_per_batch
 
-        # Log cumulative FLOPs after every training batch
-        pl_module.log(
-            "cumulative_flops",
-            float(self._cumulative_flops),
-            prog_bar=False,
-            on_step=True,
-            on_epoch=False,
-            sync_dist=True,
-        )
-        logger.info(f"CumulativeFLOPSCallback: Logged cumulative FLOPs: {self._cumulative_flops}")
+        # Log cumulative FLOPs every 50 batches (sync_dist=False to avoid DDP barrier)
+        if self._batch_count % 50 == 0:
+            pl_module.log(
+                "cumulative_flops",
+                float(self._cumulative_flops),
+                prog_bar=False,
+                on_step=True,
+                on_epoch=False,
+                sync_dist=False,
+            )
 
     def on_validation_start(self, trainer: Trainer, pl_module: Any) -> None:
         if self._flops_per_batch is None:
