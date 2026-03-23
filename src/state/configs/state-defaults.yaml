@@ -226,13 +226,13 @@ model:
   variable_masking: true
   tokenizer: sentence
   n_latent: 256
-  k_top: 4096
-  decoder_bottleneck_dim: null
+  k_top: 2048
+  decoder_bottleneck_dim: 256
   gradient_checkpointing: false
 task:
   mask: 0.2
 optimizer:
-  name: adamw
+  name: muon
   max_lr: 1.0e-05
   weight_decay: 0.01
   start: 0.33
