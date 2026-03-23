@@ -208,12 +208,12 @@ tokenizer:
 model:
   name: vci
   batch_size: 128
-  emsize: 512
-  d_hid: 1024
+  emsize: 1024
+  d_hid: 2048
   nhead: 16
   nlayers: 8
   dropout: 0.1
-  output_dim: 512
+  output_dim: 1024
   use_flash_attention: true
   rda: true
   counts: true
