@@ -329,7 +329,7 @@ class StateEmbeddingModel(L.LightningModule):
             )
         else:
             trainable_params = [p for p in self.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=weight_decay, fused=True)
+            optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=weight_decay, foreach=True)
 
         total_steps = self.trainer.estimated_stepping_batches
 
