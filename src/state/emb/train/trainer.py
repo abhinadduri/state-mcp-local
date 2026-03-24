@@ -91,28 +91,30 @@ def main(cfg):
 
     # Training dataloader
     train_dataset = DatasetClass(cfg)
+    n_train_workers = cfg.dataset.num_train_workers
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=cfg.model.batch_size,
         shuffle=True,
         collate_fn=train_collator,
-        num_workers=cfg.dataset.num_train_workers,
-        persistent_workers=True,
+        num_workers=n_train_workers,
+        persistent_workers=n_train_workers > 0,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=4 if n_train_workers > 0 else None,
         generator=generator,
     )
 
     val_dataset = DatasetClass(cfg, test=True)
+    n_val_workers = cfg.dataset.num_val_workers
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=cfg.model.batch_size,
         shuffle=True,
         collate_fn=val_collator,
-        num_workers=cfg.dataset.num_val_workers,
-        persistent_workers=True,
+        num_workers=n_val_workers,
+        persistent_workers=n_val_workers > 0,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=4 if n_val_workers > 0 else None,
         generator=generator,
     )
 
@@ -153,6 +155,22 @@ def main(cfg):
         all_pe = all_pe.to(torch.bfloat16)
         all_pe.requires_grad = False
         model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
+
+        # Pre-split Muon params BEFORE FSDP wrapping — FSDP flattens parameters
+        # to 1-D, making ndim-based splitting fail in configure_optimizers.
+        # Store param names so we can match by name after FSDP.
+        optimizer_name = getattr(cfg.optimizer, "name", "adamw").lower()
+        if optimizer_name == "muon":
+            from ...tx.models.state_transition import _split_muon_parameters
+            muon_params, adamw_params = _split_muon_parameters(model)
+            # Build name→group mapping
+            muon_names = set()
+            param_to_name = {id(p): n for n, p in model.named_parameters()}
+            for p in muon_params:
+                muon_names.add(param_to_name[id(p)])
+            model._muon_param_names = muon_names
+            print(f"Pre-FSDP Muon split: {len(muon_params)} matrix, {len(adamw_params)} adamw")
+
         # Skip compile — FSDP + compile requires FSDP2 composable API which
         # can't be used through Lightning's strategy (needs manual dist init).
         print(f"FSDP mode: model on CPU, pe_embedding loaded, compile skipped")

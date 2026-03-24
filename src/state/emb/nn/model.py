@@ -306,8 +306,24 @@ class StateEmbeddingModel(L.LightningModule):
             from ...tx.optim import MuonWithAuxAdamW
             from ...tx.models.state_transition import _split_muon_parameters
 
-            muon_params, adamw_params = _split_muon_parameters(self)
-            print(f"Muon: {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm params")
+            if hasattr(self, "_muon_param_names") and self._muon_param_names:
+                # FSDP mode: params are flattened to 1-D, so ndim-based splitting
+                # fails. Use pre-computed name mapping from before FSDP wrapping.
+                muon_names = self._muon_param_names
+                muon_params, adamw_params = [], []
+                for name, p in self.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    # Strip FSDP wrapper prefixes for name matching
+                    clean = name.replace("_fsdp_wrapped_module.", "")
+                    if clean in muon_names:
+                        muon_params.append(p)
+                    else:
+                        adamw_params.append(p)
+                print(f"Muon (FSDP name-match): {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm params")
+            else:
+                muon_params, adamw_params = _split_muon_parameters(self)
+                print(f"Muon: {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm params")
             optimizer = MuonWithAuxAdamW(
                 muon_params, adamw_params,
                 lr=max_lr,
@@ -326,7 +342,10 @@ class StateEmbeddingModel(L.LightningModule):
             trainable_params = [p for p in self.parameters() if p.requires_grad]
             optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=weight_decay, foreach=True)
 
-        total_steps = self.trainer.estimated_stepping_batches
+        if self.trainer.max_steps > 0:
+            total_steps = self.trainer.max_steps
+        else:
+            total_steps = self.trainer.estimated_stepping_batches
 
         lr_schedulers = [
             LinearLR(
