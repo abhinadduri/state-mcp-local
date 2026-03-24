@@ -8,7 +8,7 @@ from datetime import timedelta
 
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.strategies import DDPStrategy
+from lightning.pytorch.strategies import DDPStrategy, FSDPStrategy
 
 from ..nn.model import StateEmbeddingModel
 from ..nn.tokenizer import SentenceTokenizer, LatentTokenizer
@@ -144,49 +144,18 @@ def main(cfg):
     use_fsdp = strategy_name == "fsdp"
 
     if use_fsdp:
-        # FSDP2: use composable fully_shard API (works with torch.compile).
-        # Apply per-module sharding, then compile, then use DDP in Lightning.
-        from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
-        import torch.distributed as dist
-
-        if not dist.is_initialized():
-            dist.init_process_group("nccl")
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-
-        # Load pe_embedding (frozen, bf16) — excluded from FSDP sharding
+        # FSDP: keep model on CPU — Lightning's FSDPStrategy handles dist init,
+        # process spawning, and sharding across GPUs.
+        # use_orig_params=True preserves parameter shapes so Muon sees ndim>=2 matrices.
         all_pe = torch.load(get_embedding_cfg(cfg).all_embeddings, weights_only=False)
         if isinstance(all_pe, dict):
             all_pe = torch.vstack(list(all_pe.values()))
         all_pe = all_pe.to(torch.bfloat16)
         all_pe.requires_grad = False
-
-        pe_emb_weights = all_pe
-
-        # Move model to GPU before fully_shard (FSDP2 requires CUDA tensors)
-        model = model.cuda()
-
-        mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16)
-
-        # Shard each transformer layer and cross-attention block individually
-        for layer in model.tokenizer.transformer_encoder.layers:
-            fully_shard(layer, mp_policy=mp)
-        for block in model.tokenizer.cross_attn_rounds:
-            fully_shard(block, mp_policy=mp)
-        # Shard the root module (remaining params: decoder, projections, etc.)
-        fully_shard(model, mp_policy=mp)
-
-        # Now set pe_embedding (after sharding, so it's not touched by FSDP)
-        model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(pe_emb_weights.cuda())
-
-        # Compile submodules that operate within DTensor domain.
-        # Full-tokenizer compile fails due to DTensor/Tensor boundary at pe_embedding.
-        if compiled:
-            model.tokenizer.transformer_encoder = torch.compile(model.tokenizer.transformer_encoder)
-            model._decode = torch.compile(model._decode)
-            print(f"FSDP2 + submodule compile: transformer_encoder and _decode")
-        else:
-            print(f"FSDP2 mode: sharded model, no compile")
+        model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
+        # Skip compile — FSDP + compile requires FSDP2 composable API which
+        # can't be used through Lightning's strategy (needs manual dist init).
+        print(f"FSDP mode: model on CPU, pe_embedding loaded, compile skipped")
     else:
         model = model.cuda()
 
@@ -248,13 +217,41 @@ def main(cfg):
 
     val_interval = int(cfg.experiment.val_check_interval * cfg.experiment.num_gpus_per_node * cfg.experiment.num_nodes)
 
-    # FSDP2 is composable with DDP — always use DDPStrategy for Lightning,
-    # the per-module sharding is already applied above.
-    strategy = DDPStrategy(
-        process_group_backend="nccl",
-        find_unused_parameters=False,
-        timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
-    )
+    if use_fsdp:
+        from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+        from ..nn.flash_transformer import FlashTransformerEncoderLayer
+        from ..nn.tokenizer import CrossAttentionBlock
+
+        # Detach frozen pe_embedding (bf16) before FSDP wrapping — mixed dtype
+        # in the same FSDP unit causes ValueError. Re-attach after setup.
+        _pe_embedding = model.tokenizer.pe_embedding
+        model.tokenizer.pe_embedding = None
+
+        class _ReattachPECallback(L.Callback):
+            """Re-attach pe_embedding after FSDP wraps the model."""
+            def __init__(self, pe_emb):
+                self._pe_emb = pe_emb
+            def on_fit_start(self, trainer, pl_module):
+                device = next(pl_module.parameters()).device
+                pl_module.tokenizer.pe_embedding = self._pe_emb.to(device)
+                print(f"Re-attached pe_embedding on {device}")
+
+        callbacks.append(_ReattachPECallback(_pe_embedding))
+
+        strategy = FSDPStrategy(
+            auto_wrap_policy=ModuleWrapPolicy({FlashTransformerEncoderLayer, CrossAttentionBlock}),
+            sharding_strategy="FULL_SHARD",
+            process_group_backend="nccl",
+            timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
+            use_orig_params=True,  # preserve param shapes for Muon optimizer
+        )
+        print(f"Using FSDP (FULL_SHARD, use_orig_params=True)")
+    else:
+        strategy = DDPStrategy(
+            process_group_backend="nccl",
+            find_unused_parameters=False,
+            timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
+        )
 
     trainer = L.Trainer(
         max_epochs=cfg.experiment.num_epochs,
