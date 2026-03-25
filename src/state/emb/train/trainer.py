@@ -289,7 +289,11 @@ def main(cfg):
     val_collator.cfg = cfg
     model.collater = val_collator
 
-    model = model.cuda()
+    # Store all parameters in bf16 to halve memory footprint.
+    # Without this, 7B params + grads + optimizer state = ~84 GB (exceeds H100 80 GB).
+    # With bf16: ~42 GB base, leaving room for activations.
+    # Autocast still handles compute precision; Muon upcasts to fp32 for Newton-Schulz.
+    model = model.to(torch.bfloat16).cuda()
 
     # Load frozen protein embeddings (bf16)
     all_pe = get_embeddings(cfg)
