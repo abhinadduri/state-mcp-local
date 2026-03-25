@@ -92,7 +92,14 @@ class MMDLoss(nn.Module):
         input = input.reshape(-1, downsample, input.shape[-1])
         target = target.reshape(-1, downsample, target.shape[-1])
 
-        loss = self.mmd_loss(input, target)
+        # Pre-compute uniform weights on the correct device to avoid
+        # geomloss creating CPU tensors then calling .type_as() which
+        # triggers a cudaStreamSynchronize on every forward pass.
+        B, N, _ = input.shape
+        α = torch.ones(B, N, device=input.device, dtype=input.dtype) / N
+        β = torch.ones(B, N, device=target.device, dtype=target.dtype) / N
+
+        loss = self.mmd_loss(α, input, β, target)
         return loss.mean()
 
 
@@ -119,7 +126,12 @@ class TabularLoss(nn.Module):
         # (B*D, P+N+S) -> (B, D, P+N+S)  where D = downsample count
         input = input.reshape(-1, downsample, input.shape[-1])
         target = target.reshape(-1, downsample, target.shape[-1])
-        gene_mmd = self.gene_loss(input, target).nanmean()
+
+        # Pre-compute uniform weights on GPU to avoid geomloss type_as syncs
+        B, N, _ = input.shape
+        α_gene = torch.ones(B, N, device=input.device, dtype=input.dtype) / N
+        β_gene = torch.ones(B, N, device=target.device, dtype=target.dtype) / N
+        gene_mmd = self.gene_loss(α_gene, input, β_gene, target).nanmean()
 
         # Extract the S shared genes (last S columns) for cross-cell comparison
         cell_inputs = input[:, :, -self.shared :]
@@ -130,7 +142,11 @@ class TabularLoss(nn.Module):
         # distributions across cells
         cell_inputs = cell_inputs.transpose(2, 0)
         cell_targets = cell_targets.transpose(2, 0)
-        cell_mmd = self.cell_loss(cell_inputs, cell_targets).nanmean()
+
+        S, D, _ = cell_inputs.shape
+        α_cell = torch.ones(S, D, device=cell_inputs.device, dtype=cell_inputs.dtype) / D
+        β_cell = torch.ones(S, D, device=cell_targets.device, dtype=cell_targets.dtype) / D
+        cell_mmd = self.cell_loss(α_cell, cell_inputs, β_cell, cell_targets).nanmean()
 
         # Combine losses, skipping any that are NaN (can happen with degenerate batches)
         final_loss = torch.tensor(0.0, device=cell_mmd.device, dtype=cell_mmd.dtype)

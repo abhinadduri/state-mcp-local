@@ -164,6 +164,12 @@ def main(cfg):
     print(f"Starting training with Embedding {cfg.embeddings.current} and dataset {cfg.dataset.current}")
     torch.set_float32_matmul_precision("high")
 
+    # Reduce CUDA memory fragmentation for large models (4B+).
+    # torch >=2.9 renamed PYTORCH_CUDA_ALLOC_CONF → PYTORCH_ALLOC_CONF.
+    for key in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        if key not in os.environ:
+            os.environ[key] = "expandable_segments:True"
+
     # --- DDP setup ---
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -291,38 +297,70 @@ def main(cfg):
     all_pe.requires_grad = False
     model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
 
-    # Measure FLOPS before compile (FlopCounterMode can't trace compiled kernels)
+    # Measure FLOPS before compile (FlopCounterMode can't trace compiled kernels).
+    # For large models (>50% GPU used by params alone), FLOPS measurement runs an
+    # uncompiled forward+backward that fragments memory, preventing the compiled
+    # model from fitting. In that case, skip and set flops=0 (cells/sec still works).
     flops_per_batch = None
     if is_main:
-        try:
-            flops_batch = next(iter(train_dataloader))
-            flops_per_batch = compute_forward_flops(
-                model, flops_batch,
-                use_backward=cfg.experiment.cumulative_flops_use_backward,
-            )
-            print(f"Measured FLOPs per batch: {flops_per_batch:,}")
-            del flops_batch
-        except (torch.OutOfMemoryError, RuntimeError) as e:
-            # Large models may OOM during uncompiled FLOPS measurement;
-            # measure forward-only and estimate total as 3x (forward + backward ≈ 3x forward)
-            torch.cuda.empty_cache()
-            model.zero_grad(set_to_none=True)
+        n_params = sum(p.numel() for p in model.parameters())
+        if n_params > 2_000_000_000:
+            # Large models: measure forward-only with batch_size=1 (minimal memory),
+            # then scale to actual batch_size × 3 (backward ≈ 2× forward).
+            try:
+                mini_batch = next(iter(train_dataloader))
+                # Slice all tensor fields to batch=1 (NamedTuple uses _replace)
+                sliced = {
+                    f: getattr(mini_batch, f)[:1] if isinstance(getattr(mini_batch, f), torch.Tensor)
+                       and getattr(mini_batch, f).dim() > 0 else getattr(mini_batch, f)
+                    for f in mini_batch._fields
+                }
+                mini_batch = type(mini_batch)(**sliced)
+                flops_1 = compute_forward_flops(model, mini_batch, use_backward=False)
+                flops_per_batch = flops_1 * cfg.model.batch_size * 3
+                print(f"Measured FLOPs per batch ({n_params/1e9:.1f}B model, bs=1×{cfg.model.batch_size}×3): {flops_per_batch:,}")
+                del mini_batch
+            except Exception as e:
+                print(f"Warning: FLOPS measurement failed for {n_params/1e9:.1f}B model: {e}")
+                flops_per_batch = 0
+            finally:
+                import gc
+                model.zero_grad(set_to_none=True)
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+        else:
             try:
                 flops_batch = next(iter(train_dataloader))
-                flops_fwd = compute_forward_flops(model, flops_batch, use_backward=False)
-                flops_per_batch = flops_fwd * 3  # forward + backward ≈ 3x forward
-                print(f"Measured FLOPs per batch (fwd×3): {flops_per_batch:,}")
+                flops_per_batch = compute_forward_flops(
+                    model, flops_batch,
+                    use_backward=cfg.experiment.cumulative_flops_use_backward,
+                )
+                print(f"Measured FLOPs per batch: {flops_per_batch:,}")
                 del flops_batch
-            except Exception:
+            except (torch.OutOfMemoryError, RuntimeError) as e:
                 torch.cuda.empty_cache()
                 model.zero_grad(set_to_none=True)
-                print(f"Warning: FLOPS measurement failed (OOM): {e}")
+                try:
+                    flops_batch = next(iter(train_dataloader))
+                    flops_fwd = compute_forward_flops(model, flops_batch, use_backward=False)
+                    flops_per_batch = flops_fwd * 3
+                    print(f"Measured FLOPs per batch (fwd×3): {flops_per_batch:,}")
+                    del flops_batch
+                except Exception:
+                    torch.cuda.empty_cache()
+                    model.zero_grad(set_to_none=True)
+                    print(f"Warning: FLOPS measurement failed (OOM): {e}")
+                    flops_per_batch = 0
+            except Exception as e:
+                print(f"Warning: FLOPS measurement failed: {e}")
                 flops_per_batch = 0
-        except Exception as e:
-            print(f"Warning: FLOPS measurement failed: {e}")
-            flops_per_batch = 0
-        finally:
-            torch.cuda.empty_cache()
+            finally:
+                import gc
+                model.zero_grad(set_to_none=True)
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
 
     # Compile after pe_embedding set and ESM2 cache populated
     if compiled:

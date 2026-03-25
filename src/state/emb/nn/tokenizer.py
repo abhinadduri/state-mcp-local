@@ -331,8 +331,10 @@ class LatentCollator:
             task_counts_list.append(tc)
             dataset_nums[i] = dataset_num
 
-        # Pad to max measured genes in batch
+        # Pad to bucketed size (nearest multiple of 256) so torch.compile sees
+        # at most ~8 distinct shapes, avoiding constant recompilation.
         k_max = max(len(c[0]) for c in cells)
+        k_max = ((k_max + 255) // 256) * 256
         gene_indices = torch.zeros(batch_size, k_max, dtype=torch.long)
         gene_counts = torch.zeros(batch_size, k_max)
         gene_mask = torch.zeros(batch_size, k_max, dtype=torch.bool)
@@ -380,10 +382,11 @@ class CrossAttentionBlock(nn.Module):
         k = k.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
         v = v.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
 
-        if not kv_mask.all():
-            padding_mask = kv_mask.unsqueeze(-1)
-            k = k * padding_mask.unsqueeze(1)
-            v = v * padding_mask.unsqueeze(1)
+        # Always apply mask — avoids cudaStreamSynchronize from kv_mask.all().item()
+        # which also acts as a torch.compile graph break.
+        padding_mask = kv_mask.unsqueeze(-1)
+        k = k * padding_mask.unsqueeze(1)
+        v = v * padding_mask.unsqueeze(1)
 
         dropout_p = self.dropout if self.training else 0.0
         attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
