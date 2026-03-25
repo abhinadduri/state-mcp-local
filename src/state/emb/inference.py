@@ -139,9 +139,18 @@ class Inference:
         if checkpoint_suffix == ".safetensors":
             self.model = self._load_model_from_safetensors(checkpoint_path, device=device)
         else:
-            self.model = StateEmbeddingModel.load_from_checkpoint(
-                checkpoint, dropout=0.0, strict=False, cfg=self._vci_conf, weights_only=False, map_location=device
-            )
+            self.model = self._init_model_from_cfg(cfg_to_use)
+            ckpt_data = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            if isinstance(ckpt_data, dict) and "model" in ckpt_data:
+                state_dict = ckpt_data["model"]
+            elif isinstance(ckpt_data, dict) and "state_dict" in ckpt_data:
+                state_dict = ckpt_data["state_dict"]
+            else:
+                state_dict = ckpt_data
+            # Strip DDP "module." prefix if present
+            if state_dict and any(k.startswith("module.") for k in state_dict):
+                state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+            self.model.load_state_dict(state_dict, strict=False)
 
         # Convert model to appropriate precision for faster inference
         precision = get_precision_config(device_type=device_type)

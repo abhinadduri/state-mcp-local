@@ -48,11 +48,11 @@ def run_emb_fit(cfg, args):
         log.error("Experiment name is required for training. Please set 'experiment.name'")
         sys.exit(1)
 
-    # Set environment variables
-    os.environ["MASTER_PORT"] = str(cfg.experiment.port)
-    # WAR: Workaround for sbatch failing when --ntasks-per-node is set.
-    # lightning expects this to be set.
-    os.environ["SLURM_NTASKS_PER_NODE"] = str(cfg.experiment.num_gpus_per_node)
+    # Set environment variables (guard to avoid overriding torchrun values)
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = str(cfg.experiment.port)
+    if "SLURM_NTASKS_PER_NODE" not in os.environ:
+        os.environ["SLURM_NTASKS_PER_NODE"] = str(cfg.experiment.num_gpus_per_node)
 
     log.info(f"*************** Training {cfg.experiment.name} ***************")
     log.info(OmegaConf.to_yaml(cfg))

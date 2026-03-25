@@ -1,53 +1,188 @@
+"""Native PyTorch DDP training loop for State Embedding model.
+
+Replaces the former Lightning Trainer with a minimal, high-performance loop.
+DDP only (single-GPU is just world_size=1 without DDP wrapper).
+"""
+
 import os
+import time
+import logging
+import collections
+from contextlib import nullcontext
+
 import torch
-import lightning as L
-
+import torch.distributed as dist
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.optim.lr_scheduler import ChainedScheduler, LinearLR, CosineAnnealingLR
 from datetime import timedelta
-
-from lightning.pytorch.callbacks import ModelCheckpoint
-from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.strategies import DDPStrategy, FSDPStrategy
+from tqdm import tqdm
+from omegaconf import OmegaConf
 
 from ..nn.model import StateEmbeddingModel
 from ..nn.tokenizer import SentenceTokenizer, LatentTokenizer
 from ..data import H5adSentenceDataset
-from ..train.callbacks import (
-    LogLR,
-    ProfilerCallback,
-    ResumeCallback,
-    PerfProfilerCallback,
-    CumulativeFLOPSCallback,
-)
 from ..utils import get_latest_checkpoint, get_embedding_cfg, get_dataset_cfg
+from .callbacks import compute_forward_flops
+
+log = logging.getLogger(__name__)
+
+# H100 peak bf16 TFLOPS
+H100_PEAK_TFLOPS = 989.5
 
 
 def get_embeddings(cfg):
-    # Load in ESM2 embeddings and special tokens
+    """Load ESM2 embeddings and special tokens."""
     all_pe = torch.load(get_embedding_cfg(cfg).all_embeddings, weights_only=False)
     if isinstance(all_pe, dict):
         all_pe = torch.vstack(list(all_pe.values()))
-
     all_pe = all_pe.cuda()
     return all_pe
+
+
+def build_optimizer_and_scheduler(model, cfg, total_steps):
+    """Build optimizer and LR scheduler from config.
+
+    Extracted from former StateEmbeddingModel.configure_optimizers.
+    """
+    max_lr = cfg.optimizer.max_lr
+    weight_decay = cfg.optimizer.weight_decay
+    optimizer_name = getattr(cfg.optimizer, "name", "adamw").lower()
+
+    if optimizer_name == "muon":
+        from ...tx.optim import MuonWithAuxAdamW
+        from ...tx.models.state_transition import _split_muon_parameters
+
+        muon_params, adamw_params = _split_muon_parameters(model)
+        print(f"Muon: {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm params")
+        optimizer = MuonWithAuxAdamW(
+            muon_params,
+            adamw_params,
+            lr=max_lr,
+            weight_decay=weight_decay,
+            momentum=getattr(cfg.optimizer, "muon_momentum", 0.95),
+            nesterov=getattr(cfg.optimizer, "muon_nesterov", True),
+            ns_steps=getattr(cfg.optimizer, "muon_ns_steps", 5),
+            muon_eps=getattr(cfg.optimizer, "muon_eps", 1e-7),
+            adamw_betas=(
+                getattr(cfg.optimizer, "muon_adamw_beta1", 0.9),
+                getattr(cfg.optimizer, "muon_adamw_beta2", 0.95),
+            ),
+            adamw_eps=getattr(cfg.optimizer, "muon_adamw_eps", 1e-8),
+        )
+    else:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=weight_decay, foreach=True)
+
+    lr_schedulers = [
+        LinearLR(
+            optimizer,
+            start_factor=cfg.optimizer.start,
+            end_factor=cfg.optimizer.end,
+            total_iters=int(0.03 * total_steps),
+        ),
+        CosineAnnealingLR(optimizer, eta_min=max_lr * 0.3, T_max=total_steps),
+    ]
+    scheduler = ChainedScheduler(lr_schedulers)
+
+    return optimizer, scheduler
+
+
+class CheckpointManager:
+    """Manages checkpoint saving with last + top-k by metric."""
+
+    def __init__(self, dirpath, save_top_k=2):
+        self.dirpath = dirpath
+        self.save_top_k = save_top_k
+        self._best = []  # list of (metric_value, path)
+        os.makedirs(dirpath, exist_ok=True)
+
+    def _build_checkpoint(self, model, optimizer, scheduler, step, epoch, best_val_loss):
+        raw_model = model.module if isinstance(model, DDP) else model
+        checkpoint = {
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "step": step,
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+        }
+        raw_model.on_save_checkpoint(checkpoint)
+        return checkpoint
+
+    def save(self, model, optimizer, scheduler, step, epoch, best_val_loss,
+             metric_value=None, run_name=""):
+        """Save checkpoint with optional metric tracking."""
+        checkpoint = self._build_checkpoint(model, optimizer, scheduler, step, epoch, best_val_loss)
+
+        # Always save last
+        last_path = os.path.join(self.dirpath, "last.pt")
+        torch.save(checkpoint, last_path)
+
+        # Save named checkpoint if metric provided
+        if metric_value is not None:
+            fname = f"{run_name}-epoch={epoch}-step={step}-val_loss={metric_value:.4f}.pt"
+            path = os.path.join(self.dirpath, fname)
+            torch.save(checkpoint, path)
+
+            self._best.append((metric_value, path))
+            self._best.sort(key=lambda x: x[0])  # ascending — best (lowest) first
+
+            while len(self._best) > self.save_top_k:
+                _, old_path = self._best.pop()
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+
+        return last_path
+
+    def save_periodic(self, model, optimizer, scheduler, step, epoch, best_val_loss):
+        """Save periodic checkpoint (last.pt only, no metric tracking)."""
+        checkpoint = self._build_checkpoint(model, optimizer, scheduler, step, epoch, best_val_loss)
+        last_path = os.path.join(self.dirpath, "last.pt")
+        torch.save(checkpoint, last_path)
+        return last_path
+
+
+def run_validation(model, val_dataloader, limit_val_batches):
+    """Run validation loop, return mean val loss."""
+    model.eval()
+    val_losses = []
+    with torch.no_grad():
+        for i, batch in enumerate(val_dataloader):
+            if 0 < limit_val_batches <= i:
+                break
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                loss = model(batch)
+            val_losses.append(loss.item())
+    model.train()
+    return sum(val_losses) / len(val_losses) if val_losses else float("inf")
 
 
 def main(cfg):
     print(f"Starting training with Embedding {cfg.embeddings.current} and dataset {cfg.dataset.current}")
     torch.set_float32_matmul_precision("high")
+
+    # --- DDP setup ---
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_distributed = world_size > 1
+    is_main = local_rank == 0
+
     os.environ["NCCL_LAUNCH_TIMEOUT"] = str(cfg.experiment.ddp_timeout)
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
-    TOTAL_N_CELL = cfg.dataset.num_cells
-    EPOCH_LENGTH = int(TOTAL_N_CELL // cfg.model.batch_size // 24)
-    warmup_steps = EPOCH_LENGTH * 6
+
+    if is_distributed:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group("nccl", timeout=timedelta(seconds=cfg.experiment.ddp_timeout))
+    else:
+        torch.cuda.set_device(0)
+
+    compiled = cfg.experiment.get("compiled", False)
 
     # --- Build tokenizer ---
     tokenizer_type = getattr(cfg.model, "tokenizer", "sentence")
-    compiled = cfg.experiment.get("compiled", False)
-    # When compiled=True, we compile the full tokenizer in the trainer (after pe_embedding
-    # is set) rather than individual submodules, since full-module compile gives better
-    # kernel fusion (1.25x vs 1.16x in benchmarks).
     if tokenizer_type == "latent":
         n_latent = getattr(cfg.model, "n_latent", 128)
         tokenizer = LatentTokenizer(
@@ -60,7 +195,7 @@ def main(cfg):
             nlayers=cfg.model.nlayers,
             output_dim=cfg.model.output_dim,
             dropout=cfg.model.dropout,
-            compiled=False,  # compile full tokenizer below instead
+            compiled=False,
             cfg=cfg,
         )
         print(f"Using LatentTokenizer: n_genes={get_embedding_cfg(cfg).num}, n_latent={n_latent}")
@@ -77,7 +212,7 @@ def main(cfg):
             cfg=cfg,
         )
 
-    # --- Build collators from tokenizer ---
+    # --- Build collators ---
     train_collator = tokenizer.make_collator(cfg, is_train=True)
     val_collator = tokenizer.make_collator(cfg, is_train=False)
 
@@ -89,35 +224,42 @@ def main(cfg):
     else:
         raise ValueError(f"Unknown dataset type: {get_dataset_cfg(cfg).ds_type}")
 
-    # Training dataloader
+    # --- Dataloaders ---
     train_dataset = DatasetClass(cfg)
+    val_dataset = DatasetClass(cfg, test=True)
+
+    train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_distributed else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
+
     n_train_workers = cfg.dataset.num_train_workers
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=cfg.model.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         collate_fn=train_collator,
         num_workers=n_train_workers,
         persistent_workers=n_train_workers > 0,
         pin_memory=True,
         prefetch_factor=4 if n_train_workers > 0 else None,
-        generator=generator,
+        generator=generator if train_sampler is None else None,
     )
 
-    val_dataset = DatasetClass(cfg, test=True)
     n_val_workers = cfg.dataset.num_val_workers
     val_dataloader = DataLoader(
         val_dataset,
         batch_size=cfg.model.batch_size,
-        shuffle=True,
+        shuffle=(val_sampler is None),
+        sampler=val_sampler,
         collate_fn=val_collator,
         num_workers=n_val_workers,
         persistent_workers=n_val_workers > 0,
         pin_memory=True,
         prefetch_factor=4 if n_val_workers > 0 else None,
-        generator=generator,
+        generator=generator if val_sampler is None else None,
     )
 
+    # --- Build model ---
     model = StateEmbeddingModel(
         token_dim=get_embedding_cfg(cfg).size,
         d_model=cfg.model.emsize,
@@ -126,15 +268,14 @@ def main(cfg):
         nlayers=cfg.model.nlayers,
         output_dim=cfg.model.output_dim,
         dropout=cfg.model.dropout,
-        warmup_steps=warmup_steps,
-        compiled=False,  # compile in trainer after pe_embedding is set
+        warmup_steps=0,
+        compiled=False,
         max_lr=cfg.optimizer.max_lr,
         emb_size=get_embedding_cfg(cfg).size,
         collater=val_collator,
         cfg=cfg,
         tokenizer=tokenizer,
     )
-    # Ensure model always uses the current config, even after checkpoint loading
     model.update_config(cfg)
     train_dataset.cfg = cfg
     val_dataset.cfg = cfg
@@ -142,158 +283,296 @@ def main(cfg):
     val_collator.cfg = cfg
     model.collater = val_collator
 
-    strategy_name = cfg.experiment.get("strategy", "ddp").lower()
-    use_fsdp = strategy_name == "fsdp"
+    model = model.cuda()
 
-    if use_fsdp:
-        # FSDP: keep model on CPU — Lightning's FSDPStrategy handles dist init,
-        # process spawning, and sharding across GPUs.
-        # use_orig_params=True preserves parameter shapes so Muon sees ndim>=2 matrices.
-        all_pe = torch.load(get_embedding_cfg(cfg).all_embeddings, weights_only=False)
-        if isinstance(all_pe, dict):
-            all_pe = torch.vstack(list(all_pe.values()))
-        all_pe = all_pe.to(torch.bfloat16)
-        all_pe.requires_grad = False
-        model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
+    # Load frozen protein embeddings (bf16)
+    all_pe = get_embeddings(cfg)
+    all_pe = all_pe.to(torch.bfloat16)
+    all_pe.requires_grad = False
+    model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
 
-        # Pre-split Muon params BEFORE FSDP wrapping — FSDP flattens parameters
-        # to 1-D, making ndim-based splitting fail in configure_optimizers.
-        # Store param names so we can match by name after FSDP.
-        optimizer_name = getattr(cfg.optimizer, "name", "adamw").lower()
-        if optimizer_name == "muon":
-            from ...tx.models.state_transition import _split_muon_parameters
-            muon_params, adamw_params = _split_muon_parameters(model)
-            # Build name→group mapping
-            muon_names = set()
-            param_to_name = {id(p): n for n, p in model.named_parameters()}
-            for p in muon_params:
-                muon_names.add(param_to_name[id(p)])
-            model._muon_param_names = muon_names
-            print(f"Pre-FSDP Muon split: {len(muon_params)} matrix, {len(adamw_params)} adamw")
-
-        # Skip compile — FSDP + compile requires FSDP2 composable API which
-        # can't be used through Lightning's strategy (needs manual dist init).
-        print(f"FSDP mode: model on CPU, pe_embedding loaded, compile skipped")
-    else:
-        model = model.cuda()
-
-        # Load frozen protein embeddings onto the tokenizer (bf16 to avoid dtype conversion)
-        all_pe = get_embeddings(cfg)
-        all_pe = all_pe.to(torch.bfloat16)
-        all_pe.requires_grad = False
-        model.tokenizer.pe_embedding = nn.Embedding.from_pretrained(all_pe)
-
-        # Compile after pe_embedding is set so the cache can be populated first.
-        # Full-module compile gives 1.25x vs 1.16x for individual submodules.
-        if compiled:
-            # Populate the ESM2 projection cache before compile to avoid graph breaks
-            # Use autocast since pe_embedding is bf16 but encoder weights are fp32
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
-            model.tokenizer = torch.compile(model.tokenizer)
-            model._decode = torch.compile(model._decode)
-            print(f"Compiled tokenizer and _decode with torch.compile")
-
-    model = model.train()
-
-    run_name, chk = get_latest_checkpoint(cfg)
-    checkpoint_callback = ModelCheckpoint(
-        every_n_train_steps=cfg.experiment.checkpoint.every_n_train_steps,
-        dirpath=os.path.join(cfg.experiment.checkpoint.path, cfg.experiment.name),
-        filename=f"{run_name}" + "-{epoch}-{step}",
-        save_last=True,
-        save_top_k=cfg.experiment.checkpoint.save_top_k,
-        monitor=cfg.experiment.checkpoint.monitor,
-    )
-
-    if cfg.wandb.enable:
+    # Measure FLOPS before compile (FlopCounterMode can't trace compiled kernels)
+    flops_per_batch = None
+    if is_main:
         try:
-            import wandb
-
-            exp_logger = WandbLogger(project=cfg.wandb.project, entity=cfg.wandb.entity, name=cfg.experiment.name)
-            exp_logger.watch(model, log_freq=1000)
-        except ImportError:
-            print("Warning: wandb is not installed. Skipping wandb logging.")
-            print("To enable wandb logging, install it with: pip install wandb")
-            exp_logger = None
+            flops_batch = next(iter(train_dataloader))
+            flops_per_batch = compute_forward_flops(
+                model, flops_batch,
+                use_backward=cfg.experiment.cumulative_flops_use_backward,
+            )
+            print(f"Measured FLOPs per batch: {flops_per_batch:,}")
+            del flops_batch
+        except (torch.OutOfMemoryError, RuntimeError) as e:
+            # Large models may OOM during uncompiled FLOPS measurement;
+            # measure forward-only and estimate total as 3x (forward + backward ≈ 3x forward)
+            torch.cuda.empty_cache()
+            model.zero_grad(set_to_none=True)
+            try:
+                flops_batch = next(iter(train_dataloader))
+                flops_fwd = compute_forward_flops(model, flops_batch, use_backward=False)
+                flops_per_batch = flops_fwd * 3  # forward + backward ≈ 3x forward
+                print(f"Measured FLOPs per batch (fwd×3): {flops_per_batch:,}")
+                del flops_batch
+            except Exception:
+                torch.cuda.empty_cache()
+                model.zero_grad(set_to_none=True)
+                print(f"Warning: FLOPS measurement failed (OOM): {e}")
+                flops_per_batch = 0
         except Exception as e:
-            print(f"Warning: Failed to initialize wandb logger: {e}")
-            print("Continuing without wandb logging.")
-            exp_logger = None
-    else:
-        exp_logger = None
+            print(f"Warning: FLOPS measurement failed: {e}")
+            flops_per_batch = 0
+        finally:
+            torch.cuda.empty_cache()
 
-    callbacks = [checkpoint_callback, LogLR(100), ResumeCallback(cfg), PerfProfilerCallback()]
+    # Compile after pe_embedding set and ESM2 cache populated
+    if compiled:
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
+        model.tokenizer = torch.compile(model.tokenizer)
+        model._decode = torch.compile(model._decode)
+        print("Compiled tokenizer and _decode with torch.compile")
 
-    # Add cumulative FLOPS callback
-    callbacks.append(CumulativeFLOPSCallback(use_backward=cfg.experiment.cumulative_flops_use_backward))
+    # Wrap with DDP
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+
+    model.train()
+
+    # --- Config values ---
+    grad_accum = cfg.optimizer.gradient_accumulation_steps
+    max_grad_norm = cfg.optimizer.max_grad_norm
+    ckpt_interval = cfg.experiment.checkpoint.every_n_train_steps
+    val_interval = int(cfg.experiment.val_check_interval * world_size)
+    limit_val_batches = cfg.experiment.limit_val_batches
 
     max_steps = -1
     if cfg.experiment.profile.enable_profiler:
-        callbacks.append(ProfilerCallback(cfg=cfg))
         max_steps = cfg.experiment.profile.max_steps
 
-    val_interval = int(cfg.experiment.val_check_interval * cfg.experiment.num_gpus_per_node * cfg.experiment.num_nodes)
-
-    if use_fsdp:
-        from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-        from ..nn.flash_transformer import FlashTransformerEncoderLayer
-        from ..nn.tokenizer import CrossAttentionBlock
-
-        # Detach frozen pe_embedding (bf16) before FSDP wrapping — mixed dtype
-        # in the same FSDP unit causes ValueError. Re-attach after setup.
-        _pe_embedding = model.tokenizer.pe_embedding
-        model.tokenizer.pe_embedding = None
-
-        class _ReattachPECallback(L.Callback):
-            """Re-attach pe_embedding after FSDP wraps the model."""
-            def __init__(self, pe_emb):
-                self._pe_emb = pe_emb
-            def on_fit_start(self, trainer, pl_module):
-                device = next(pl_module.parameters()).device
-                pl_module.tokenizer.pe_embedding = self._pe_emb.to(device)
-                print(f"Re-attached pe_embedding on {device}")
-
-        callbacks.append(_ReattachPECallback(_pe_embedding))
-
-        strategy = FSDPStrategy(
-            auto_wrap_policy=ModuleWrapPolicy({FlashTransformerEncoderLayer, CrossAttentionBlock}),
-            sharding_strategy="FULL_SHARD",
-            process_group_backend="nccl",
-            timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
-            use_orig_params=True,  # preserve param shapes for Muon optimizer
-        )
-        print(f"Using FSDP (FULL_SHARD, use_orig_params=True)")
+    # Total optimizer steps for scheduler
+    if max_steps > 0:
+        total_steps = max_steps
     else:
-        strategy = DDPStrategy(
-            process_group_backend="nccl",
-            find_unused_parameters=False,
-            timeout=timedelta(seconds=cfg.experiment.get("ddp_timeout", 3600)),
-        )
+        steps_per_epoch = max(len(train_dataloader) // grad_accum, 1)
+        total_steps = steps_per_epoch * cfg.experiment.num_epochs
 
-    trainer = L.Trainer(
-        max_epochs=cfg.experiment.num_epochs,
-        max_steps=max_steps,
-        callbacks=callbacks,
-        devices=cfg.experiment.num_gpus_per_node,
-        num_nodes=cfg.experiment.num_nodes,
-        # Accumulation
-        gradient_clip_val=cfg.optimizer.max_grad_norm,
-        accumulate_grad_batches=cfg.optimizer.gradient_accumulation_steps,
-        precision="bf16-mixed",
-        strategy=strategy,
-        val_check_interval=val_interval,
-        # Logging
-        logger=exp_logger,
-        fast_dev_run=False,
-        limit_val_batches=cfg.experiment.limit_val_batches,
-    )
+    # --- Build optimizer and scheduler ---
+    raw_model = model.module if is_distributed else model
+    optimizer, scheduler = build_optimizer_and_scheduler(raw_model, cfg, total_steps)
+
+    # --- Resume from checkpoint ---
+    run_name, chk = get_latest_checkpoint(cfg)
+    global_step = 0
+    start_epoch = 0
+    best_val_loss = float("inf")
 
     if chk:
-        print(f"******** Loading chkpoint {run_name} {chk}...")
+        print(f"******** Loading checkpoint {run_name} {chk}...")
+        ckpt = torch.load(chk, map_location=f"cuda:{local_rank}", weights_only=False)
+        raw_model.load_state_dict(ckpt["model"], strict=False)
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        global_step = ckpt.get("step", 0)
+        start_epoch = ckpt.get("epoch", 0)
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+
+        if cfg.optimizer.get("reset_lr_on_restart", False):
+            for param_group in optimizer.param_groups:
+                original_lr = param_group.get("lr", None)
+                param_group["lr"] = cfg.optimizer.max_lr
+                print(f"Reset learning rate from {original_lr} to {param_group['lr']}")
     else:
         print(f"******** Initialized fresh {run_name}...")
 
-    trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=chk)
+    # --- Wandb ---
+    wandb_run = None
+    if cfg.wandb.enable and is_main:
+        try:
+            import wandb
 
-    trainer.save_checkpoint(os.path.join(cfg.experiment.checkpoint.path, f"{run_name}_final.pt"))
+            wandb_run = wandb.init(project=cfg.wandb.project, entity=cfg.wandb.entity, name=cfg.experiment.name)
+        except Exception as e:
+            print(f"Warning: Failed to initialize wandb: {e}")
+
+    # --- Checkpoint manager ---
+    ckpt_dir = os.path.join(cfg.experiment.checkpoint.path, cfg.experiment.name)
+    ckpt_mgr = CheckpointManager(dirpath=ckpt_dir, save_top_k=cfg.experiment.checkpoint.save_top_k)
+
+    # --- FLOPS tracking ---
+    cumulative_flops = 0
+    batch_times = collections.deque(maxlen=50)
+
+    # --- Profiling config ---
+    profiling = cfg.experiment.profile.enable_profiler
+    profile_steps = cfg.experiment.profile.profile_steps if profiling else [0, 0]
+
+    # --- Training loop ---
+    log_interval = 100
+    microstep = global_step * grad_accum
+    done = False
+
+    for epoch in range(start_epoch, cfg.experiment.num_epochs):
+        if done:
+            break
+        if is_distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch}", disable=not is_main, dynamic_ncols=True)
+        accum_start = None
+
+        for batch in pbar:
+            # NSys profiling start
+            if profiling and microstep == profile_steps[0]:
+                log.info(f"Starting NSys profiling at microstep {microstep}")
+                torch.cuda.nvtx.range_push("VCIProfiledSection")
+
+            # Track time for the accumulation window
+            if microstep % grad_accum == 0:
+                accum_start = time.time()
+
+            # Skip gradient AllReduce on non-final accumulation microsteps (DDP only)
+            is_accum_step = (microstep + 1) % grad_accum != 0
+            sync_context = model.no_sync() if (is_distributed and is_accum_step) else nullcontext()
+
+            with sync_context:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    loss = model(batch)
+
+                loss_scaled = loss / grad_accum
+                loss_scaled.backward()
+            microstep += 1
+
+            # NSys profiling end
+            if profiling and microstep == profile_steps[1]:
+                log.info(f"Stopping NSys profiling at microstep {microstep}")
+                torch.cuda.nvtx.range_pop()
+
+            if microstep % grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+
+                step_time = time.time() - accum_start
+                batch_times.append(step_time)
+
+                # Track cumulative FLOPS (grad_accum forward+backward passes per step)
+                if flops_per_batch and flops_per_batch > 0:
+                    cumulative_flops += flops_per_batch * grad_accum
+
+                # Logging
+                if is_main and global_step % log_interval == 0:
+                    avg_step_time = sum(batch_times) / len(batch_times) if batch_times else 1.0
+                    cells_per_sec = cfg.model.batch_size * world_size * grad_accum / avg_step_time
+
+                    mfu = 0.0
+                    if flops_per_batch and flops_per_batch > 0:
+                        flops_per_step = flops_per_batch * grad_accum
+                        flops_per_sec = flops_per_step / avg_step_time
+                        mfu = flops_per_sec / (H100_PEAK_TFLOPS * 1e12) * 100
+
+                    lr = scheduler.get_last_lr()[0]
+
+                    pbar.set_postfix({
+                        "loss": f"{loss.item():.4f}",
+                        "lr": f"{lr:.2e}",
+                        "c/s": f"{cells_per_sec:.0f}",
+                        "mfu": f"{mfu:.1f}%",
+                    })
+
+                    if wandb_run:
+                        import wandb
+
+                        wandb.log(
+                            {
+                                "trainer/train_loss": loss.item(),
+                                "trainer/learning_rate": lr,
+                                "perf/cells_per_sec": cells_per_sec,
+                                "perf/mfu": mfu,
+                                "cumulative_flops": float(cumulative_flops),
+                            },
+                            step=global_step,
+                        )
+
+                # Validation
+                if val_interval > 0 and limit_val_batches > 0 and global_step % val_interval == 0:
+                    val_loss = run_validation(model, val_dataloader, limit_val_batches)
+
+                    if is_distributed:
+                        val_loss_tensor = torch.tensor(val_loss, device=f"cuda:{local_rank}")
+                        dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+                        val_loss = val_loss_tensor.item()
+
+                    if is_main:
+                        print(f"\n[Step {global_step}] val_loss={val_loss:.4f} (best={best_val_loss:.4f})")
+                        if wandb_run:
+                            import wandb
+
+                            wandb.log(
+                                {
+                                    "validation/val_loss": val_loss,
+                                    "cumulative_flops": float(cumulative_flops),
+                                },
+                                step=global_step,
+                            )
+
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                        ckpt_mgr.save(
+                            model, optimizer, scheduler, global_step, epoch,
+                            best_val_loss, metric_value=val_loss, run_name=run_name,
+                        )
+
+                    model.train()
+
+                # Periodic checkpoint
+                if is_main and ckpt_interval > 0 and global_step % ckpt_interval == 0:
+                    ckpt_mgr.save_periodic(model, optimizer, scheduler, global_step, epoch, best_val_loss)
+
+                # Max steps check
+                if 0 < max_steps <= global_step:
+                    done = True
+                    break
+
+    # --- Final summary ---
+    if is_main:
+        avg_step_time = sum(batch_times) / len(batch_times) if batch_times else 1.0
+        cells_per_sec = cfg.model.batch_size * world_size * grad_accum / avg_step_time
+        mfu = 0.0
+        if flops_per_batch and flops_per_batch > 0:
+            flops_per_step = flops_per_batch * grad_accum
+            mfu = (flops_per_step / avg_step_time) / (H100_PEAK_TFLOPS * 1e12) * 100
+        print(f"\n{'='*60}")
+        print(f"Training complete: {global_step} steps")
+        print(f"  cells/sec: {cells_per_sec:.0f}")
+        print(f"  MFU: {mfu:.1f}%")
+        print(f"  peak GPU mem: {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
+        print(f"{'='*60}")
+
+    # --- Final checkpoint ---
+    if is_main:
+        final_path = os.path.join(ckpt_dir, f"{run_name}_final.pt")
+        raw_model = model.module if is_distributed else model
+        checkpoint = {
+            "model": raw_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "step": global_step,
+            "epoch": epoch if 'epoch' in dir() else 0,
+            "best_val_loss": best_val_loss,
+        }
+        raw_model.on_save_checkpoint(checkpoint)
+        torch.save(checkpoint, final_path)
+        print(f"Saved final checkpoint to {final_path}")
+
+        if wandb_run:
+            import wandb
+
+            wandb.finish()
+
+    # --- Cleanup ---
+    if is_distributed:
+        dist.destroy_process_group()

@@ -6,7 +6,6 @@ import logging
 import torch.nn.functional as F
 import torch
 from omegaconf import OmegaConf
-import lightning as L
 
 import sys
 
@@ -17,8 +16,6 @@ from torch import nn, Tensor
 from torch.nn import BCEWithLogitsLoss
 
 
-from torch.optim.lr_scheduler import ChainedScheduler, LinearLR, CosineAnnealingLR
-
 from ..utils import (
     get_embedding_cfg,
     get_dataset_cfg,
@@ -27,7 +24,7 @@ from .loss import WassersteinLoss, KLDivergenceLoss, MMDLoss, TabularLoss
 from .tokenizer import Tokenizer, TokenizerOutput, SentenceTokenizer, SkipBlock
 
 
-class StateEmbeddingModel(L.LightningModule):
+class StateEmbeddingModel(nn.Module):
     def __init__(
         self,
         token_dim: int,
@@ -48,7 +45,6 @@ class StateEmbeddingModel(L.LightningModule):
     ):
         super().__init__()
         self.cfg = cfg
-        self.save_hyperparameters()
         self.compiled = compiled
         self.model_type = "Transformer"
         self.d_model = d_model
@@ -155,6 +151,10 @@ class StateEmbeddingModel(L.LightningModule):
     def dataset_token(self):
         return getattr(self.tokenizer, "dataset_token", None)
 
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
     def on_save_checkpoint(self, checkpoint):
         try:
             if self.cfg is not None:
@@ -249,10 +249,10 @@ class StateEmbeddingModel(L.LightningModule):
         return self.binary_decoder(combine)
 
     def forward(self, batch, batch_idx=0):
-        """Forward pass for FSDP compatibility — delegates to shared_step."""
+        """Forward pass — delegates to shared_step."""
         return self.shared_step(batch, batch_idx)
 
-    def shared_step(self, batch, batch_idx):
+    def shared_step(self, batch, batch_idx=0):
         out = self.tokenizer(batch)
 
         X = out.task_gene_embs  # [B, n_task, d_model]
@@ -273,95 +273,13 @@ class StateEmbeddingModel(L.LightningModule):
         else:
             loss = self.criterion(decs.squeeze(), target)
 
-        if self.dataset_embedder is not None and dataset_embs is not None and out.dataset_nums is not None:
+        if self.training and self.dataset_embedder is not None and dataset_embs is not None and out.dataset_nums is not None:
             dataset_pred = self.dataset_encoder(dataset_embs)
             dataset_labels = out.dataset_nums.to(self.device).long()
             dataset_loss = self.dataset_loss(dataset_pred, dataset_labels)
-            if self.training:
-                self.log("trainer/dataset_loss", dataset_loss)
-                loss = loss + dataset_loss
-            else:
-                self.log("validation/dataset_loss", dataset_loss)
+            loss = loss + dataset_loss
 
         return loss
-
-    @torch.compile(disable=True)
-    def training_step(self, batch, batch_idx):
-        loss = self.shared_step(batch, batch_idx)
-        self.log("trainer/train_loss", loss)
-        return loss
-
-    @torch.compile(disable=True)
-    def validation_step(self, batch, batch_idx):
-        loss = self.shared_step(batch, batch_idx)
-        self.log("validation/val_loss", loss)
-        return loss
-
-    def configure_optimizers(self):
-        max_lr = self.max_lr
-        weight_decay = self.cfg.optimizer.weight_decay
-        optimizer_name = getattr(self.cfg.optimizer, "name", "adamw").lower()
-
-        if optimizer_name == "muon":
-            from ...tx.optim import MuonWithAuxAdamW
-            from ...tx.models.state_transition import _split_muon_parameters
-
-            if hasattr(self, "_muon_param_names") and self._muon_param_names:
-                # FSDP mode: params are flattened to 1-D, so ndim-based splitting
-                # fails. Use pre-computed name mapping from before FSDP wrapping.
-                muon_names = self._muon_param_names
-                muon_params, adamw_params = [], []
-                for name, p in self.named_parameters():
-                    if not p.requires_grad:
-                        continue
-                    # Strip FSDP wrapper prefixes for name matching
-                    clean = name.replace("_fsdp_wrapped_module.", "")
-                    if clean in muon_names:
-                        muon_params.append(p)
-                    else:
-                        adamw_params.append(p)
-                print(f"Muon (FSDP name-match): {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm params")
-            else:
-                muon_params, adamw_params = _split_muon_parameters(self)
-                print(f"Muon: {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm params")
-            optimizer = MuonWithAuxAdamW(
-                muon_params, adamw_params,
-                lr=max_lr,
-                weight_decay=weight_decay,
-                momentum=getattr(self.cfg.optimizer, "muon_momentum", 0.95),
-                nesterov=getattr(self.cfg.optimizer, "muon_nesterov", True),
-                ns_steps=getattr(self.cfg.optimizer, "muon_ns_steps", 5),
-                muon_eps=getattr(self.cfg.optimizer, "muon_eps", 1e-7),
-                adamw_betas=(
-                    getattr(self.cfg.optimizer, "muon_adamw_beta1", 0.9),
-                    getattr(self.cfg.optimizer, "muon_adamw_beta2", 0.95),
-                ),
-                adamw_eps=getattr(self.cfg.optimizer, "muon_adamw_eps", 1e-8),
-            )
-        else:
-            trainable_params = [p for p in self.parameters() if p.requires_grad]
-            optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=weight_decay, foreach=True)
-
-        if self.trainer.max_steps > 0:
-            total_steps = self.trainer.max_steps
-        else:
-            total_steps = self.trainer.estimated_stepping_batches
-
-        lr_schedulers = [
-            LinearLR(
-                optimizer,
-                start_factor=self.cfg.optimizer.start,
-                end_factor=self.cfg.optimizer.end,
-                total_iters=int(0.03 * total_steps),
-            )
-        ]
-        lr_schedulers.append(CosineAnnealingLR(optimizer, eta_min=max_lr * 0.3, T_max=total_steps))
-        scheduler = ChainedScheduler(lr_schedulers)
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "monitor": "train_loss", "interval": "step", "frequency": 1},
-        }
 
     def update_config(self, new_cfg):
         """Update the model's config after loading from checkpoint."""
