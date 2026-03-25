@@ -1,7 +1,7 @@
-"""Native PyTorch DDP training loop for State Embedding model.
+"""Native PyTorch training loop for State Embedding model.
 
 Replaces the former Lightning Trainer with a minimal, high-performance loop.
-DDP only (single-GPU is just world_size=1 without DDP wrapper).
+Supports DDP and FSDP2 strategies (single-GPU is just world_size=1 without wrapper).
 """
 
 import os
@@ -101,9 +101,20 @@ class CheckpointManager:
 
     def _build_checkpoint(self, model, optimizer, scheduler, step, epoch, best_val_loss):
         raw_model = model.module if isinstance(model, DDP) else model
+        try:
+            from torch.distributed.checkpoint.state_dict import (
+                get_model_state_dict, get_optimizer_state_dict, StateDictOptions,
+            )
+            full_opts = StateDictOptions(full_state_dict=True)
+            model_sd = get_model_state_dict(raw_model, options=full_opts)
+            optim_sd = get_optimizer_state_dict(raw_model, optimizer, options=full_opts)
+        except (ImportError, TypeError):
+            # Fallback for non-FSDP (DDP / single-GPU)
+            model_sd = raw_model.state_dict()
+            optim_sd = optimizer.state_dict()
         checkpoint = {
-            "model": raw_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "model": model_sd,
+            "optimizer": optim_sd,
             "scheduler": scheduler.state_dict(),
             "step": step,
             "epoch": epoch,
@@ -143,6 +154,31 @@ class CheckpointManager:
         last_path = os.path.join(self.dirpath, "last.pt")
         torch.save(checkpoint, last_path)
         return last_path
+
+
+def apply_fsdp2(model):
+    """Apply FSDP2 partial sharding to the model.
+
+    Shards each transformer encoder layer individually (95% of params for 7B).
+    Also shards cross-attention blocks if present (LatentTokenizer).
+    The root fully_shard handles remaining params + gradient synchronization.
+    """
+    from torch.distributed._composable.fsdp import fully_shard
+
+    # Shard each transformer layer (these hold 95%+ of params)
+    for layer in model.tokenizer.transformer_encoder.layers:
+        fully_shard(layer)
+
+    # Shard cross-attention blocks if present (LatentTokenizer)
+    if hasattr(model.tokenizer, "cross_attn_rounds"):
+        for block in model.tokenizer.cross_attn_rounds:
+            fully_shard(block)
+
+    # Root handles remaining params (encoder, decoder, cls_token, etc.)
+    # and coordinates gradient synchronization
+    fully_shard(model)
+
+    return model
 
 
 def run_validation(model, val_dataloader, limit_val_batches):
@@ -185,6 +221,8 @@ def main(cfg):
     else:
         torch.cuda.set_device(0)
 
+    strategy = cfg.experiment.get("strategy", "ddp").lower()
+    use_fsdp = strategy in ("fsdp", "fsdp2") and is_distributed
     compiled = cfg.experiment.get("compiled", False)
 
     # --- Build tokenizer ---
@@ -366,17 +404,31 @@ def main(cfg):
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
 
-    # Compile after pe_embedding set and ESM2 cache populated
-    if compiled:
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
-        model.tokenizer = torch.compile(model.tokenizer)
-        model._decode = torch.compile(model._decode)
-        print("Compiled tokenizer and _decode with torch.compile")
+    # Populate ESM2 cache before compile/FSDP (needs full pe_embedding)
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
 
-    # Wrap with DDP
-    if is_distributed:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
+    # --- Apply distributed strategy ---
+    if use_fsdp:
+        model = apply_fsdp2(model)
+        print(f"Applied FSDP2 sharding across {world_size} GPUs")
+        if compiled:
+            model.tokenizer = torch.compile(model.tokenizer)
+            model._decode = torch.compile(model._decode)
+            print("Compiled tokenizer and _decode with torch.compile (FSDP2)")
+    else:
+        # Compile then wrap with DDP
+        if compiled:
+            model.tokenizer = torch.compile(model.tokenizer)
+            model._decode = torch.compile(model._decode)
+            print("Compiled tokenizer and _decode with torch.compile")
+        if is_distributed:
+            model = DDP(
+                model,
+                device_ids=[local_rank],
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+            )
 
     model.train()
 
@@ -399,7 +451,9 @@ def main(cfg):
         total_steps = steps_per_epoch * cfg.experiment.num_epochs
 
     # --- Build optimizer and scheduler ---
-    raw_model = model.module if is_distributed else model
+    # For DDP: model.module gives the unwrapped model.
+    # For FSDP2: model IS the model (fully_shard modifies in-place, no wrapper).
+    raw_model = model.module if isinstance(model, DDP) else model
     optimizer, scheduler = build_optimizer_and_scheduler(raw_model, cfg, total_steps)
 
     # --- Resume from checkpoint ---
@@ -411,9 +465,21 @@ def main(cfg):
     if chk:
         print(f"******** Loading checkpoint {run_name} {chk}...")
         ckpt = torch.load(chk, map_location=f"cuda:{local_rank}", weights_only=False)
-        raw_model.load_state_dict(ckpt["model"], strict=False)
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
+        if use_fsdp:
+            try:
+                from torch.distributed.checkpoint.state_dict import (
+                    set_model_state_dict, set_optimizer_state_dict, StateDictOptions,
+                )
+                full_opts = StateDictOptions(full_state_dict=True)
+                set_model_state_dict(raw_model, ckpt["model"], options=full_opts)
+                if "optimizer" in ckpt:
+                    set_optimizer_state_dict(raw_model, optimizer, ckpt["optimizer"], options=full_opts)
+            except (ImportError, TypeError):
+                raw_model.load_state_dict(ckpt["model"], strict=False)
+        else:
+            raw_model.load_state_dict(ckpt["model"], strict=False)
+            if "optimizer" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler"])
         global_step = ckpt.get("step", 0)
@@ -474,16 +540,37 @@ def main(cfg):
             if microstep % grad_accum == 0:
                 accum_start = time.time()
 
-            # Skip gradient AllReduce on non-final accumulation microsteps (DDP only)
+            # Skip gradient sync on non-final accumulation microsteps
             is_accum_step = (microstep + 1) % grad_accum != 0
-            sync_context = model.no_sync() if (is_distributed and is_accum_step) else nullcontext()
+
+            if use_fsdp and is_distributed:
+                # FSDP2: toggle gradient sync via FSDPModule method
+                model.set_requires_gradient_sync(not is_accum_step)
+                sync_context = nullcontext()
+            elif is_distributed and is_accum_step:
+                # DDP: use no_sync context manager
+                sync_context = model.no_sync()
+            else:
+                sync_context = nullcontext()
 
             with sync_context:
+                # Per-microstep timing for FSDP2 debugging
+                if use_fsdp and is_main and microstep < 10:
+                    torch.cuda.synchronize()
+                    _fwd_t0 = time.time()
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     loss = model(batch)
+                if use_fsdp and is_main and microstep < 10:
+                    torch.cuda.synchronize()
+                    _fwd_t1 = time.time()
 
                 loss_scaled = loss / grad_accum
                 loss_scaled.backward()
+
+                if use_fsdp and is_main and microstep < 10:
+                    torch.cuda.synchronize()
+                    _bwd_t1 = time.time()
+                    print(f"[FSDP2 micro {microstep}] fwd={_fwd_t1-_fwd_t0:.3f}s  bwd={_bwd_t1-_fwd_t1:.3f}s  total={_bwd_t1-_fwd_t0:.3f}s", flush=True)
             microstep += 1
 
             # NSys profiling end
@@ -492,10 +579,26 @@ def main(cfg):
                 torch.cuda.nvtx.range_pop()
 
             if microstep % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+                # FSDP2: skip clip_grad_norm_ (DTensor all-reduces are extremely slow)
+                # and time each phase for diagnostics
+                if use_fsdp:
+                    if is_main and global_step < 10:
+                        torch.cuda.synchronize()
+                        _t0 = time.time()
+                    optimizer.step()
+                    if is_main and global_step < 10:
+                        torch.cuda.synchronize()
+                        _t1 = time.time()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    if is_main and global_step < 10:
+                        _t2 = time.time()
+                        print(f"[FSDP2 step {global_step}] fwd+bwd={_t0 - accum_start:.3f}s  optim={_t1-_t0:.3f}s  zero={_t2-_t1:.3f}s", flush=True)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
                 global_step += 1
 
                 step_time = time.time() - accum_start
@@ -597,10 +700,20 @@ def main(cfg):
     # --- Final checkpoint ---
     if is_main:
         final_path = os.path.join(ckpt_dir, f"{run_name}_final.pt")
-        raw_model = model.module if is_distributed else model
+        raw_model = model.module if isinstance(model, DDP) else model
+        try:
+            from torch.distributed.checkpoint.state_dict import (
+                get_model_state_dict, get_optimizer_state_dict, StateDictOptions,
+            )
+            full_opts = StateDictOptions(full_state_dict=True)
+            model_sd = get_model_state_dict(raw_model, options=full_opts)
+            optim_sd = get_optimizer_state_dict(raw_model, optimizer, options=full_opts)
+        except (ImportError, TypeError):
+            model_sd = raw_model.state_dict()
+            optim_sd = optimizer.state_dict()
         checkpoint = {
-            "model": raw_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
+            "model": model_sd,
+            "optimizer": optim_sd,
             "scheduler": scheduler.state_dict(),
             "step": global_step,
             "epoch": epoch if 'epoch' in dir() else 0,
