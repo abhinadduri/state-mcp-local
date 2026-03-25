@@ -590,7 +590,7 @@ def main(cfg):
                         torch.cuda.synchronize()
                         _t1 = time.time()
                     scheduler.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     if is_main and global_step < 10:
                         _t2 = time.time()
                         print(f"[FSDP2 step {global_step}] fwd+bwd={_t0 - accum_start:.3f}s  optim={_t1-_t0:.3f}s  zero={_t2-_t1:.3f}s", flush=True)
@@ -598,7 +598,7 @@ def main(cfg):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                     optimizer.step()
                     scheduler.step()
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
                 step_time = time.time() - accum_start
