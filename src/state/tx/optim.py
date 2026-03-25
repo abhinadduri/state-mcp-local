@@ -19,12 +19,14 @@ def _orthogonalize_update(matrix: torch.Tensor, steps: int, eps: float) -> torch
         raise ValueError(f"Expected a 2D update matrix, got shape {tuple(matrix.shape)}")
 
     transposed = False
-    x = matrix.float()
+    # Keep in input dtype (bf16) for 2× faster tensor-core matmuls vs fp32/TF32.
+    # Only the norm computation upcasts to fp32 to avoid overflow.
+    x = matrix
     if x.shape[0] > x.shape[1]:
         x = x.transpose(0, 1)
         transposed = True
 
-    x = x / (torch.linalg.norm(x) + eps)
+    x = x / (torch.linalg.norm(x.float()) + eps)
     a, b, c = 3.4445, -4.7750, 2.0315
     for _ in range(max(1, steps)):
         gram = x @ x.transpose(0, 1)
