@@ -43,13 +43,12 @@ class _GroupedMM(torch.autograd.Function):
 
 
 def grouped_mm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """Batched matmul using native grouped GEMM when available, bmm fallback.
+    """Batched matmul. Uses torch.bmm for training (reliable with FSDP2 + autocast).
 
-    Uses _grouped_mm for forward (2.63x faster on H100) with bmm backward.
-    Falls back to bmm entirely if dtypes mismatch (common under FSDP2 + autocast).
+    Note: torch._grouped_mm is 2.63x faster in forward on H100 but has dtype
+    issues with FSDP2 autocast in torch 2.10. Will be useful once the backward
+    strides bug is fixed in a future torch release.
     """
-    if hasattr(torch, "_grouped_mm") and A.is_cuda and A.dtype == B.dtype and A.dtype != torch.float32:
-        return _GroupedMM.apply(A, B)
     return torch.bmm(A, B)
 
 
