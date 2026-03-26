@@ -121,7 +121,13 @@ class MoEFFN(nn.Module):
         self._router_z_loss = router_z_loss(router_logits)
 
         if self._backend == "scattermoe":
-            output = self.experts(x_flat, top_k_weights, top_k_indices)
+            # Cast to expert weight dtype (FSDP2 may unshard to fp32 under autocast)
+            expert_dtype = next(self.experts.parameters()).dtype
+            x_cast = x_flat.to(expert_dtype) if x_flat.dtype != expert_dtype else x_flat
+            w_cast = top_k_weights.to(expert_dtype) if top_k_weights.dtype != expert_dtype else top_k_weights
+            output = self.experts(x_cast, w_cast, top_k_indices)
+            if output.dtype != x_flat.dtype:
+                output = output.to(x_flat.dtype)
         else:
             output = self._forward_bmm(x_flat, top_k_weights, top_k_indices)
 
