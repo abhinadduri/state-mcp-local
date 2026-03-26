@@ -1,0 +1,19 @@
+# SE 100M-active MoE — ~300M total, ~100M active per token
+# 8 experts, top-2, MoE every 2nd layer
+model:
+  emsize: 1024
+  d_hid: 2048
+  output_dim: 1024
+  nlayers: 8
+  nhead: 16
+  n_latent: 256
+  n_cross_attn_rounds: 1
+  batch_size: 256
+  gradient_checkpointing: false
+  moe:
+    enable: true
+    num_experts: 8
+    top_k: 2
+    moe_freq: 2
+    load_balance_weight: 0.01
+    router_z_weight: 0.001

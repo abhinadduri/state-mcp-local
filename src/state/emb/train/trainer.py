@@ -160,13 +160,17 @@ def apply_fsdp2(model):
     """Apply FSDP2 partial sharding to the model.
 
     Shards each transformer encoder layer individually (95% of params for 7B).
+    For MoE layers, also shards the MoE FFN sub-module for finer granularity.
     Also shards cross-attention blocks if present (LatentTokenizer).
     The root fully_shard handles remaining params + gradient synchronization.
     """
     from torch.distributed._composable.fsdp import fully_shard
+    from ..nn.moe import MoETransformerEncoderLayer
 
     # Shard each transformer layer (these hold 95%+ of params)
     for layer in model.tokenizer.transformer_encoder.layers:
+        if isinstance(layer, MoETransformerEncoderLayer):
+            fully_shard(layer.moe_ffn)
         fully_shard(layer)
 
     # Shard cross-attention blocks if present (LatentTokenizer)
@@ -609,16 +613,20 @@ def main(cfg):
                 if is_main and global_step % log_interval == 0 and wandb_run:
                     import wandb
 
-                    wandb.log(
-                        {
-                            "trainer/train_loss": loss.item(),
-                            "trainer/learning_rate": lr,
-                            "perf/cells_per_sec": cells_per_sec,
-                            "perf/mfu": mfu,
-                            "cumulative_flops": float(cumulative_flops),
-                        },
-                        step=global_step,
-                    )
+                    log_dict = {
+                        "trainer/train_loss": loss.item(),
+                        "trainer/learning_rate": lr,
+                        "perf/cells_per_sec": cells_per_sec,
+                        "perf/mfu": mfu,
+                        "cumulative_flops": float(cumulative_flops),
+                    }
+                    moe_cfg = cfg.model.get("moe", None)
+                    if moe_cfg is not None and getattr(moe_cfg, "enable", False):
+                        from ..nn.moe import collect_moe_aux_losses
+                        moe_losses = collect_moe_aux_losses(raw_model)
+                        log_dict["moe/load_balance_loss"] = moe_losses["moe_load_balance"].item()
+                        log_dict["moe/router_z_loss"] = moe_losses["moe_router_z"].item()
+                    wandb.log(log_dict, step=global_step)
 
                 # Validation
                 if val_interval > 0 and limit_val_batches > 0 and global_step % val_interval == 0:
