@@ -527,10 +527,12 @@ def main(cfg):
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch}", disable=not is_main, dynamic_ncols=True)
+        pbar = tqdm(total=max_steps - global_step if max_steps > 0 else None,
+                    desc=f"Epoch {epoch}", disable=not is_main, dynamic_ncols=True,
+                    initial=global_step)
         accum_start = None
 
-        for batch in pbar:
+        for batch in train_dataloader:
             # NSys profiling start
             if profiling and microstep == profile_steps[0]:
                 log.info(f"Starting NSys profiling at microstep {microstep}")
@@ -554,23 +556,11 @@ def main(cfg):
                 sync_context = nullcontext()
 
             with sync_context:
-                # Per-microstep timing for FSDP2 debugging
-                if use_fsdp and is_main and microstep < 10:
-                    torch.cuda.synchronize()
-                    _fwd_t0 = time.time()
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     loss = model(batch)
-                if use_fsdp and is_main and microstep < 10:
-                    torch.cuda.synchronize()
-                    _fwd_t1 = time.time()
 
                 loss_scaled = loss / grad_accum
                 loss_scaled.backward()
-
-                if use_fsdp and is_main and microstep < 10:
-                    torch.cuda.synchronize()
-                    _bwd_t1 = time.time()
-                    print(f"[FSDP2 micro {microstep}] fwd={_fwd_t1-_fwd_t0:.3f}s  bwd={_bwd_t1-_fwd_t1:.3f}s  total={_bwd_t1-_fwd_t0:.3f}s", flush=True)
             microstep += 1
 
             # NSys profiling end
@@ -579,26 +569,11 @@ def main(cfg):
                 torch.cuda.nvtx.range_pop()
 
             if microstep % grad_accum == 0:
-                # FSDP2: skip clip_grad_norm_ (DTensor all-reduces are extremely slow)
-                # and time each phase for diagnostics
-                if use_fsdp:
-                    if is_main and global_step < 10:
-                        torch.cuda.synchronize()
-                        _t0 = time.time()
-                    optimizer.step()
-                    if is_main and global_step < 10:
-                        torch.cuda.synchronize()
-                        _t1 = time.time()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    if is_main and global_step < 10:
-                        _t2 = time.time()
-                        print(f"[FSDP2 step {global_step}] fwd+bwd={_t0 - accum_start:.3f}s  optim={_t1-_t0:.3f}s  zero={_t2-_t1:.3f}s", flush=True)
-                else:
+                if not use_fsdp:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
                 step_time = time.time() - accum_start
@@ -606,21 +581,23 @@ def main(cfg):
 
                 # Track cumulative FLOPS (grad_accum forward+backward passes per step)
                 if flops_per_batch and flops_per_batch > 0:
-                    cumulative_flops += flops_per_batch * grad_accum
+                    cumulative_flops += flops_per_batch * grad_accum * world_size
 
-                # Logging
-                if is_main and global_step % log_interval == 0:
-                    avg_step_time = sum(batch_times) / len(batch_times) if batch_times else 1.0
-                    cells_per_sec = cfg.model.batch_size * world_size * grad_accum / avg_step_time
+                # Compute metrics
+                avg_step_time = sum(batch_times) / len(batch_times) if batch_times else 1.0
+                cells_per_sec = cfg.model.batch_size * world_size * grad_accum / avg_step_time
 
-                    mfu = 0.0
-                    if flops_per_batch and flops_per_batch > 0:
-                        flops_per_step = flops_per_batch * grad_accum
-                        flops_per_sec = flops_per_step / avg_step_time
-                        mfu = flops_per_sec / (H100_PEAK_TFLOPS * 1e12) * 100
+                mfu = 0.0
+                if flops_per_batch and flops_per_batch > 0:
+                    flops_per_step = flops_per_batch * grad_accum
+                    flops_per_sec = flops_per_step / avg_step_time
+                    mfu = flops_per_sec / (H100_PEAK_TFLOPS * 1e12) * 100
 
-                    lr = scheduler.get_last_lr()[0]
+                lr = scheduler.get_last_lr()[0]
 
+                # Update progress bar (one tick per optimizer step)
+                if is_main:
+                    pbar.update(1)
                     pbar.set_postfix({
                         "loss": f"{loss.item():.4f}",
                         "lr": f"{lr:.2e}",
@@ -628,19 +605,20 @@ def main(cfg):
                         "mfu": f"{mfu:.1f}%",
                     })
 
-                    if wandb_run:
-                        import wandb
+                # Wandb logging
+                if is_main and global_step % log_interval == 0 and wandb_run:
+                    import wandb
 
-                        wandb.log(
-                            {
-                                "trainer/train_loss": loss.item(),
-                                "trainer/learning_rate": lr,
-                                "perf/cells_per_sec": cells_per_sec,
-                                "perf/mfu": mfu,
-                                "cumulative_flops": float(cumulative_flops),
-                            },
-                            step=global_step,
-                        )
+                    wandb.log(
+                        {
+                            "trainer/train_loss": loss.item(),
+                            "trainer/learning_rate": lr,
+                            "perf/cells_per_sec": cells_per_sec,
+                            "perf/mfu": mfu,
+                            "cumulative_flops": float(cumulative_flops),
+                        },
+                        step=global_step,
+                    )
 
                 # Validation
                 if val_interval > 0 and limit_val_batches > 0 and global_step % val_interval == 0:
@@ -681,6 +659,8 @@ def main(cfg):
                 if 0 < max_steps <= global_step:
                     done = True
                     break
+
+        pbar.close()
 
     # --- Final summary ---
     if is_main:

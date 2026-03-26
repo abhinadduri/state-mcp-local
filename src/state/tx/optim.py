@@ -108,29 +108,14 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self, closure=None):
         loss = closure() if closure is not None else None
-        # Timing instrumentation for FSDP2 debugging (first 5 steps only)
-        _diag = getattr(self, '_fsdp_diag_count', 0)
-        _do_diag = _diag < 5 and any(_is_dtensor(p) for g in self.param_groups for p in g["params"][:1])
-        if _do_diag:
-            import time as _time
-            torch.cuda.synchronize()
         for group in self.param_groups:
             kind = str(group.get("kind", "adamw")).lower()
-            if _do_diag:
-                _gt0 = _time.time()
             if kind == "muon":
                 self._step_muon_group(group)
             elif kind == "adamw":
                 self._step_adamw_group(group)
             else:
                 raise ValueError(f"Unsupported optimizer group kind {kind!r}.")
-            if _do_diag:
-                torch.cuda.synchronize()
-                _gt1 = _time.time()
-                if dist.get_rank() == 0:
-                    print(f"  [optim] {kind} group: {_gt1-_gt0:.3f}s ({len(group['params'])} params)", flush=True)
-        if _do_diag:
-            self._fsdp_diag_count = _diag + 1
         return loss
 
     def _step_muon_group(self, group: dict[str, object]) -> None:
