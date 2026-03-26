@@ -9,7 +9,7 @@ model:
   nhead: 32
   n_latent: 512
   n_cross_attn_rounds: 2
-  batch_size: 12
+  batch_size: 14
   gradient_checkpointing: false
   moe:
     enable: true
