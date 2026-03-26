@@ -17,12 +17,9 @@ import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
 
-# Try to import ScatterMoE for zero-padding-waste expert computation
-try:
-    from scattermoe.mlp import MLP as ScatterMoEMLP
-    _HAS_SCATTERMOE = True
-except ImportError:
-    _HAS_SCATTERMOE = False
+# ScatterMoE: available but disabled by default (bmm is faster on H100 and
+# more compatible with FSDP2 autocast). Set _HAS_SCATTERMOE = True to enable.
+_HAS_SCATTERMOE = False
 
 
 class TopKRouter(nn.Module):
@@ -86,6 +83,7 @@ class MoEFFN(nn.Module):
 
         if _HAS_SCATTERMOE:
             # ScatterMoE: Triton-based, zero padding waste, variable-length expert groups
+            from scattermoe.mlp import MLP as ScatterMoEMLP
             self.experts = ScatterMoEMLP(
                 input_size=d_model,
                 hidden_size=d_hid,
