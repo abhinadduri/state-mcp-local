@@ -411,6 +411,19 @@ def main(cfg):
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
 
+    # --- Expert Parallelism (if enabled) ---
+    moe_cfg = cfg.model.get("moe", None)
+    use_ep = (moe_cfg is not None and getattr(moe_cfg, "enable", False)
+              and getattr(moe_cfg, "expert_parallel", False)
+              and is_distributed)
+    if use_ep:
+        from ..nn.moe import enable_expert_parallel
+        # EP uses the default process group (all GPUs)
+        ep_group = dist.group.WORLD
+        enable_expert_parallel(model, ep_group)
+        n_experts = getattr(moe_cfg, "num_experts", 8)
+        print(f"Expert parallelism enabled: {n_experts} experts across {world_size} GPUs")
+
     # --- Apply distributed strategy ---
     if use_fsdp:
         model = apply_fsdp2(model)

@@ -1,12 +1,13 @@
 """Mixture of Experts (MoE) components for the State Embedding model.
 
 Replaces dense FFN layers with sparsely-activated expert FFNs.
-Uses ScatterMoE's Triton scatter2scatter kernels for zero-padding-waste
-dropless expert computation when available, with padded bmm fallback.
+Supports two modes:
+- FSDP2 mode: padded bmm with stacked expert weights (default)
+- Expert Parallel (EP) mode: all-to-all token dispatch, each GPU owns 1 expert
 
 Key components:
 - TopKRouter: Token-to-expert routing with load balancing and z-loss
-- MoEFFN: Dropless MoE FFN (ScatterMoE backend or padded bmm fallback)
+- MoEFFN: Dropless MoE FFN with configurable backend
 - MoETransformerEncoderLayer: Drop-in replacement for FlashTransformerEncoderLayer
 """
 
@@ -16,10 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 log = logging.getLogger(__name__)
-
-# ScatterMoE: available but disabled by default (bmm is faster on H100 and
-# more compatible with FSDP2 autocast). Set _HAS_SCATTERMOE = True to enable.
-_HAS_SCATTERMOE = False
 
 
 class TopKRouter(nn.Module):
@@ -59,10 +56,11 @@ def router_z_loss(router_logits: torch.Tensor) -> torch.Tensor:
 class MoEFFN(nn.Module):
     """Dropless Mixture of Experts FFN.
 
-    When ScatterMoE is available, uses Triton scatter2scatter kernels for
-    zero-padding-waste expert computation. Otherwise falls back to padded bmm.
+    Supports two backends:
+    - "bmm": padded batched matmul with stacked [E, d, h] weights (default)
+    - "ep": expert parallelism — each GPU owns 1 expert, tokens dispatched via all-to-all
 
-    All tokens are processed — no capacity factor, no token dropping.
+    EP mode is enabled by calling `enable_expert_parallel(process_group)` after init.
     """
 
     def __init__(
@@ -81,34 +79,48 @@ class MoEFFN(nn.Module):
 
         self.router = TopKRouter(d_model, num_experts, top_k)
 
-        if _HAS_SCATTERMOE:
-            # ScatterMoE: Triton-based, zero padding waste, variable-length expert groups
-            from scattermoe.mlp import MLP as ScatterMoEMLP
-            self.experts = ScatterMoEMLP(
-                input_size=d_model,
-                hidden_size=d_hid,
-                num_experts=num_experts,
-                top_k=top_k,
-                bias=False,
-                activation=nn.GELU(),
-            )
-            self._backend = "scattermoe"
-            log.info(f"MoEFFN using ScatterMoE backend ({num_experts}E, top-{top_k})")
-        else:
-            # Fallback: padded bmm with stacked expert weights
-            self.w1 = nn.Parameter(torch.empty(num_experts, d_model, d_hid))
-            self.b1 = nn.Parameter(torch.zeros(num_experts, 1, d_hid))
-            self.w2 = nn.Parameter(torch.empty(num_experts, d_hid, d_model))
-            self.b2 = nn.Parameter(torch.zeros(num_experts, 1, d_model))
-            for i in range(num_experts):
-                nn.init.kaiming_uniform_(self.w1[i])
-                nn.init.kaiming_uniform_(self.w2[i])
-            self._backend = "bmm"
-            log.info(f"MoEFFN using padded bmm backend ({num_experts}E, top-{top_k})")
+        # Expert weights: [E, d_in, d_out] for bmm or sharded for EP
+        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, d_hid))
+        self.b1 = nn.Parameter(torch.zeros(num_experts, 1, d_hid))
+        self.w2 = nn.Parameter(torch.empty(num_experts, d_hid, d_model))
+        self.b2 = nn.Parameter(torch.zeros(num_experts, 1, d_model))
+        for i in range(num_experts):
+            nn.init.kaiming_uniform_(self.w1[i])
+            nn.init.kaiming_uniform_(self.w2[i])
 
         self.dropout_p = dropout
         self._aux_loss = None
         self._router_z_loss = None
+
+        # EP state (set by enable_expert_parallel)
+        self._ep_group = None
+        self._ep_rank = None
+        self._ep_size = None
+
+    def enable_expert_parallel(self, process_group):
+        """Enable expert parallelism. Each rank in the group owns one expert.
+
+        Call after model init but before FSDP2 wrapping. The expert weights
+        [E, d, h] are sliced so each rank keeps only its local expert.
+        """
+        import torch.distributed as dist
+
+        self._ep_group = process_group
+        self._ep_rank = dist.get_rank(process_group)
+        self._ep_size = dist.get_world_size(process_group)
+
+        assert self._ep_size == self.num_experts, \
+            f"EP group size ({self._ep_size}) must equal num_experts ({self.num_experts})"
+
+        # Slice expert weights to keep only local expert
+        r = self._ep_rank
+        with torch.no_grad():
+            self.w1 = nn.Parameter(self.w1[r:r+1].clone())  # [1, d, h]
+            self.b1 = nn.Parameter(self.b1[r:r+1].clone())  # [1, 1, h]
+            self.w2 = nn.Parameter(self.w2[r:r+1].clone())  # [1, h, d]
+            self.b2 = nn.Parameter(self.b2[r:r+1].clone())  # [1, 1, d]
+
+        log.info(f"EP enabled: rank {self._ep_rank} owns expert {r}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -118,21 +130,86 @@ class MoEFFN(nn.Module):
         self._aux_loss = load_balancing_loss(router_logits, top_k_indices, self.num_experts)
         self._router_z_loss = router_z_loss(router_logits)
 
-        if self._backend == "scattermoe":
-            # Cast to expert weight dtype (FSDP2 may unshard to fp32 under autocast)
-            expert_dtype = next(self.experts.parameters()).dtype
-            x_cast = x_flat.to(expert_dtype) if x_flat.dtype != expert_dtype else x_flat
-            w_cast = top_k_weights.to(expert_dtype) if top_k_weights.dtype != expert_dtype else top_k_weights
-            output = self.experts(x_cast, w_cast, top_k_indices)
-            if output.dtype != x_flat.dtype:
-                output = output.to(x_flat.dtype)
+        if self._ep_group is not None:
+            output = self._forward_ep(x_flat, top_k_weights, top_k_indices)
         else:
             output = self._forward_bmm(x_flat, top_k_weights, top_k_indices)
 
         return output.reshape(B, T, D)
 
+    def _forward_ep(self, x_flat, top_k_weights, top_k_indices):
+        """Expert parallel forward: all-to-all dispatch → local expert → all-to-all combine."""
+        import torch.distributed as dist
+
+        N, D = x_flat.shape
+        E = self.num_experts
+        K = self.top_k
+        ep_group = self._ep_group
+
+        # Count tokens destined for each expert on this rank
+        flat_experts = top_k_indices.reshape(-1)  # [N*K]
+        flat_weights = top_k_weights.reshape(-1)  # [N*K]
+        flat_token_idx = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(-1, K).reshape(-1)
+
+        # Sort by expert
+        sort_idx = flat_experts.argsort()
+        sorted_token_idx = flat_token_idx[sort_idx]
+        sorted_experts = flat_experts[sort_idx]
+        sorted_weights = flat_weights[sort_idx]
+
+        # Count tokens per expert (local)
+        local_counts = torch.zeros(E, dtype=torch.long, device=x_flat.device)
+        local_counts.scatter_add_(0, sorted_experts, torch.ones_like(sorted_experts, dtype=torch.long))
+
+        # Exchange counts across EP ranks
+        recv_counts = torch.empty_like(local_counts)
+        dist.all_to_all_single(recv_counts, local_counts, group=ep_group)
+
+        input_splits = local_counts.tolist()
+        output_splits = recv_counts.tolist()
+
+        # Gather sorted tokens for dispatch
+        sorted_tokens = x_flat[sorted_token_idx]  # [N*K, D]
+        sorted_weighted = sorted_tokens * sorted_weights.unsqueeze(-1)  # pre-weight
+
+        # All-to-all dispatch: send tokens to the GPU that owns their expert
+        recv_total = sum(output_splits)
+        recv_tokens = torch.empty(recv_total, D, device=x_flat.device, dtype=x_flat.dtype)
+        dist.all_to_all_single(recv_tokens, sorted_weighted,
+                               output_split_sizes=output_splits,
+                               input_split_sizes=input_splits,
+                               group=ep_group)
+
+        # Local expert computation (this GPU's single expert)
+        w1_local = self.w1.squeeze(0)  # [D, H]
+        b1_local = self.b1.squeeze(0).squeeze(0)  # [H]
+        w2_local = self.w2.squeeze(0)  # [H, D]
+        b2_local = self.b2.squeeze(0).squeeze(0)  # [D]
+
+        h = F.gelu(recv_tokens @ w1_local + b1_local)
+        if self.dropout_p > 0 and self.training:
+            h = F.dropout(h, p=self.dropout_p, training=True)
+        expert_out = h @ w2_local + b2_local  # [recv_total, D]
+
+        # All-to-all combine: send results back to originating ranks
+        send_back = torch.empty(N * K, D, device=x_flat.device, dtype=x_flat.dtype)
+        dist.all_to_all_single(send_back, expert_out,
+                               output_split_sizes=input_splits,
+                               input_split_sizes=output_splits,
+                               group=ep_group)
+
+        # Unsort and accumulate
+        output = torch.zeros_like(x_flat)
+        unsort_idx = sort_idx.argsort()
+        unsorting = send_back[unsort_idx]
+        # Reshape back to [N, K, D] and sum over K
+        unsorting = unsorting.reshape(N, K, D)
+        output = unsorting.sum(dim=1)
+
+        return output
+
     def _forward_bmm(self, x_flat, top_k_weights, top_k_indices):
-        """Padded bmm fallback when ScatterMoE is not available."""
+        """Padded bmm forward (no EP)."""
         N, D = x_flat.shape
         E = self.num_experts
         K = self.top_k
@@ -187,11 +264,7 @@ class MoEFFN(nn.Module):
 
 
 class MoETransformerEncoderLayer(nn.Module):
-    """Transformer encoder layer with MoE FFN.
-
-    Drop-in replacement for FlashTransformerEncoderLayer. Attention is unchanged;
-    the dense FFN is replaced with a dropless MoE FFN.
-    """
+    """Transformer encoder layer with MoE FFN."""
 
     def __init__(
         self,
@@ -210,13 +283,11 @@ class MoETransformerEncoderLayer(nn.Module):
         self.nhead = nhead
         self.dropout = dropout
 
-        # Self-attention (identical to FlashTransformerEncoderLayer)
         self.qkv_proj = nn.Linear(d_model, d_model * 3)
         self.out_proj = nn.Linear(d_model, d_model)
         self.norm1 = nn.LayerNorm(d_model)
         self.dropout_layer = nn.Dropout(dropout)
 
-        # MoE FFN
         self.moe_ffn = MoEFFN(
             d_model=d_model,
             d_hid=dim_feedforward,
@@ -227,7 +298,6 @@ class MoETransformerEncoderLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
-        # Self-Attention Block
         residual = src
         qkv = self.qkv_proj(src)
         q, k, v = torch.chunk(qkv, 3, dim=-1)
@@ -245,7 +315,6 @@ class MoETransformerEncoderLayer(nn.Module):
         attn_output = self.out_proj(attn_output)
         src = self.norm1(residual + self.dropout_layer(attn_output))
 
-        # MoE FFN Block
         residual2 = src
         ff_output = self.moe_ffn(src)
         src = self.norm2(residual2 + self.dropout_layer(ff_output))
@@ -254,6 +323,13 @@ class MoETransformerEncoderLayer(nn.Module):
     @property
     def aux_losses(self):
         return self.moe_ffn.aux_losses
+
+
+def enable_expert_parallel(model: nn.Module, process_group):
+    """Enable EP on all MoE layers in the model."""
+    for module in model.modules():
+        if isinstance(module, MoEFFN):
+            module.enable_expert_parallel(process_group)
 
 
 def collect_moe_aux_losses(model: nn.Module):
