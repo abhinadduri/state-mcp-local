@@ -172,19 +172,23 @@ class MoEFFN(nn.Module):
         sorted_tokens = x_flat[sorted_token_idx]  # [N*K, D]
         sorted_weighted = sorted_tokens * sorted_weights.unsqueeze(-1)  # pre-weight
 
+        # Use bf16 for all-to-all (autocast context means compute is bf16)
+        comm_dtype = torch.bfloat16
+        sorted_weighted = sorted_weighted.to(comm_dtype)
+
         # All-to-all dispatch: send tokens to the GPU that owns their expert
         recv_total = sum(output_splits)
-        recv_tokens = torch.empty(recv_total, D, device=x_flat.device, dtype=x_flat.dtype)
+        recv_tokens = torch.empty(recv_total, D, device=x_flat.device, dtype=comm_dtype)
         dist.all_to_all_single(recv_tokens, sorted_weighted,
                                output_split_sizes=output_splits,
                                input_split_sizes=input_splits,
                                group=ep_group)
 
         # Local expert computation (this GPU's single expert)
-        w1_local = self.w1.squeeze(0)  # [D, H]
-        b1_local = self.b1.squeeze(0).squeeze(0)  # [H]
-        w2_local = self.w2.squeeze(0)  # [H, D]
-        b2_local = self.b2.squeeze(0).squeeze(0)  # [D]
+        w1_local = self.w1.squeeze(0).to(comm_dtype)  # [D, H]
+        b1_local = self.b1.squeeze(0).squeeze(0).to(comm_dtype)  # [H]
+        w2_local = self.w2.squeeze(0).to(comm_dtype)  # [H, D]
+        b2_local = self.b2.squeeze(0).squeeze(0).to(comm_dtype)  # [D]
 
         h = F.gelu(recv_tokens @ w1_local + b1_local)
         if self.dropout_p > 0 and self.training:
@@ -192,7 +196,7 @@ class MoEFFN(nn.Module):
         expert_out = h @ w2_local + b2_local  # [recv_total, D]
 
         # All-to-all combine: send results back to originating ranks
-        send_back = torch.empty(N * K, D, device=x_flat.device, dtype=x_flat.dtype)
+        send_back = torch.empty(N * K, D, device=x_flat.device, dtype=comm_dtype)
         dist.all_to_all_single(send_back, expert_out,
                                output_split_sizes=input_splits,
                                input_split_sizes=output_splits,
