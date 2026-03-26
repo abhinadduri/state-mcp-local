@@ -26,6 +26,9 @@ class _GroupedMM(torch.autograd.Function):
     @staticmethod
     def forward(ctx, A, B):
         ctx.save_for_backward(A, B)
+        # Ensure matching dtypes (FSDP2 + autocast can mix bf16/fp32)
+        if A.dtype != B.dtype:
+            B = B.to(A.dtype)
         return torch._grouped_mm(A, B)
 
     @staticmethod
