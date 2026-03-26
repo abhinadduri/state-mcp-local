@@ -15,6 +15,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class _GroupedMM(torch.autograd.Function):
+    """Custom autograd for torch._grouped_mm.
+
+    Uses the native grouped GEMM kernel (2.63x faster than bmm on H100) for
+    the forward pass, with bmm fallback for backward (native backward is broken
+    in torch 2.10 due to a strides bug).
+    """
+
+    @staticmethod
+    def forward(ctx, A, B):
+        ctx.save_for_backward(A, B)
+        return torch._grouped_mm(A, B)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        A, B = ctx.saved_tensors
+        dA = torch.bmm(grad_output, B.transpose(-1, -2))
+        dB = torch.bmm(A.transpose(-1, -2), grad_output)
+        return dA, dB
+
+
+def grouped_mm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Batched matmul using native grouped GEMM when available, bmm fallback."""
+    if hasattr(torch, "_grouped_mm") and A.is_cuda:
+        return _GroupedMM.apply(A, B)
+    return torch.bmm(A, B)
+
+
 class TopKRouter(nn.Module):
     """Token-to-expert router with auxiliary losses for balanced expert utilization."""
 
@@ -143,11 +171,11 @@ class MoEFFN(nn.Module):
         padded_out_idx[sorted_experts, positions] = sorted_token_idx
 
         # Batched expert computation: [E, max_tokens, D] @ [E, D, H] → [E, max_tokens, H]
-        h = torch.bmm(padded_tokens, self.w1) + self.b1
+        h = grouped_mm(padded_tokens, self.w1) + self.b1
         h = F.gelu(h)
         if self.dropout_p > 0 and self.training:
             h = F.dropout(h, p=self.dropout_p, training=True)
-        expert_out = torch.bmm(h, self.w2) + self.b2  # [E, max_tokens, D]
+        expert_out = grouped_mm(h, self.w2) + self.b2  # [E, max_tokens, D]
 
         # Apply routing weights
         expert_out = expert_out * padded_weights.unsqueeze(-1)
