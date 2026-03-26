@@ -1,55 +1,28 @@
 """Mixture of Experts (MoE) components for the State Embedding model.
 
 Replaces dense FFN layers with sparsely-activated expert FFNs.
-Uses padded batched matmul with stacked expert weights — no Python loops,
-no .item() calls, fully torch.compile-compatible.
+Uses ScatterMoE's Triton scatter2scatter kernels for zero-padding-waste
+dropless expert computation when available, with padded bmm fallback.
 
 Key components:
 - TopKRouter: Token-to-expert routing with load balancing and z-loss
-- MoEFFN: Dropless MoE FFN with padded bmm (all tokens processed, no dropping)
+- MoEFFN: Dropless MoE FFN (ScatterMoE backend or padded bmm fallback)
 - MoETransformerEncoderLayer: Drop-in replacement for FlashTransformerEncoderLayer
 """
 
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+log = logging.getLogger(__name__)
 
-class _GroupedMM(torch.autograd.Function):
-    """Custom autograd for torch._grouped_mm.
-
-    Uses the native grouped GEMM kernel (2.63x faster than bmm on H100) for
-    the forward pass, with bmm fallback for backward (native backward is broken
-    in torch 2.10 due to a strides bug).
-    """
-
-    @staticmethod
-    def forward(ctx, A, B):
-        ctx.save_for_backward(A, B)
-        # Ensure matching dtypes (FSDP2 + autocast can mix bf16/fp32)
-        if A.dtype != B.dtype:
-            B = B.to(A.dtype)
-        return torch._grouped_mm(A, B)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        A, B = ctx.saved_tensors
-        # Ensure matching dtypes for bmm (autocast may mix bf16/fp32)
-        if grad_output.dtype != B.dtype:
-            grad_output = grad_output.to(B.dtype)
-        dA = torch.bmm(grad_output, B.transpose(-1, -2))
-        dB = torch.bmm(A.transpose(-1, -2), grad_output)
-        return dA, dB
-
-
-def grouped_mm(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    """Batched matmul. Uses torch.bmm for training (reliable with FSDP2 + autocast).
-
-    Note: torch._grouped_mm is 2.63x faster in forward on H100 but has dtype
-    issues with FSDP2 autocast in torch 2.10. Will be useful once the backward
-    strides bug is fixed in a future torch release.
-    """
-    return torch.bmm(A, B)
+# Try to import ScatterMoE for zero-padding-waste expert computation
+try:
+    from scattermoe.mlp import MLP as ScatterMoEMLP
+    _HAS_SCATTERMOE = True
+except ImportError:
+    _HAS_SCATTERMOE = False
 
 
 class TopKRouter(nn.Module):
@@ -87,15 +60,12 @@ def router_z_loss(router_logits: torch.Tensor) -> torch.Tensor:
 
 
 class MoEFFN(nn.Module):
-    """Dropless Mixture of Experts FFN using padded batched matmul.
+    """Dropless Mixture of Experts FFN.
 
-    All expert weights are stored as stacked [E, d_in, d_out] tensors.
-    Tokens are sorted by expert assignment, padded to max group size,
-    and processed in a single torch.bmm — no Python loops over experts,
-    no .item() calls, fully compilable.
+    When ScatterMoE is available, uses Triton scatter2scatter kernels for
+    zero-padding-waste expert computation. Otherwise falls back to padded bmm.
 
-    Dropless: every token is processed by its assigned experts. No capacity
-    factor, no token dropping. Padding tokens contribute zero to output.
+    All tokens are processed — no capacity factor, no token dropping.
     """
 
     def __init__(
@@ -114,87 +84,93 @@ class MoEFFN(nn.Module):
 
         self.router = TopKRouter(d_model, num_experts, top_k)
 
-        # Stacked expert weights: [E, d_in, d_out] for batched matmul
-        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, d_hid))
-        self.b1 = nn.Parameter(torch.zeros(num_experts, 1, d_hid))
-        self.w2 = nn.Parameter(torch.empty(num_experts, d_hid, d_model))
-        self.b2 = nn.Parameter(torch.zeros(num_experts, 1, d_model))
+        if _HAS_SCATTERMOE:
+            # ScatterMoE: Triton-based, zero padding waste, variable-length expert groups
+            self.experts = ScatterMoEMLP(
+                input_size=d_model,
+                hidden_size=d_hid,
+                num_experts=num_experts,
+                top_k=top_k,
+                bias=False,
+                activation=nn.GELU(),
+            )
+            self._backend = "scattermoe"
+            log.info(f"MoEFFN using ScatterMoE backend ({num_experts}E, top-{top_k})")
+        else:
+            # Fallback: padded bmm with stacked expert weights
+            self.w1 = nn.Parameter(torch.empty(num_experts, d_model, d_hid))
+            self.b1 = nn.Parameter(torch.zeros(num_experts, 1, d_hid))
+            self.w2 = nn.Parameter(torch.empty(num_experts, d_hid, d_model))
+            self.b2 = nn.Parameter(torch.zeros(num_experts, 1, d_model))
+            for i in range(num_experts):
+                nn.init.kaiming_uniform_(self.w1[i])
+                nn.init.kaiming_uniform_(self.w2[i])
+            self._backend = "bmm"
+            log.info(f"MoEFFN using padded bmm backend ({num_experts}E, top-{top_k})")
 
         self.dropout_p = dropout
-        self._init_weights()
         self._aux_loss = None
         self._router_z_loss = None
 
-    def _init_weights(self):
-        for i in range(self.num_experts):
-            nn.init.kaiming_uniform_(self.w1[i])
-            nn.init.kaiming_uniform_(self.w2[i])
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Fully-tensorized forward: sort → pad → bmm → unpad → scatter.
-
-        No .item() calls, no data-dependent branching. Compatible with
-        torch.compile for kernel fusion.
-        """
         B, T, D = x.shape
         x_flat = x.reshape(-1, D)
-        N = x_flat.shape[0]
+
+        top_k_weights, top_k_indices, router_logits = self.router(x_flat)
+        self._aux_loss = load_balancing_loss(router_logits, top_k_indices, self.num_experts)
+        self._router_z_loss = router_z_loss(router_logits)
+
+        if self._backend == "scattermoe":
+            output = self.experts(x_flat, top_k_weights, top_k_indices)
+        else:
+            output = self._forward_bmm(x_flat, top_k_weights, top_k_indices)
+
+        return output.reshape(B, T, D)
+
+    def _forward_bmm(self, x_flat, top_k_weights, top_k_indices):
+        """Padded bmm fallback when ScatterMoE is not available."""
+        N, D = x_flat.shape
         E = self.num_experts
         K = self.top_k
 
-        top_k_weights, top_k_indices, router_logits = self.router(x_flat)
-        self._aux_loss = load_balancing_loss(router_logits, top_k_indices, E)
-        self._router_z_loss = router_z_loss(router_logits)
-
-        # Flatten top-k selections: [N*K]
-        flat_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, K).reshape(-1)
-        flat_experts = top_k_indices.reshape(-1)     # [N*K]
-        flat_weights = top_k_weights.reshape(-1)     # [N*K]
+        flat_token_idx = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(-1, K).reshape(-1)
+        flat_experts = top_k_indices.reshape(-1)
+        flat_weights = top_k_weights.reshape(-1)
         M = N * K
 
-        # Sort by expert for contiguous grouping
         sort_idx = flat_experts.argsort()
         sorted_token_idx = flat_token_idx[sort_idx]
         sorted_experts = flat_experts[sort_idx]
         sorted_weights = flat_weights[sort_idx]
 
-        # Compute expert group sizes and boundaries
-        expert_counts = torch.zeros(E, dtype=torch.long, device=x.device)
-        expert_counts.scatter_add_(0, sorted_experts, torch.ones(M, dtype=torch.long, device=x.device))
-        max_tokens = expert_counts.max()  # tensor, no .item()
+        expert_counts = torch.zeros(E, dtype=torch.long, device=x_flat.device)
+        expert_counts.scatter_add_(0, sorted_experts, torch.ones(M, dtype=torch.long, device=x_flat.device))
+        max_tokens = expert_counts.max()
 
-        # Compute within-expert positions using cumsum trick (no loop)
-        offsets = torch.zeros(E, dtype=torch.long, device=x.device)
+        offsets = torch.zeros(E, dtype=torch.long, device=x_flat.device)
         torch.cumsum(expert_counts[:-1], dim=0, out=offsets[1:])
-        # positions[i] = index within this token's expert group
-        global_pos = torch.arange(M, device=x.device)
+        global_pos = torch.arange(M, device=x_flat.device)
         positions = global_pos - offsets[sorted_experts]
 
-        # Build padded tensors using scatter: [E, max_tokens, D]
         padded_tokens = x_flat.new_zeros(E, max_tokens, D)
         padded_weights = x_flat.new_zeros(E, max_tokens)
-        padded_out_idx = torch.zeros(E, max_tokens, dtype=torch.long, device=x.device)
+        padded_out_idx = torch.zeros(E, max_tokens, dtype=torch.long, device=x_flat.device)
 
         padded_tokens[sorted_experts, positions] = x_flat[sorted_token_idx]
         padded_weights[sorted_experts, positions] = sorted_weights
         padded_out_idx[sorted_experts, positions] = sorted_token_idx
 
-        # Batched expert computation: [E, max_tokens, D] @ [E, D, H] → [E, max_tokens, H]
-        h = grouped_mm(padded_tokens, self.w1) + self.b1
+        h = torch.bmm(padded_tokens, self.w1) + self.b1
         h = F.gelu(h)
         if self.dropout_p > 0 and self.training:
             h = F.dropout(h, p=self.dropout_p, training=True)
-        expert_out = grouped_mm(h, self.w2) + self.b2  # [E, max_tokens, D]
-
-        # Apply routing weights
+        expert_out = torch.bmm(h, self.w2) + self.b2
         expert_out = expert_out * padded_weights.unsqueeze(-1)
 
-        # Scatter-add back to output: [N, D]
         output = torch.zeros_like(x_flat)
         flat_idx = padded_out_idx.reshape(-1).unsqueeze(-1).expand(-1, D)
         output.scatter_add_(0, flat_idx, expert_out.reshape(-1, D))
-
-        return output.reshape(B, T, D)
+        return output
 
     @property
     def aux_losses(self):
