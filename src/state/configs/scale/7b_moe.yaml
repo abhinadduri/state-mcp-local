@@ -1,9 +1,9 @@
-# SE 7B MoE — ~7.4B total, ~1.7B active per token
-# 16 experts, top-2, MoE every 2nd layer
-# d_model=2048 matches dense 600m attention, d_hid=6144 gives 7.4B total
+# SE ~5.4B MoE — ~5.4B total, ~2.1B active per token
+# 8 experts, top-2, MoE every 2nd layer
+# Fewer experts = fewer FSDP2 all-gather calls = more stable NCCL
 model:
   emsize: 2048
-  d_hid: 6144
+  d_hid: 8192
   output_dim: 2048
   nlayers: 32
   nhead: 32
@@ -13,7 +13,7 @@ model:
   gradient_checkpointing: false
   moe:
     enable: true
-    num_experts: 16
+    num_experts: 8
     top_k: 2
     moe_freq: 2
     load_balance_weight: 0.01

@@ -165,15 +165,11 @@ def apply_fsdp2(model):
     The root fully_shard handles remaining params + gradient synchronization.
     """
     from torch.distributed._composable.fsdp import fully_shard
-    from ..nn.moe import MoETransformerEncoderLayer
 
     # Shard each transformer layer (these hold 95%+ of params)
+    # MoE layers use stacked expert weights — FSDP2 shards the whole layer
+    # as one unit, which is simpler and produces fewer all-gather calls.
     for layer in model.tokenizer.transformer_encoder.layers:
-        if isinstance(layer, MoETransformerEncoderLayer):
-            # Shard each expert individually so FSDP2 doesn't all-gather
-            # all expert weights at once (which would OOM for 16+ experts)
-            for expert in layer.moe_ffn.experts:
-                fully_shard(expert)
         fully_shard(layer)
 
     # Shard cross-attention blocks if present (LatentTokenizer)

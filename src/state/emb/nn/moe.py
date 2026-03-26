@@ -1,11 +1,12 @@
 """Mixture of Experts (MoE) components for the State Embedding model.
 
 Replaces dense FFN layers with sparsely-activated expert FFNs.
-Uses per-expert token gathering for memory-efficient batched computation.
+Uses padded batched matmul with stacked expert weights — no Python loops,
+no .item() calls, fully torch.compile-compatible.
 
 Key components:
 - TopKRouter: Token-to-expert routing with load balancing and z-loss
-- MoEFFN: Sparse expert FFN with top-k routing
+- MoEFFN: Dropless MoE FFN with padded bmm (all tokens processed, no dropping)
 - MoETransformerEncoderLayer: Drop-in replacement for FlashTransformerEncoderLayer
 """
 
@@ -24,16 +25,6 @@ class TopKRouter(nn.Module):
         self.gate = nn.Linear(d_model, num_experts, bias=False)
 
     def forward(self, x: torch.Tensor):
-        """Route tokens to experts.
-
-        Args:
-            x: [num_tokens, d_model]
-
-        Returns:
-            top_k_weights: [num_tokens, top_k] normalized routing weights
-            top_k_indices: [num_tokens, top_k] expert indices
-            router_logits: [num_tokens, num_experts] raw logits for aux losses
-        """
         router_logits = self.gate(x)
         scores = F.softmax(router_logits, dim=-1)
         top_k_weights, top_k_indices = torch.topk(scores, self.top_k, dim=-1)
@@ -58,25 +49,16 @@ def router_z_loss(router_logits: torch.Tensor) -> torch.Tensor:
     return (log_z ** 2).mean()
 
 
-class ExpertFFN(nn.Module):
-    """Single expert FFN: Linear -> GELU -> Linear."""
-
-    def __init__(self, d_model: int, d_hid: int, dropout: float = 0.0):
-        super().__init__()
-        self.w1 = nn.Linear(d_model, d_hid)
-        self.w2 = nn.Linear(d_hid, d_model)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(self.dropout(F.gelu(self.w1(x))))
-
-
 class MoEFFN(nn.Module):
-    """Mixture of Experts FFN using per-expert modules.
+    """Dropless Mixture of Experts FFN using padded batched matmul.
 
-    Each expert is an independent ExpertFFN nn.Module, enabling FSDP2 to shard
-    each expert individually. Tokens are sorted by expert for contiguous
-    memory access, then each expert processes its assigned tokens.
+    All expert weights are stored as stacked [E, d_in, d_out] tensors.
+    Tokens are sorted by expert assignment, padded to max group size,
+    and processed in a single torch.bmm — no Python loops over experts,
+    no .item() calls, fully compilable.
+
+    Dropless: every token is processed by its assigned experts. No capacity
+    factor, no token dropping. Padding tokens contribute zero to output.
     """
 
     def __init__(
@@ -94,59 +76,86 @@ class MoEFFN(nn.Module):
         self.top_k = top_k
 
         self.router = TopKRouter(d_model, num_experts, top_k)
-        self.experts = nn.ModuleList([
-            ExpertFFN(d_model, d_hid, dropout) for _ in range(num_experts)
-        ])
 
+        # Stacked expert weights: [E, d_in, d_out] for batched matmul
+        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, d_hid))
+        self.b1 = nn.Parameter(torch.zeros(num_experts, 1, d_hid))
+        self.w2 = nn.Parameter(torch.empty(num_experts, d_hid, d_model))
+        self.b2 = nn.Parameter(torch.zeros(num_experts, 1, d_model))
+
+        self.dropout_p = dropout
+        self._init_weights()
         self._aux_loss = None
         self._router_z_loss = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: sort by expert, gather-compute-scatter per expert.
+    def _init_weights(self):
+        for i in range(self.num_experts):
+            nn.init.kaiming_uniform_(self.w1[i])
+            nn.init.kaiming_uniform_(self.w2[i])
 
-        Args:
-            x: [B, T, d_model]
-        Returns:
-            [B, T, d_model]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Fully-tensorized forward: sort → pad → bmm → unpad → scatter.
+
+        No .item() calls, no data-dependent branching. Compatible with
+        torch.compile for kernel fusion.
         """
         B, T, D = x.shape
         x_flat = x.reshape(-1, D)
         N = x_flat.shape[0]
         E = self.num_experts
+        K = self.top_k
 
         top_k_weights, top_k_indices, router_logits = self.router(x_flat)
         self._aux_loss = load_balancing_loss(router_logits, top_k_indices, E)
         self._router_z_loss = router_z_loss(router_logits)
 
-        # Flatten top-k: each token appears top_k times
-        flat_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)
-        flat_experts = top_k_indices.reshape(-1)
-        flat_weights = top_k_weights.reshape(-1)
-        M = flat_token_idx.shape[0]
+        # Flatten top-k selections: [N*K]
+        flat_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, K).reshape(-1)
+        flat_experts = top_k_indices.reshape(-1)     # [N*K]
+        flat_weights = top_k_weights.reshape(-1)     # [N*K]
+        M = N * K
 
-        # Sort by expert for contiguous access
+        # Sort by expert for contiguous grouping
         sort_idx = flat_experts.argsort()
         sorted_token_idx = flat_token_idx[sort_idx]
         sorted_experts = flat_experts[sort_idx]
         sorted_weights = flat_weights[sort_idx]
 
-        # Expert boundaries
+        # Compute expert group sizes and boundaries
         expert_counts = torch.zeros(E, dtype=torch.long, device=x.device)
         expert_counts.scatter_add_(0, sorted_experts, torch.ones(M, dtype=torch.long, device=x.device))
-        offsets = torch.zeros(E + 1, dtype=torch.long, device=x.device)
-        torch.cumsum(expert_counts, dim=0, out=offsets[1:])
+        max_tokens = expert_counts.max()  # tensor, no .item()
 
-        # Gather-compute-scatter per expert
+        # Compute within-expert positions using cumsum trick (no loop)
+        offsets = torch.zeros(E, dtype=torch.long, device=x.device)
+        torch.cumsum(expert_counts[:-1], dim=0, out=offsets[1:])
+        # positions[i] = index within this token's expert group
+        global_pos = torch.arange(M, device=x.device)
+        positions = global_pos - offsets[sorted_experts]
+
+        # Build padded tensors using scatter: [E, max_tokens, D]
+        padded_tokens = x_flat.new_zeros(E, max_tokens, D)
+        padded_weights = x_flat.new_zeros(E, max_tokens)
+        padded_out_idx = torch.zeros(E, max_tokens, dtype=torch.long, device=x.device)
+
+        padded_tokens[sorted_experts, positions] = x_flat[sorted_token_idx]
+        padded_weights[sorted_experts, positions] = sorted_weights
+        padded_out_idx[sorted_experts, positions] = sorted_token_idx
+
+        # Batched expert computation: [E, max_tokens, D] @ [E, D, H] → [E, max_tokens, H]
+        h = torch.bmm(padded_tokens, self.w1) + self.b1
+        h = F.gelu(h)
+        if self.dropout_p > 0 and self.training:
+            h = F.dropout(h, p=self.dropout_p, training=True)
+        expert_out = torch.bmm(h, self.w2) + self.b2  # [E, max_tokens, D]
+
+        # Apply routing weights
+        expert_out = expert_out * padded_weights.unsqueeze(-1)
+
+        # Scatter-add back to output: [N, D]
         output = torch.zeros_like(x_flat)
-        for e in range(E):
-            start = offsets[e].item()
-            end = offsets[e + 1].item()
-            if start == end:
-                continue
-            idx = sorted_token_idx[start:end]
-            w = sorted_weights[start:end]
-            out_e = self.experts[e](x_flat[idx])
-            output.index_add_(0, idx, w.unsqueeze(-1) * out_e)
+        flat_idx = padded_out_idx.reshape(-1).unsqueeze(-1).expand(-1, D)
+        output.scatter_add_(0, flat_idx, expert_out.reshape(-1, D))
 
         return output.reshape(B, T, D)
 
@@ -164,7 +173,7 @@ class MoETransformerEncoderLayer(nn.Module):
     """Transformer encoder layer with MoE FFN.
 
     Drop-in replacement for FlashTransformerEncoderLayer. Attention is unchanged;
-    the dense FFN is replaced with a sparse MoE FFN.
+    the dense FFN is replaced with a dropless MoE FFN.
     """
 
     def __init__(
