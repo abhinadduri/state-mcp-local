@@ -1,14 +1,15 @@
-# SE 7B MoE — ~7B total, ~1.1B active per token
+# SE 7B MoE — ~7.4B total, ~1.7B active per token
 # 16 experts, top-2, MoE every 2nd layer
+# d_model=2048 matches dense 600m attention, d_hid=6144 gives 7.4B total
 model:
-  emsize: 1536
-  d_hid: 4096
-  output_dim: 1536
+  emsize: 2048
+  d_hid: 6144
+  output_dim: 2048
   nlayers: 32
-  nhead: 24
+  nhead: 32
   n_latent: 512
   n_cross_attn_rounds: 2
-  batch_size: 16
+  batch_size: 8
   gradient_checkpointing: false
   moe:
     enable: true

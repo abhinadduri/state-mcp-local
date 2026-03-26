@@ -72,14 +72,11 @@ class ExpertFFN(nn.Module):
 
 
 class MoEFFN(nn.Module):
-    """Mixture of Experts FFN using padded batched matmul.
+    """Mixture of Experts FFN using per-expert modules.
 
-    Stores all expert weights as [E, d_in, d_out] tensors and uses torch.bmm
-    over all experts simultaneously. Tokens are sorted by expert, padded to
-    the max expert group size, then processed in a single batched matmul.
-
-    Memory: O(E * max_tokens_per_expert * d_hid) — much smaller than the
-    naive per-token weight expansion approach.
+    Each expert is an independent ExpertFFN nn.Module, enabling FSDP2 to shard
+    each expert individually. Tokens are sorted by expert for contiguous
+    memory access, then each expert processes its assigned tokens.
     """
 
     def __init__(
@@ -97,25 +94,15 @@ class MoEFFN(nn.Module):
         self.top_k = top_k
 
         self.router = TopKRouter(d_model, num_experts, top_k)
+        self.experts = nn.ModuleList([
+            ExpertFFN(d_model, d_hid, dropout) for _ in range(num_experts)
+        ])
 
-        # Expert weights as grouped tensors: [E, d_in, d_out]
-        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, d_hid))
-        self.w2 = nn.Parameter(torch.empty(num_experts, d_hid, d_model))
-        self.b1 = nn.Parameter(torch.zeros(num_experts, 1, d_hid))
-        self.b2 = nn.Parameter(torch.zeros(num_experts, 1, d_model))
-
-        self.dropout_p = dropout
-        self._init_weights()
         self._aux_loss = None
         self._router_z_loss = None
 
-    def _init_weights(self):
-        for i in range(self.num_experts):
-            nn.init.kaiming_uniform_(self.w1[i])
-            nn.init.kaiming_uniform_(self.w2[i])
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward: sort by expert, pad, bmm all experts, unpad, unsort.
+        """Forward: sort by expert, gather-compute-scatter per expert.
 
         Args:
             x: [B, T, d_model]
@@ -135,60 +122,31 @@ class MoEFFN(nn.Module):
         flat_token_idx = torch.arange(N, device=x.device).unsqueeze(1).expand(-1, self.top_k).reshape(-1)
         flat_experts = top_k_indices.reshape(-1)
         flat_weights = top_k_weights.reshape(-1)
-        M = flat_token_idx.shape[0]  # N * top_k
+        M = flat_token_idx.shape[0]
 
-        # Sort by expert
+        # Sort by expert for contiguous access
         sort_idx = flat_experts.argsort()
         sorted_token_idx = flat_token_idx[sort_idx]
         sorted_experts = flat_experts[sort_idx]
         sorted_weights = flat_weights[sort_idx]
 
-        # Expert group sizes and max size for padding
+        # Expert boundaries
         expert_counts = torch.zeros(E, dtype=torch.long, device=x.device)
         expert_counts.scatter_add_(0, sorted_experts, torch.ones(M, dtype=torch.long, device=x.device))
-        max_tokens = expert_counts.max().item()
+        offsets = torch.zeros(E + 1, dtype=torch.long, device=x.device)
+        torch.cumsum(expert_counts, dim=0, out=offsets[1:])
 
-        # Build padded token matrix: [E, max_tokens, D]
-        # and corresponding weight matrix: [E, max_tokens]
-        padded_tokens = torch.zeros(E, max_tokens, D, device=x.device, dtype=x.dtype)
-        padded_weights = torch.zeros(E, max_tokens, device=x.device, dtype=x.dtype)
-        padded_indices = torch.zeros(E, max_tokens, device=x.device, dtype=torch.long)
-
-        # Fill each expert's slot
-        offsets = torch.zeros(E, dtype=torch.long, device=x.device)
-        torch.cumsum(expert_counts, dim=0, out=offsets)
-        offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=x.device), offsets[:-1]])
-
-        for e in range(E):
-            cnt = expert_counts[e].item()
-            if cnt == 0:
-                continue
-            start = offsets[e].item()
-            idx = sorted_token_idx[start:start + cnt]
-            padded_tokens[e, :cnt] = x_flat[idx]
-            padded_weights[e, :cnt] = sorted_weights[start:start + cnt]
-            padded_indices[e, :cnt] = idx
-
-        # Batched expert computation: all E experts in parallel via bmm
-        # h = GELU(tokens @ W1 + b1)  ->  [E, max_tokens, d_hid]
-        h = torch.bmm(padded_tokens, self.w1) + self.b1
-        h = F.gelu(h)
-        if self.dropout_p > 0 and self.training:
-            h = F.dropout(h, p=self.dropout_p, training=True)
-        # out = h @ W2 + b2  ->  [E, max_tokens, D]
-        expert_out = torch.bmm(h, self.w2) + self.b2
-
-        # Weight and scatter back
-        weighted_out = expert_out * padded_weights.unsqueeze(-1)  # [E, max_tokens, D]
-
-        # Scatter-add back to output
+        # Gather-compute-scatter per expert
         output = torch.zeros_like(x_flat)
         for e in range(E):
-            cnt = expert_counts[e].item()
-            if cnt == 0:
+            start = offsets[e].item()
+            end = offsets[e + 1].item()
+            if start == end:
                 continue
-            idx = padded_indices[e, :cnt]
-            output.index_add_(0, idx, weighted_out[e, :cnt])
+            idx = sorted_token_idx[start:end]
+            w = sorted_weights[start:end]
+            out_e = self.experts[e](x_flat[idx])
+            output.index_add_(0, idx, w.unsqueeze(-1) * out_e)
 
         return output.reshape(B, T, D)
 
