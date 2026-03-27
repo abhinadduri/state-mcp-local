@@ -85,16 +85,19 @@ def build_optimizer_and_scheduler(model, cfg, total_steps):
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=weight_decay, foreach=True)
 
-    warmup_steps = int(getattr(cfg.optimizer, "warmup_frac", 0.03) * total_steps)
-    eta_min = max_lr * float(getattr(cfg.optimizer, "eta_min_frac", 0.0))
+    warmup_steps = int(getattr(cfg.optimizer, "warmup_steps", 2000))
+    min_lr = float(getattr(cfg.optimizer, "min_lr", 0.0))
+    schedule_steps = int(getattr(cfg.optimizer, "schedule_steps", -1))
+    if schedule_steps <= 0:
+        schedule_steps = total_steps
     lr_schedulers = [
         LinearLR(
             optimizer,
-            start_factor=cfg.optimizer.start,
+            start_factor=float(getattr(cfg.optimizer, "start", 0.33)),
             end_factor=1.0,
             total_iters=warmup_steps,
         ),
-        CosineAnnealingLR(optimizer, eta_min=eta_min, T_max=total_steps - warmup_steps),
+        CosineAnnealingLR(optimizer, eta_min=min_lr, T_max=schedule_steps - warmup_steps),
     ]
     scheduler = ChainedScheduler(lr_schedulers)
 
