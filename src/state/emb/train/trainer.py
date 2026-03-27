@@ -418,11 +418,33 @@ def main(cfg):
               and is_distributed)
     if use_ep:
         from ..nn.moe import enable_expert_parallel
-        # EP uses the default process group (all GPUs)
         ep_group = dist.group.WORLD
         enable_expert_parallel(model, ep_group)
         n_experts = getattr(moe_cfg, "num_experts", 8)
         print(f"Expert parallelism enabled: {n_experts} experts across {world_size} GPUs")
+
+        # Correct FLOPS for EP: the measurement above counted all experts on rank 0,
+        # but with EP each GPU only runs E/world_size experts. Scale down the MoE
+        # portion of FLOPs. Approximate: MoE FFN is ~(E/top_k) of total model FLOPs,
+        # so with EP the per-GPU FLOPs = total * (1 - moe_fraction + moe_fraction/world_size).
+        # Simpler: just re-measure after EP slicing.
+        if is_main and flops_per_batch and flops_per_batch > 0:
+            try:
+                mini_batch = next(iter(train_dataloader))
+                sliced = {
+                    f: getattr(mini_batch, f)[:1] if isinstance(getattr(mini_batch, f), torch.Tensor)
+                       and getattr(mini_batch, f).dim() > 0 else getattr(mini_batch, f)
+                    for f in mini_batch._fields
+                }
+                mini_batch = type(mini_batch)(**sliced)
+                flops_1 = compute_forward_flops(model, mini_batch, use_backward=False)
+                flops_per_batch = flops_1 * cfg.model.batch_size * 3
+                print(f"Re-measured FLOPs after EP (per-GPU active): {flops_per_batch:,}")
+                del mini_batch
+                import gc; gc.collect(); torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+            except Exception as e:
+                print(f"Warning: EP FLOPS re-measurement failed: {e}")
 
     # --- Apply distributed strategy ---
     if use_fsdp:

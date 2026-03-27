@@ -1,0 +1,23 @@
+# SE 8B MoE — ~8.6B total, ~1.1B active per token
+# 32 routed experts + 1 shared expert, top-2, MoE every layer
+# d_model=2048, d_hid=3072, 20 layers — balanced width+depth
+# With EP on 8 GPUs: 4 experts per GPU, ~1.6B params per GPU
+model:
+  emsize: 2048
+  d_hid: 3072
+  output_dim: 2048
+  nlayers: 20
+  nhead: 32
+  n_latent: 512
+  n_cross_attn_rounds: 2
+  batch_size: 40
+  gradient_checkpointing: false
+  moe:
+    enable: true
+    num_experts: 32
+    top_k: 2
+    moe_freq: 1
+    load_balance_weight: 0.01
+    router_z_weight: 0.001
+    expert_parallel: true
+    num_shared_experts: 1

@@ -34,18 +34,21 @@ def _build_transformer_layers(d_model, nhead, d_hid, nlayers, dropout, cfg=None)
     num_experts = getattr(moe_cfg, "num_experts", 8)
     top_k = getattr(moe_cfg, "top_k", 2)
     moe_freq = getattr(moe_cfg, "moe_freq", 2)
+    num_shared = getattr(moe_cfg, "num_shared_experts", 0)
 
     layers = []
     for i in range(nlayers):
         if (i + 1) % moe_freq == 0:
             layers.append(MoETransformerEncoderLayer(
-                d_model, nhead, d_hid, num_experts=num_experts, top_k=top_k, dropout=dropout,
+                d_model, nhead, d_hid, num_experts=num_experts, top_k=top_k,
+                dropout=dropout, num_shared_experts=num_shared,
             ))
         else:
             layers.append(FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout))
 
     n_moe = sum(1 for l in layers if isinstance(l, MoETransformerEncoderLayer))
-    log.info(f"Built {nlayers} layers: {n_moe} MoE ({num_experts}E, top-{top_k}), {nlayers - n_moe} dense")
+    shared_str = f", {num_shared} shared" if num_shared > 0 else ""
+    log.info(f"Built {nlayers} layers: {n_moe} MoE ({num_experts}E, top-{top_k}{shared_str}), {nlayers - n_moe} dense")
     return layers
 
 
