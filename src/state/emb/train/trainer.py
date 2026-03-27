@@ -423,28 +423,20 @@ def main(cfg):
         n_experts = getattr(moe_cfg, "num_experts", 8)
         print(f"Expert parallelism enabled: {n_experts} experts across {world_size} GPUs")
 
-        # Correct FLOPS for EP: the measurement above counted all experts on rank 0,
-        # but with EP each GPU only runs E/world_size experts. Scale down the MoE
-        # portion of FLOPs. Approximate: MoE FFN is ~(E/top_k) of total model FLOPs,
-        # so with EP the per-GPU FLOPs = total * (1 - moe_fraction + moe_fraction/world_size).
-        # Simpler: just re-measure after EP slicing.
+        # Correct FLOPS for EP: the measurement above counted all E experts on rank 0,
+        # but with EP each GPU only runs E/world_size experts. Scale down accordingly.
+        # The expert FFN FLOPs dominate in MoE, so scale by (top_k / num_experts).
         if is_main and flops_per_batch and flops_per_batch > 0:
-            try:
-                mini_batch = next(iter(train_dataloader))
-                sliced = {
-                    f: getattr(mini_batch, f)[:1] if isinstance(getattr(mini_batch, f), torch.Tensor)
-                       and getattr(mini_batch, f).dim() > 0 else getattr(mini_batch, f)
-                    for f in mini_batch._fields
-                }
-                mini_batch = type(mini_batch)(**sliced)
-                flops_1 = compute_forward_flops(model, mini_batch, use_backward=False)
-                flops_per_batch = flops_1 * cfg.model.batch_size * 3
-                print(f"Re-measured FLOPs after EP (per-GPU active): {flops_per_batch:,}")
-                del mini_batch
-                import gc; gc.collect(); torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats()
-            except Exception as e:
-                print(f"Warning: EP FLOPS re-measurement failed: {e}")
+            top_k = getattr(moe_cfg, "top_k", 2)
+            # Pre-EP FLOPs counted all E experts; active FLOPs use only top_k
+            scale = top_k / n_experts
+            # But attention + shared experts are fully counted, not scaled.
+            # Approximation: expert FFN is ~80% of total FLOPs for MoE models.
+            # active_flops ≈ total * (0.2 + 0.8 * top_k/E)
+            moe_frac = 0.8  # expert FFN fraction of total FLOPs (approximate)
+            ep_scale = (1.0 - moe_frac) + moe_frac * scale
+            flops_per_batch = int(flops_per_batch * ep_scale)
+            print(f"EP-corrected FLOPs per batch (scale={ep_scale:.3f}): {flops_per_batch:,}")
 
     # --- Apply distributed strategy ---
     if use_fsdp:
