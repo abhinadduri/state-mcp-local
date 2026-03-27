@@ -493,7 +493,7 @@ def main(cfg):
     grad_accum = cfg.optimizer.gradient_accumulation_steps
     max_grad_norm = cfg.optimizer.max_grad_norm
     ckpt_interval = cfg.experiment.checkpoint.every_n_train_steps
-    val_interval = int(cfg.experiment.val_check_interval * world_size)
+    val_interval = int(cfg.experiment.val_check_interval)
     limit_val_batches = cfg.experiment.limit_val_batches
 
     max_steps = -1
