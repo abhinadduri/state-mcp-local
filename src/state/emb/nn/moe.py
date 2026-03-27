@@ -160,15 +160,17 @@ class MoEFFN(nn.Module):
 
         top_k_weights, top_k_indices, router_logits = self.router(x_flat)
 
-        # Accumulate balance stats across micro-batches for global-batch loss
+        # Accumulate balance stats across micro-batches for global-batch loss.
+        # Detach previous micro-batch stats so only the current micro-batch's
+        # router gets gradients (previous graphs are already freed by backward).
         tpe, ss, nt = _compute_balance_stats(router_logits, top_k_indices, self.num_experts)
         if self._accum_tokens_per_expert is None:
             self._accum_tokens_per_expert = tpe
             self._accum_score_sum = ss
             self._accum_num_tokens = nt
         else:
-            self._accum_tokens_per_expert = self._accum_tokens_per_expert + tpe
-            self._accum_score_sum = self._accum_score_sum + ss
+            self._accum_tokens_per_expert = self._accum_tokens_per_expert.detach() + tpe
+            self._accum_score_sum = self._accum_score_sum.detach() + ss
             self._accum_num_tokens = self._accum_num_tokens + nt
 
         # Compute loss from accumulated global-batch stats
