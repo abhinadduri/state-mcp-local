@@ -247,10 +247,10 @@ task:
 optimizer:
   name: muon
   max_lr: 4e-4
-  weight_decay: 0.01
+  weight_decay: 0.1
   start: 0.33
   end: 1.0
-  max_grad_norm: 0.8
+  max_grad_norm: 2.0
   gradient_accumulation_steps: 8
   reset_lr_on_restart: false
   zclip: false

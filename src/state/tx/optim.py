@@ -153,7 +153,8 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
                 momentum_buffer.mul_(momentum).add_(grad_view)
                 update = grad_view.add(momentum_buffer, alpha=momentum) if nesterov else momentum_buffer
                 orthogonal_update = _orthogonalize_update(update, steps=ns_steps, eps=eps)
-                scale = math.sqrt(max(1.0, orthogonal_update.shape[0] / max(1, orthogonal_update.shape[1])))
+                # Moonlight-style RMS-calibrated scaling: 0.2 * sqrt(max(rows, cols))
+                scale = 0.2 * math.sqrt(max(orthogonal_update.shape[0], orthogonal_update.shape[1]))
                 param_view.add_(orthogonal_update, alpha=-lr * scale)
 
         # FSDP2 path: per-param with DTensor.full_tensor() all-gather
@@ -195,7 +196,8 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
 
         # Newton-Schulz on regular tensor (no distributed overhead)
         orth = _orthogonalize_update(full_update, steps=ns_steps, eps=eps)
-        scale = math.sqrt(max(1.0, orth.shape[0] / max(1, orth.shape[1])))
+        # Moonlight-style RMS-calibrated scaling: 0.2 * sqrt(max(rows, cols))
+        scale = 0.2 * math.sqrt(max(orth.shape[0], orth.shape[1]))
 
         # Extract this rank's shard and apply to local param data
         rank = dist.get_rank()

@@ -47,6 +47,20 @@ def load_balancing_loss(router_logits: torch.Tensor, top_k_indices: torch.Tensor
     return num_experts * (f * P).sum()
 
 
+def _compute_balance_stats(router_logits: torch.Tensor, top_k_indices: torch.Tensor, num_experts: int):
+    """Compute per-expert token fraction (f) and mean routing probability (P).
+
+    Returns raw counts so they can be accumulated across micro-batches for
+    global-batch load balancing (Qwen, ACL 2025).
+    """
+    scores = F.softmax(router_logits, dim=-1)
+    num_tokens = router_logits.shape[0]
+    one_hot = F.one_hot(top_k_indices, num_experts).float()
+    tokens_per_expert = one_hot.sum(dim=1).sum(dim=0)  # [E]
+    score_sum = scores.sum(dim=0)  # [E]
+    return tokens_per_expert, score_sum, num_tokens
+
+
 def router_z_loss(router_logits: torch.Tensor) -> torch.Tensor:
     """Router z-loss (ST-MoE): penalizes large logits for stability."""
     log_z = torch.logsumexp(router_logits, dim=-1)
@@ -101,6 +115,11 @@ class MoEFFN(nn.Module):
         self._aux_loss = None
         self._router_z_loss = None
 
+        # Global-batch load balancing: accumulate stats across micro-batches
+        self._accum_tokens_per_expert = None  # [E]
+        self._accum_score_sum = None  # [E]
+        self._accum_num_tokens = 0
+
         # EP state (set by enable_expert_parallel)
         self._ep_group = None
         self._ep_rank = None
@@ -140,7 +159,22 @@ class MoEFFN(nn.Module):
         x_flat = x.reshape(-1, D)
 
         top_k_weights, top_k_indices, router_logits = self.router(x_flat)
-        self._aux_loss = load_balancing_loss(router_logits, top_k_indices, self.num_experts)
+
+        # Accumulate balance stats across micro-batches for global-batch loss
+        tpe, ss, nt = _compute_balance_stats(router_logits, top_k_indices, self.num_experts)
+        if self._accum_tokens_per_expert is None:
+            self._accum_tokens_per_expert = tpe
+            self._accum_score_sum = ss
+            self._accum_num_tokens = nt
+        else:
+            self._accum_tokens_per_expert = self._accum_tokens_per_expert + tpe
+            self._accum_score_sum = self._accum_score_sum + ss
+            self._accum_num_tokens = self._accum_num_tokens + nt
+
+        # Compute loss from accumulated global-batch stats
+        f = self._accum_tokens_per_expert / (self._accum_num_tokens * top_k_indices.shape[1])
+        P = self._accum_score_sum / self._accum_num_tokens
+        self._aux_loss = self.num_experts * (f * P).sum()
         self._router_z_loss = router_z_loss(router_logits)
 
         if self._ep_group is not None:
@@ -329,6 +363,12 @@ class MoEFFN(nn.Module):
             losses["router_z"] = self._router_z_loss
         return losses
 
+    def reset_balance_stats(self):
+        """Reset accumulated balance stats after each optimizer step."""
+        self._accum_tokens_per_expert = None
+        self._accum_score_sum = None
+        self._accum_num_tokens = 0
+
 
 class MoETransformerEncoderLayer(nn.Module):
     """Transformer encoder layer with MoE FFN."""
@@ -421,3 +461,10 @@ def collect_moe_aux_losses(model: nn.Module):
         total_rz = total_rz / n
 
     return {"moe_load_balance": total_lb, "moe_router_z": total_rz, "moe_num_layers": n}
+
+
+def reset_moe_balance_stats(model: nn.Module):
+    """Reset accumulated balance stats on all MoE layers (call after optimizer step)."""
+    for module in model.modules():
+        if isinstance(module, MoEFFN):
+            module.reset_balance_stats()

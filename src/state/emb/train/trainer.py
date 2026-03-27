@@ -56,6 +56,15 @@ def build_optimizer_and_scheduler(model, cfg, total_steps):
         from ...tx.models.state_transition import _split_muon_parameters
 
         muon_params, adamw_params = _split_muon_parameters(model)
+
+        # Move MoE router params from Muon to AdamW — the gate matrix is highly
+        # non-square (d_model × num_experts) and gets extreme Muon scaling.
+        from ..nn.moe import TopKRouter
+        router_param_ids = {id(p) for m in model.modules() if isinstance(m, TopKRouter) for p in m.parameters()}
+        if router_param_ids:
+            moved = [p for p in muon_params if id(p) in router_param_ids]
+            muon_params = [p for p in muon_params if id(p) not in router_param_ids]
+            adamw_params.extend(moved)
         print(f"Muon: {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm params")
         optimizer = MuonWithAuxAdamW(
             muon_params,
@@ -76,14 +85,16 @@ def build_optimizer_and_scheduler(model, cfg, total_steps):
         trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(trainable_params, lr=max_lr, weight_decay=weight_decay, foreach=True)
 
+    warmup_steps = int(getattr(cfg.optimizer, "warmup_frac", 0.03) * total_steps)
+    eta_min = max_lr * float(getattr(cfg.optimizer, "eta_min_frac", 0.0))
     lr_schedulers = [
         LinearLR(
             optimizer,
             start_factor=cfg.optimizer.start,
-            end_factor=cfg.optimizer.end,
-            total_iters=int(0.03 * total_steps),
+            end_factor=1.0,
+            total_iters=warmup_steps,
         ),
-        CosineAnnealingLR(optimizer, eta_min=max_lr * 0.3, T_max=total_steps),
+        CosineAnnealingLR(optimizer, eta_min=eta_min, T_max=total_steps - warmup_steps),
     ]
     scheduler = ChainedScheduler(lr_schedulers)
 
@@ -627,6 +638,11 @@ def main(cfg):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+
+                # Reset MoE global-batch balance stats after each optimizer step
+                from ..nn.moe import reset_moe_balance_stats
+                reset_moe_balance_stats(model)
+
                 global_step += 1
 
                 step_time = time.time() - accum_start
