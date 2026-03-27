@@ -551,15 +551,25 @@ def main(cfg):
     microstep = global_step * grad_accum
     done = False
 
+    # Log dataset and training stats
+    batches_per_epoch = len(train_dataloader)
+    steps_per_epoch_actual = batches_per_epoch // grad_accum
+    if is_main:
+        n_train_cells = len(train_dataloader.dataset)
+        print(f"Dataset: {n_train_cells:,} cells, {batches_per_epoch:,} batches/epoch "
+              f"(bs={cfg.model.batch_size}×{world_size} GPUs), "
+              f"{steps_per_epoch_actual:,} optimizer steps/epoch (grad_accum={grad_accum})")
+
     for epoch in range(start_epoch, cfg.experiment.num_epochs):
         if done:
             break
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        pbar = tqdm(total=max_steps - global_step if max_steps > 0 else None,
+        pbar_total = max_steps - global_step if max_steps > 0 else steps_per_epoch_actual
+        pbar = tqdm(total=pbar_total,
                     desc=f"Epoch {epoch}", disable=not is_main, dynamic_ncols=True,
-                    initial=global_step)
+                    initial=global_step if max_steps > 0 else 0)
         accum_start = None
 
         for batch in train_dataloader:
