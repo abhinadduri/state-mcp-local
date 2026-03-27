@@ -184,6 +184,16 @@ class StateEmbeddingModel(nn.Module):
         if self.protein_embeds is None:
             self.protein_embeds = torch.load(get_embedding_cfg(self.cfg).all_embeddings, weights_only=False)
 
+        # For learned embeddings, map gene names to integer indices
+        if hasattr(self.tokenizer, 'use_learned_embeddings') and self.tokenizer.use_learned_embeddings:
+            gene_keys = list(self.protein_embeds.keys())
+            gene_to_idx = {g: i for i, g in enumerate(gene_keys)}
+            indices = torch.tensor(
+                [gene_to_idx.get(g, 0) for g in genes],
+                device=self.device,
+            )
+            return self.tokenizer.learned_gene_emb(indices)
+
         protein_embeds = [
             self.protein_embeds[x] if x in self.protein_embeds else torch.zeros(get_embedding_cfg(self.cfg).size)
             for x in genes
@@ -269,9 +279,9 @@ class StateEmbeddingModel(nn.Module):
         target = Y
         if self.cfg.loss.name in ("mmd", "tabular"):
             downsample = self.cfg.model.num_downsample if self.training else 1
-            loss = self.criterion(decs.squeeze(), target, downsample=downsample)
+            loss = self.criterion(decs.squeeze(-1), target, downsample=downsample)
         else:
-            loss = self.criterion(decs.squeeze(), target)
+            loss = self.criterion(decs.squeeze(-1), target)
 
         if self.training and self.dataset_embedder is not None and dataset_embs is not None and out.dataset_nums is not None:
             dataset_pred = self.dataset_encoder(dataset_embs)

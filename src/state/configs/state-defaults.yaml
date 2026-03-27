@@ -232,6 +232,7 @@ model:
   decoder_bottleneck_dim: 256
   n_cross_attn_rounds: 1
   gradient_checkpointing: false
+  use_learned_embeddings: true
 task:
   mask: 0.2
 optimizer:

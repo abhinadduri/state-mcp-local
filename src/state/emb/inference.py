@@ -236,14 +236,42 @@ class Inference:
         model_cfg = self._cfg_get(cfg, "model", {})
         optimizer_cfg = self._cfg_get(cfg, "optimizer", {})
 
+        token_dim = int(self._cfg_get(emb_cfg, "size"))
+        d_model = int(self._cfg_get(model_cfg, "emsize"))
+        nhead = int(self._cfg_get(model_cfg, "nhead"))
+        d_hid = int(self._cfg_get(model_cfg, "d_hid"))
+        nlayers = int(self._cfg_get(model_cfg, "nlayers"))
+        output_dim = int(self._cfg_get(model_cfg, "output_dim"))
+        dropout = float(self._cfg_get(model_cfg, "dropout", 0.0))
+
+        # Create the correct tokenizer based on config
+        tokenizer = None
+        if self._cfg_get(model_cfg, "tokenizer", "sentence") == "latent":
+            from .nn.tokenizer import LatentTokenizer
+            n_genes = int(self._cfg_get(emb_cfg, "num", 19790) or 19790)
+            n_latent = int(self._cfg_get(model_cfg, "n_latent", 256))
+            tokenizer = LatentTokenizer(
+                n_genes=n_genes,
+                n_latent=n_latent,
+                token_dim=token_dim,
+                d_model=d_model,
+                nhead=nhead,
+                d_hid=d_hid,
+                nlayers=nlayers,
+                output_dim=output_dim,
+                dropout=dropout,
+                compiled=False,
+                cfg=cfg,
+            )
+
         return StateEmbeddingModel(
-            token_dim=int(self._cfg_get(emb_cfg, "size")),
-            d_model=int(self._cfg_get(model_cfg, "emsize")),
-            nhead=int(self._cfg_get(model_cfg, "nhead")),
-            d_hid=int(self._cfg_get(model_cfg, "d_hid")),
-            nlayers=int(self._cfg_get(model_cfg, "nlayers")),
-            output_dim=int(self._cfg_get(model_cfg, "output_dim")),
-            dropout=float(self._cfg_get(model_cfg, "dropout", 0.0)),
+            token_dim=token_dim,
+            d_model=d_model,
+            nhead=nhead,
+            d_hid=d_hid,
+            nlayers=nlayers,
+            output_dim=output_dim,
+            dropout=dropout,
             warmup_steps=0,
             compiled=False,
             max_lr=float(self._cfg_get(optimizer_cfg, "max_lr", 4e-4)),
@@ -251,6 +279,7 @@ class Inference:
             emb_size=int(self._cfg_get(emb_cfg, "size")),
             cfg=cfg,
             collater=None,
+            tokenizer=tokenizer,
         )
 
     def init_from_model(self, model, protein_embeds=None):

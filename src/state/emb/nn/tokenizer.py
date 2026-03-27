@@ -431,13 +431,24 @@ class LatentTokenizer(Tokenizer):
         self.output_dim = output_dim
         self._gradient_checkpointing = cfg and getattr(cfg.model, "gradient_checkpointing", False)
 
-        # Encoder: projects protein embedding dim → d_model (shared with task gene embedding)
-        self.encoder = nn.Sequential(
-            nn.Linear(token_dim, d_model, bias=True),
-            nn.LayerNorm(d_model),
-            nn.SiLU(),
-        )
-        self.gene_embedding_layer = self.encoder  # alias for decoder task genes
+        # Learned gene embeddings vs frozen ESM2 + projection
+        self.use_learned_embeddings = cfg and getattr(cfg.model, "use_learned_embeddings", False)
+
+        if self.use_learned_embeddings:
+            # Trainable gene embeddings: directly learn d_model-dim vectors per gene
+            self.learned_gene_emb = nn.Embedding(n_genes, d_model)
+            nn.init.normal_(self.learned_gene_emb.weight, std=0.02)
+            self.encoder = nn.Identity()
+            self.gene_embedding_layer = self.learned_gene_emb
+        else:
+            # Encoder: projects protein embedding dim → d_model (shared with task gene embedding)
+            self.encoder = nn.Sequential(
+                nn.Linear(token_dim, d_model, bias=True),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+            )
+            self.gene_embedding_layer = self.encoder
+            self.learned_gene_emb = None
 
         # Count encoding
         if cfg and cfg.model.counts:
@@ -509,7 +520,14 @@ class LatentTokenizer(Tokenizer):
         )
 
     def _get_esm2_proj_table(self, device):
-        """Compute encoder(pe_embedding) for all genes once and cache as frozen buffer."""
+        """Get projected gene embedding table (n_genes, d_model).
+
+        For ESM2 mode: compute encoder(pe_embedding) once and cache.
+        For learned mode: return the trainable embedding weight directly.
+        """
+        if self.use_learned_embeddings:
+            return self.learned_gene_emb.weight  # [n_genes, d_model], trainable
+
         if self._esm2_proj_cache is not None and self._esm2_proj_cache.device == device:
             return self._esm2_proj_cache
 
@@ -594,11 +612,13 @@ class LatentTokenizer(Tokenizer):
             dataset_emb = gene_output[:, -1, :]
 
         # --- Task gene embeddings for decoder ---
-        # Must run encoder WITH gradients so its parameters get updated.
-        # (The esm2_proj_cache is computed under no_grad and can't provide gradients.)
-        with torch.no_grad():
-            task_pe = self.pe_embedding(task_genes.long())  # [B, P+N, token_dim]
-        task_gene_embs = self.gene_embedding_layer(task_pe)  # [B, P+N, d_model] — grad flows here
+        if self.use_learned_embeddings:
+            task_gene_embs = self.learned_gene_emb(task_genes.long())  # [B, P+N, d_model]
+        else:
+            # Must run encoder WITH gradients so its parameters get updated.
+            with torch.no_grad():
+                task_pe = self.pe_embedding(task_genes.long())  # [B, P+N, token_dim]
+            task_gene_embs = self.gene_embedding_layer(task_pe)  # [B, P+N, d_model] — grad flows here
 
         return TokenizerOutput(
             cell_embedding=embedding,

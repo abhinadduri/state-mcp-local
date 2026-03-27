@@ -121,13 +121,13 @@ def run_emb_eval(args):
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
-                # Compute embeddings
-                _, _, _, emb, ds_emb = model._compute_embedding_for_batch(batch)
+                # Compute embeddings — capture task_counts for RDA
+                _, task_counts_batch, _, emb, ds_emb = model._compute_embedding_for_batch(batch)
 
                 # Get gene embeddings
                 try:
                     gene_embeds = model.get_gene_embedding(adata.var.index)
-                except:
+                except Exception:
                     gene_embeds = model.get_gene_embedding(adata.var["gene_symbols"])
 
                 # Handle dataset embeddings
@@ -140,26 +140,28 @@ def run_emb_eval(args):
                 if ds_emb is not None:
                     ds_emb_batches.append(ds_emb.detach().cpu().float().numpy())
 
-                # Resize batch and decode
-                task_counts = None
-                Y = batch[2]
-                nan_y = Y.masked_fill(Y == 0, float("nan"))[:, : cfg.dataset.P + cfg.dataset.N]
-                task_counts = torch.nanmean(nan_y, dim=1) if cfg.model.rda else None
+                # Decode: use model._decode which handles bottleneck projections correctly
+                B_cur = emb.shape[0]
 
-                # Ensure task_counts is on the same device as other tensors
-                if task_counts is not None:
-                    task_counts = task_counts.to(model.device)
+                # Expand gene embeddings to batch: [n_genes, d_model] → [B, n_genes, d_model]
+                gene_embeds_batch = gene_embeds.unsqueeze(0).expand(B_cur, -1, -1)
 
-                merged_embs = model.__class__.resize_batch(emb, gene_embeds, task_counts=task_counts, ds_emb=ds_emb)
-                logprobs_batch = model.binary_decoder(merged_embs)
+                # _decode handles gene_proj, cell_proj, rda, ds_emb concatenation
+                # Use task_counts_batch for RDA computation (mean non-zero expression)
+                logprobs_batch = model._decode(gene_embeds_batch, task_counts_batch, emb, ds_emb=ds_emb)
+                # For discrete models, convert bin logits to continuous values
+                logprobs_batch = model.decode_to_continuous(logprobs_batch)
                 logprobs_batch = logprobs_batch.detach().cpu().float().numpy()
-                logprob_batches.append(logprobs_batch.squeeze())
+                logprob_batches.append(logprobs_batch)
 
     # Combine batches
     logprob_batches = np.vstack(logprob_batches)
     emb_combined = np.vstack(emb_batches)
-    ds_emb_combined = np.vstack(ds_emb_batches)
-    adata.obsm["X_emb"] = np.concatenate([emb_combined, ds_emb_combined], axis=-1)
+    if ds_emb_batches:
+        ds_emb_combined = np.vstack(ds_emb_batches)
+        adata.obsm["X_emb"] = np.concatenate([emb_combined, ds_emb_combined], axis=-1)
+    else:
+        adata.obsm["X_emb"] = emb_combined
 
     # Create predictions DataFrame
     probs_df = pd.DataFrame(logprob_batches)

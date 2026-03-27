@@ -78,13 +78,27 @@ def create_dataloader(
         gene_column=gene_column,
     )
     if sentence_collator is None:
-        sentence_collator = VCIDatasetSentenceCollator(
-            cfg,
-            valid_gene_mask=dataset.valid_gene_index,
-            ds_emb_mapping_inference=dataset.ds_emb_map,
-            is_train=False,
-            precision=precision,
-        )
+        tokenizer_type = getattr(cfg.model, "tokenizer", "sentence") if hasattr(cfg, "model") else "sentence"
+        if tokenizer_type == "latent":
+            from ..nn.tokenizer import LatentCollator
+            emb_cfg = utils.get_embedding_cfg(cfg)
+            n_genes = int(getattr(emb_cfg, "num", 19790) or 19790)
+            k_top = getattr(cfg.model, "k_top", None)
+            sentence_collator = LatentCollator(
+                cfg=cfg,
+                ds_emb_mapping=dataset.ds_emb_map,
+                n_genes=n_genes,
+                is_train=False,
+                k_top=k_top,
+            )
+        else:
+            sentence_collator = VCIDatasetSentenceCollator(
+                cfg,
+                valid_gene_mask=dataset.valid_gene_index,
+                ds_emb_mapping_inference=dataset.ds_emb_map,
+                is_train=False,
+                precision=precision,
+            )
 
     # validation should not use cell augmentations
     sentence_collator.training = False
