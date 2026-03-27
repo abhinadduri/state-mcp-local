@@ -124,9 +124,16 @@ class CheckpointManager:
         return checkpoint
 
     def save(self, model, optimizer, scheduler, step, epoch, best_val_loss,
-             metric_value=None, run_name=""):
-        """Save checkpoint with optional metric tracking."""
+             metric_value=None, run_name="", rank=0):
+        """Save checkpoint with optional metric tracking.
+
+        All ranks must call this (FSDP2 all-gathers in _build_checkpoint),
+        but only rank 0 writes to disk.
+        """
         checkpoint = self._build_checkpoint(model, optimizer, scheduler, step, epoch, best_val_loss)
+
+        if rank != 0:
+            return None
 
         # Always save last
         last_path = os.path.join(self.dirpath, "last.pt")
@@ -148,9 +155,15 @@ class CheckpointManager:
 
         return last_path
 
-    def save_periodic(self, model, optimizer, scheduler, step, epoch, best_val_loss):
-        """Save periodic checkpoint (last.pt only, no metric tracking)."""
+    def save_periodic(self, model, optimizer, scheduler, step, epoch, best_val_loss, rank=0):
+        """Save periodic checkpoint (last.pt only, no metric tracking).
+
+        All ranks must call this (FSDP2 all-gathers in _build_checkpoint),
+        but only rank 0 writes to disk.
+        """
         checkpoint = self._build_checkpoint(model, optimizer, scheduler, step, epoch, best_val_loss)
+        if rank != 0:
+            return None
         last_path = os.path.join(self.dirpath, "last.pt")
         torch.save(checkpoint, last_path)
         return last_path
@@ -686,18 +699,21 @@ def main(cfg):
                                 step=global_step,
                             )
 
-                        if val_loss < best_val_loss:
-                            best_val_loss = val_loss
-                        ckpt_mgr.save(
-                            model, optimizer, scheduler, global_step, epoch,
-                            best_val_loss, metric_value=val_loss, run_name=run_name,
-                        )
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                    # All ranks must call save (FSDP2 all-gathers state dicts);
+                    # only rank 0 writes to disk.
+                    ckpt_mgr.save(
+                        model, optimizer, scheduler, global_step, epoch,
+                        best_val_loss, metric_value=val_loss, run_name=run_name,
+                        rank=local_rank,
+                    )
 
                     model.train()
 
-                # Periodic checkpoint
-                if is_main and ckpt_interval > 0 and global_step % ckpt_interval == 0:
-                    ckpt_mgr.save_periodic(model, optimizer, scheduler, global_step, epoch, best_val_loss)
+                # Periodic checkpoint — all ranks participate for FSDP2, rank 0 writes
+                if ckpt_interval > 0 and global_step % ckpt_interval == 0:
+                    ckpt_mgr.save_periodic(model, optimizer, scheduler, global_step, epoch, best_val_loss, rank=local_rank)
 
                 # Max steps check
                 if 0 < max_steps <= global_step:
@@ -721,29 +737,29 @@ def main(cfg):
         print(f"  peak GPU mem: {torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
         print(f"{'='*60}")
 
-    # --- Final checkpoint ---
+    # --- Final checkpoint (all ranks gather state dicts for FSDP2, rank 0 writes) ---
+    final_path = os.path.join(ckpt_dir, f"{run_name}_final.pt")
+    raw_model = model.module if isinstance(model, DDP) else model
+    try:
+        from torch.distributed.checkpoint.state_dict import (
+            get_model_state_dict, get_optimizer_state_dict, StateDictOptions,
+        )
+        full_opts = StateDictOptions(full_state_dict=True)
+        model_sd = get_model_state_dict(raw_model, options=full_opts)
+        optim_sd = get_optimizer_state_dict(raw_model, optimizer, options=full_opts)
+    except (ImportError, TypeError):
+        model_sd = raw_model.state_dict()
+        optim_sd = optimizer.state_dict()
+    checkpoint = {
+        "model": model_sd,
+        "optimizer": optim_sd,
+        "scheduler": scheduler.state_dict(),
+        "step": global_step,
+        "epoch": epoch if 'epoch' in dir() else 0,
+        "best_val_loss": best_val_loss,
+    }
+    raw_model.on_save_checkpoint(checkpoint)
     if is_main:
-        final_path = os.path.join(ckpt_dir, f"{run_name}_final.pt")
-        raw_model = model.module if isinstance(model, DDP) else model
-        try:
-            from torch.distributed.checkpoint.state_dict import (
-                get_model_state_dict, get_optimizer_state_dict, StateDictOptions,
-            )
-            full_opts = StateDictOptions(full_state_dict=True)
-            model_sd = get_model_state_dict(raw_model, options=full_opts)
-            optim_sd = get_optimizer_state_dict(raw_model, optimizer, options=full_opts)
-        except (ImportError, TypeError):
-            model_sd = raw_model.state_dict()
-            optim_sd = optimizer.state_dict()
-        checkpoint = {
-            "model": model_sd,
-            "optimizer": optim_sd,
-            "scheduler": scheduler.state_dict(),
-            "step": global_step,
-            "epoch": epoch if 'epoch' in dir() else 0,
-            "best_val_loss": best_val_loss,
-        }
-        raw_model.on_save_checkpoint(checkpoint)
         torch.save(checkpoint, final_path)
         print(f"Saved final checkpoint to {final_path}")
 
