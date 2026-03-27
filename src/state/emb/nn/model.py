@@ -289,6 +289,15 @@ class StateEmbeddingModel(nn.Module):
             dataset_loss = self.dataset_loss(dataset_pred, dataset_labels)
             loss = loss + dataset_loss
 
+        # MoE auxiliary losses (load balancing + router z-loss)
+        moe_cfg = self.cfg.model.get("moe", None) if self.cfg else None
+        if self.training and moe_cfg is not None and getattr(moe_cfg, "enable", False):
+            from .moe import collect_moe_aux_losses
+
+            moe_losses = collect_moe_aux_losses(self)
+            loss = loss + getattr(moe_cfg, "load_balance_weight", 0.01) * moe_losses["moe_load_balance"]
+            loss = loss + getattr(moe_cfg, "router_z_weight", 0.001) * moe_losses["moe_router_z"]
+
         return loss
 
     def update_config(self, new_cfg):

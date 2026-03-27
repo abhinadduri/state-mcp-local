@@ -18,8 +18,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .flash_transformer import FlashTransformerEncoderLayer, FlashTransformerEncoder
+from .moe import MoETransformerEncoderLayer
 
 log = logging.getLogger(__name__)
+
+
+def _build_transformer_layers(d_model, nhead, d_hid, nlayers, dropout, cfg=None):
+    """Build transformer layers, optionally replacing every moe_freq-th with MoE."""
+    moe_cfg = cfg.model.get("moe", None) if cfg else None
+    use_moe = moe_cfg is not None and getattr(moe_cfg, "enable", False)
+
+    if not use_moe:
+        return [FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout) for _ in range(nlayers)]
+
+    num_experts = getattr(moe_cfg, "num_experts", 8)
+    top_k = getattr(moe_cfg, "top_k", 2)
+    moe_freq = getattr(moe_cfg, "moe_freq", 2)
+    num_shared = getattr(moe_cfg, "num_shared_experts", 0)
+
+    layers = []
+    for i in range(nlayers):
+        if (i + 1) % moe_freq == 0:
+            layers.append(MoETransformerEncoderLayer(
+                d_model, nhead, d_hid, num_experts=num_experts, top_k=top_k,
+                dropout=dropout, num_shared_experts=num_shared,
+            ))
+        else:
+            layers.append(FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout))
+
+    n_moe = sum(1 for l in layers if isinstance(l, MoETransformerEncoderLayer))
+    shared_str = f", {num_shared} shared" if num_shared > 0 else ""
+    log.info(f"Built {nlayers} layers: {n_moe} MoE ({num_experts}E, top-{top_k}{shared_str}), {nlayers - n_moe} dense")
+    return layers
 
 
 class SkipBlock(nn.Module):
@@ -97,9 +127,9 @@ class SentenceTokenizer(Tokenizer):
             nn.SiLU(),
         )
 
-        # Transformer
+        # Transformer (supports mixed dense + MoE layers via config)
         grad_ckpt = cfg and getattr(cfg.model, "gradient_checkpointing", False)
-        layers = [FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout) for _ in range(nlayers)]
+        layers = _build_transformer_layers(d_model, nhead, d_hid, nlayers, dropout, cfg)
         self.transformer_encoder = FlashTransformerEncoder(layers, gradient_checkpointing=grad_ckpt)
         if compiled:
             self.transformer_encoder = torch.compile(self.transformer_encoder)
@@ -483,8 +513,8 @@ class LatentTokenizer(Tokenizer):
         else:
             self.dataset_token = None
 
-        # Self-attention transformer (operates on n_latent + CLS tokens)
-        layers = [FlashTransformerEncoderLayer(d_model, nhead, d_hid, dropout=dropout) for _ in range(nlayers)]
+        # Self-attention transformer (operates on n_latent + CLS tokens, supports MoE)
+        layers = _build_transformer_layers(d_model, nhead, d_hid, nlayers, dropout, cfg)
         self.transformer_encoder = FlashTransformerEncoder(layers, gradient_checkpointing=self._gradient_checkpointing)
         if compiled:
             self.transformer_encoder = torch.compile(self.transformer_encoder)

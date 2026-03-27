@@ -1,0 +1,20 @@
+# SE ~5.4B MoE — ~5.4B total, ~2.1B active per token
+# 8 experts, top-2, MoE every 2nd layer
+# Fewer experts = fewer FSDP2 all-gather calls = more stable NCCL
+model:
+  emsize: 2048
+  d_hid: 8192
+  output_dim: 2048
+  nlayers: 32
+  nhead: 32
+  n_latent: 512
+  n_cross_attn_rounds: 2
+  batch_size: 14
+  gradient_checkpointing: false
+  moe:
+    enable: true
+    num_experts: 8
+    top_k: 2
+    moe_freq: 2
+    load_balance_weight: 0.01
+    router_z_weight: 0.001

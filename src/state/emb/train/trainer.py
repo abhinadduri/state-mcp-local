@@ -173,12 +173,15 @@ def apply_fsdp2(model):
     """Apply FSDP2 partial sharding to the model.
 
     Shards each transformer encoder layer individually (95% of params for 7B).
+    For MoE layers, also shards the MoE FFN sub-module for finer granularity.
     Also shards cross-attention blocks if present (LatentTokenizer).
     The root fully_shard handles remaining params + gradient synchronization.
     """
     from torch.distributed._composable.fsdp import fully_shard
 
     # Shard each transformer layer (these hold 95%+ of params)
+    # MoE layers use stacked expert weights — FSDP2 shards the whole layer
+    # as one unit, which is simpler and produces fewer all-gather calls.
     for layer in model.tokenizer.transformer_encoder.layers:
         fully_shard(layer)
 
@@ -421,6 +424,33 @@ def main(cfg):
     with torch.amp.autocast("cuda", dtype=torch.bfloat16):
         model.tokenizer._get_esm2_proj_table(model.tokenizer.pe_embedding.weight.device)
 
+    # --- Expert Parallelism (if enabled) ---
+    moe_cfg = cfg.model.get("moe", None)
+    use_ep = (moe_cfg is not None and getattr(moe_cfg, "enable", False)
+              and getattr(moe_cfg, "expert_parallel", False)
+              and is_distributed)
+    if use_ep:
+        from ..nn.moe import enable_expert_parallel
+        ep_group = dist.group.WORLD
+        enable_expert_parallel(model, ep_group)
+        n_experts = getattr(moe_cfg, "num_experts", 8)
+        print(f"Expert parallelism enabled: {n_experts} experts across {world_size} GPUs")
+
+        # Correct FLOPS for EP: the measurement above counted all E experts on rank 0,
+        # but with EP each GPU only runs E/world_size experts. Scale down accordingly.
+        # The expert FFN FLOPs dominate in MoE, so scale by (top_k / num_experts).
+        if is_main and flops_per_batch and flops_per_batch > 0:
+            top_k = getattr(moe_cfg, "top_k", 2)
+            # Pre-EP FLOPs counted all E experts; active FLOPs use only top_k
+            scale = top_k / n_experts
+            # But attention + shared experts are fully counted, not scaled.
+            # Approximation: expert FFN is ~80% of total FLOPs for MoE models.
+            # active_flops ≈ total * (0.2 + 0.8 * top_k/E)
+            moe_frac = 0.8  # expert FFN fraction of total FLOPs (approximate)
+            ep_scale = (1.0 - moe_frac) + moe_frac * scale
+            flops_per_batch = int(flops_per_batch * ep_scale)
+            print(f"EP-corrected FLOPs per batch (scale={ep_scale:.3f}): {flops_per_batch:,}")
+
     # --- Apply distributed strategy ---
     if use_fsdp:
         model = apply_fsdp2(model)
@@ -534,15 +564,25 @@ def main(cfg):
     microstep = global_step * grad_accum
     done = False
 
+    # Log dataset and training stats
+    batches_per_epoch = len(train_dataloader)
+    steps_per_epoch_actual = batches_per_epoch // grad_accum
+    if is_main:
+        n_train_cells = len(train_dataloader.dataset)
+        print(f"Dataset: {n_train_cells:,} cells, {batches_per_epoch:,} batches/epoch "
+              f"(bs={cfg.model.batch_size}×{world_size} GPUs), "
+              f"{steps_per_epoch_actual:,} optimizer steps/epoch (grad_accum={grad_accum})")
+
     for epoch in range(start_epoch, cfg.experiment.num_epochs):
         if done:
             break
         if is_distributed and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        pbar = tqdm(total=max_steps - global_step if max_steps > 0 else None,
+        pbar_total = max_steps - global_step if max_steps > 0 else steps_per_epoch_actual
+        pbar = tqdm(total=pbar_total,
                     desc=f"Epoch {epoch}", disable=not is_main, dynamic_ncols=True,
-                    initial=global_step)
+                    initial=global_step if max_steps > 0 else 0)
         accum_start = None
 
         for batch in train_dataloader:
@@ -622,16 +662,20 @@ def main(cfg):
                 if is_main and global_step % log_interval == 0 and wandb_run:
                     import wandb
 
-                    wandb.log(
-                        {
-                            "trainer/train_loss": loss.item(),
-                            "trainer/learning_rate": lr,
-                            "perf/cells_per_sec": cells_per_sec,
-                            "perf/mfu": mfu,
-                            "cumulative_flops": float(cumulative_flops),
-                        },
-                        step=global_step,
-                    )
+                    log_dict = {
+                        "trainer/train_loss": loss.item(),
+                        "trainer/learning_rate": lr,
+                        "perf/cells_per_sec": cells_per_sec,
+                        "perf/mfu": mfu,
+                        "cumulative_flops": float(cumulative_flops),
+                    }
+                    moe_cfg = cfg.model.get("moe", None)
+                    if moe_cfg is not None and getattr(moe_cfg, "enable", False):
+                        from ..nn.moe import collect_moe_aux_losses
+                        moe_losses = collect_moe_aux_losses(raw_model)
+                        log_dict["moe/load_balance_loss"] = moe_losses["moe_load_balance"].item()
+                        log_dict["moe/router_z_loss"] = moe_losses["moe_router_z"].item()
+                    wandb.log(log_dict, step=global_step)
 
                 # Validation
                 if val_interval > 0 and limit_val_batches > 0 and global_step % val_interval == 0:
