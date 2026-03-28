@@ -637,7 +637,9 @@ def main(cfg):
 
             if microstep % grad_accum == 0:
                 if not use_fsdp:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                else:
+                    grad_norm = None
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -688,6 +690,8 @@ def main(cfg):
                         "perf/mfu": mfu,
                         "cumulative_flops": float(cumulative_flops),
                     }
+                    if grad_norm is not None:
+                        log_dict["trainer/grad_norm"] = float(grad_norm)
                     moe_cfg = cfg.model.get("moe", None)
                     if moe_cfg is not None and getattr(moe_cfg, "enable", False):
                         from ..nn.moe import collect_moe_aux_losses

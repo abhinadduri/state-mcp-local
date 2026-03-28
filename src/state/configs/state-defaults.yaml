@@ -252,7 +252,7 @@ optimizer:
   schedule_steps: -1  # -1 = use total training steps
   weight_decay: 0.1
   start: 0.33
-  max_grad_norm: 2.0
+  max_grad_norm: 1.0
   gradient_accumulation_steps: 8
   reset_lr_on_restart: false
   zclip: false
