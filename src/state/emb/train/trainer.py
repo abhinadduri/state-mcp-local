@@ -187,15 +187,13 @@ def apply_fsdp2(model):
     """Apply FSDP2 partial sharding to the model.
 
     Shards each transformer encoder layer individually (95% of params for 7B).
-    For MoE layers, also shards the MoE FFN sub-module for finer granularity.
     Also shards cross-attention blocks if present (LatentTokenizer).
     The root fully_shard handles remaining params + gradient synchronization.
     """
     from torch.distributed._composable.fsdp import fully_shard
 
-    # Shard each transformer layer (these hold 95%+ of params)
-    # MoE layers use stacked expert weights — FSDP2 shards the whole layer
-    # as one unit, which is simpler and produces fewer all-gather calls.
+    # Shard each transformer layer as one unit — produces fewer all-gather
+    # calls and allows the compiler to pipeline communication with compute.
     for layer in model.tokenizer.transformer_encoder.layers:
         fully_shard(layer)
 
@@ -573,6 +571,27 @@ def main(cfg):
     profiling = cfg.experiment.profile.enable_profiler
     profile_steps = cfg.experiment.profile.profile_steps if profiling else [0, 0]
 
+    # --- PyTorch profiler setup ---
+    torch_profiler = None
+    if profiling and is_main:
+        import torch.profiler as tprof
+        _trace_dir = f"/tmp/torch_profile_{cfg.experiment.name}"
+        os.makedirs(_trace_dir, exist_ok=True)
+        _prof_start = profile_steps[0]
+        _prof_end = profile_steps[1]
+        _prof_warmup = max(1, (_prof_end - _prof_start) // 4)
+        _prof_active = _prof_end - _prof_start - _prof_warmup
+        torch_profiler = tprof.profile(
+            activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA],
+            schedule=tprof.schedule(wait=_prof_start, warmup=_prof_warmup, active=_prof_active, repeat=1),
+            on_trace_ready=tprof.tensorboard_trace_handler(_trace_dir),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+        )
+        torch_profiler.start()
+        print(f"[Profiler] PyTorch profiler started. Trace will be saved to: {_trace_dir}")
+
     # --- Training loop ---
     log_interval = 100
     microstep = global_step * grad_accum
@@ -622,18 +641,58 @@ def main(cfg):
             else:
                 sync_context = nullcontext()
 
+            # CUDA Event timing (only in profiling mode, main rank only)
+            if profiling and is_main and profile_steps[0] <= microstep < profile_steps[1]:
+                _t0_fwd = torch.cuda.Event(enable_timing=True)
+                _t1_fwd = torch.cuda.Event(enable_timing=True)
+                _t0_bwd = torch.cuda.Event(enable_timing=True)
+                _t1_bwd = torch.cuda.Event(enable_timing=True)
+                _t0_fwd.record()
+
             with sync_context:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     loss = model(batch)
 
+                if profiling and is_main and profile_steps[0] <= microstep < profile_steps[1]:
+                    _t1_fwd.record()
+                    _t0_bwd.record()
+
                 loss_scaled = loss / grad_accum
                 loss_scaled.backward()
+
+                if profiling and is_main and profile_steps[0] <= microstep < profile_steps[1]:
+                    _t1_bwd.record()
+
             microstep += 1
+
+            if profiling and is_main and profile_steps[0] <= microstep <= profile_steps[1]:
+                torch.cuda.synchronize()
+                try:
+                    _fwd_ms = _t0_fwd.elapsed_time(_t1_fwd)
+                    _bwd_ms = _t0_bwd.elapsed_time(_t1_bwd)
+                    print(f"[ProfStep {microstep-1}] fwd={_fwd_ms:.1f}ms  bwd={_bwd_ms:.1f}ms  total={_fwd_ms+_bwd_ms:.1f}ms")
+                except Exception:
+                    pass
+
+            # PyTorch profiler step
+            if torch_profiler is not None and microstep <= profile_steps[1]:
+                torch_profiler.step()
 
             # NSys profiling end
             if profiling and microstep == profile_steps[1]:
                 log.info(f"Stopping NSys profiling at microstep {microstep}")
                 torch.cuda.nvtx.range_pop()
+                if torch_profiler is not None:
+                    torch_profiler.stop()
+                    print(f"[Profiler] PyTorch profiler stopped. Trace saved to: {_trace_dir}")
+                    # Print top ops summary (torch_profiler only exists on is_main rank)
+                    _key_avgs = torch_profiler.key_averages()
+                    print("\n[Profiler] Top 20 CUDA ops by self CUDA time:")
+                    print(_key_avgs.table(sort_by="self_cuda_time_total", row_limit=20))
+                    print("\n[Profiler] Top 20 ops by total CUDA time:")
+                    print(_key_avgs.table(sort_by="cuda_time_total", row_limit=20))
+                    print("\n[Profiler] Top 20 ops by CPU time:")
+                    print(_key_avgs.table(sort_by="self_cpu_time_total", row_limit=20))
 
             if microstep % grad_accum == 0:
                 if not use_fsdp:

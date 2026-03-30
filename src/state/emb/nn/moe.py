@@ -15,8 +15,16 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 
 log = logging.getLogger(__name__)
+
+
+@torch.compiler.disable
+def _ep_all_to_all(recv: torch.Tensor, send: torch.Tensor, group) -> torch.Tensor:
+    """Thin wrapper so all_to_all_single is a minimal graph break for torch.compile."""
+    dist.all_to_all_single(recv, send, group=group)
+    return recv
 
 
 class TopKRouter(nn.Module):
@@ -131,8 +139,6 @@ class MoEFFN(nn.Module):
         Supports num_experts > world_size (e.g., 32 experts on 8 GPUs = 4 per GPU).
         Call after model init but before FSDP2 wrapping.
         """
-        import torch.distributed as dist
-
         self._ep_group = process_group
         self._ep_rank = dist.get_rank(process_group)
         self._ep_size = dist.get_world_size(process_group)
@@ -192,127 +198,96 @@ class MoEFFN(nn.Module):
         return output.reshape(B, T, D)
 
     def _forward_ep(self, x_flat, top_k_weights, top_k_indices):
-        """Expert parallel forward: all-to-all dispatch → local experts (bmm) → all-to-all combine.
+        """Expert parallel forward using fixed-capacity padded all-to-all.
 
-        Supports multiple experts per GPU (e.g., 32 experts on 8 GPUs = 4 per GPU).
-        Tokens for this rank's experts are grouped and processed via bmm.
+        All tensor shapes are static (determined by batch_size and model config),
+        so torch.compile can trace through everything except the all-to-all calls
+        themselves (which use minimal graph breaks via _ep_all_to_all).
         """
-        import torch.distributed as dist
-
         N, D = x_flat.shape
         E = self.num_experts
         K = self.top_k
         ep_group = self._ep_group
         ep_size = self._ep_size
-        epr = self._experts_per_rank  # experts per rank
-        comm_dtype = torch.bfloat16
+        epr = self._experts_per_rank
 
-        # Flatten top-k selections
-        flat_experts = top_k_indices.reshape(-1)  # [N*K]
+        M = N * K  # total token-expert assignments
+
+        # Fixed capacity per expert, bucketed for stable shapes
+        _BUCKET = 64
+        avg = (M + E - 1) // E
+        C = avg + avg // 8  # 12.5% headroom (load balance loss keeps routing uniform)
+        C = ((C + _BUCKET - 1) // _BUCKET) * _BUCKET
+
+        # ---- Phase 1: Pack tokens into padded [E, C, D] ----
+        flat_experts = top_k_indices.reshape(-1)  # [M]
         flat_weights = top_k_weights.reshape(-1)
         flat_token_idx = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(-1, K).reshape(-1)
 
-        # Sort by expert
         sort_idx = flat_experts.argsort()
         sorted_token_idx = flat_token_idx[sort_idx]
         sorted_experts = flat_experts[sort_idx]
         sorted_weights = flat_weights[sort_idx]
 
-        # Count tokens per expert
-        local_counts = torch.zeros(E, dtype=torch.long, device=x_flat.device)
-        local_counts.scatter_add_(0, sorted_experts, torch.ones_like(sorted_experts, dtype=torch.long))
+        counts = torch.zeros(E, dtype=torch.long, device=x_flat.device)
+        counts.scatter_add_(0, sorted_experts, torch.ones(M, dtype=torch.long, device=x_flat.device))
 
-        # For all-to-all: group counts by rank (sum experts per rank)
-        # rank r owns experts [r*epr, (r+1)*epr)
-        rank_send_counts = local_counts.reshape(ep_size, epr).sum(dim=1)  # [ep_size]
+        offsets = torch.zeros(E + 1, dtype=torch.long, device=x_flat.device)
+        torch.cumsum(counts, dim=0, out=offsets[1:])
+        expert_ids = torch.repeat_interleave(torch.arange(E, device=x_flat.device), counts)
+        positions = torch.arange(M, device=x_flat.device) - offsets[expert_ids]
 
-        # Exchange rank-level counts
-        rank_recv_counts = torch.empty_like(rank_send_counts)
-        dist.all_to_all_single(rank_recv_counts, rank_send_counts, group=ep_group)
+        keep = positions < C
+        pos_clamped = positions.clamp(max=C - 1)
 
-        input_splits = rank_send_counts.tolist()
-        output_splits = rank_recv_counts.tolist()
+        # Pre-weight and pack into padded buffer
+        weighted = (x_flat[sorted_token_idx] * sorted_weights.unsqueeze(-1)).to(torch.bfloat16)
+        padded_send = weighted.new_zeros(E, C, D)
+        padded_send[expert_ids, pos_clamped] = weighted * keep.unsqueeze(-1).to(weighted.dtype)
 
-        # Gather sorted tokens and pre-weight
-        sorted_tokens = x_flat[sorted_token_idx]
-        sorted_weighted = (sorted_tokens * sorted_weights.unsqueeze(-1)).to(comm_dtype)
+        # ---- Phase 2: Fixed-size all-to-all dispatch ----
+        # [E, C, D] → [ep_size * epr * C, D]; experts are in rank order naturally
+        send_flat = padded_send.reshape(-1, D).contiguous()
+        recv_flat = _ep_all_to_all(torch.empty_like(send_flat), send_flat, ep_group)
 
-        # All-to-all dispatch
-        recv_total = sum(output_splits)
-        recv_tokens = torch.empty(recv_total, D, device=x_flat.device, dtype=comm_dtype)
-        dist.all_to_all_single(recv_tokens, sorted_weighted,
-                               output_split_sizes=output_splits,
-                               input_split_sizes=input_splits,
-                               group=ep_group)
+        # ---- Phase 3: Local expert BMM ----
+        # recv: [ep_size, epr, C, D] → merge sources → [epr, ep_size*C, D]
+        recv = recv_flat.reshape(ep_size, epr, C, D)
+        recv_merged = recv.permute(1, 0, 2, 3).reshape(epr, ep_size * C, D)
 
-        # We also need to know which local expert each received token goes to.
-        # Exchange the per-expert counts (not just per-rank) for local routing.
-        local_expert_counts = local_counts.clone()
-        recv_expert_counts = torch.empty_like(local_expert_counts)
-        dist.all_to_all_single(recv_expert_counts, local_expert_counts, group=ep_group)
-        # recv_expert_counts[e] = how many tokens were sent to expert e from all ranks
-        # Our local experts are indices [rank*epr, (rank+1)*epr)
-        my_start = self._ep_rank * epr
-        my_expert_counts = recv_expert_counts[my_start:my_start + epr]  # [epr]
+        w1 = self.w1.to(torch.bfloat16)
+        b1 = self.b1.to(torch.bfloat16)
+        w2 = self.w2.to(torch.bfloat16)
+        b2 = self.b2.to(torch.bfloat16)
 
-        # Local expert computation via bmm on this rank's experts
-        w1 = self.w1.to(comm_dtype)  # [epr, D, H]
-        b1 = self.b1.to(comm_dtype)  # [epr, 1, H]
-        w2 = self.w2.to(comm_dtype)  # [epr, H, D]
-        b2 = self.b2.to(comm_dtype)  # [epr, 1, D]
+        h = torch.bmm(recv_merged, w1) + b1
+        h = F.gelu(h)
+        if self.dropout_p > 0 and self.training:
+            h = F.dropout(h, p=self.dropout_p, training=True)
+        out = torch.bmm(h, w2) + b2  # [epr, ep_size*C, D]
 
-        if epr == 1:
-            # Single expert per GPU: simple matmul
-            h = F.gelu(recv_tokens @ w1.squeeze(0) + b1.squeeze(0).squeeze(0))
-            if self.dropout_p > 0 and self.training:
-                h = F.dropout(h, p=self.dropout_p, training=True)
-            expert_out = h @ w2.squeeze(0) + b2.squeeze(0).squeeze(0)
-        else:
-            # Multiple experts per GPU: pad and bmm
-            max_tok = my_expert_counts.max() if my_expert_counts.numel() > 0 else torch.tensor(0)
-            max_tok_val = max_tok.item() if max_tok.numel() == 1 else int(max_tok)
-            if max_tok_val == 0:
-                expert_out = recv_tokens.new_zeros(recv_total, D)
-            else:
-                # Split recv_tokens by local expert
-                padded = recv_tokens.new_zeros(epr, max_tok_val, D)
-                offsets = torch.zeros(epr + 1, dtype=torch.long, device=x_flat.device)
-                torch.cumsum(my_expert_counts, dim=0, out=offsets[1:])
-                for e in range(epr):
-                    cnt = my_expert_counts[e].item()
-                    if cnt > 0:
-                        padded[e, :cnt] = recv_tokens[offsets[e]:offsets[e+1]]
+        # ---- Phase 4: Fixed-size all-to-all combine ----
+        out_send = out.reshape(epr, ep_size, C, D).permute(1, 0, 2, 3).contiguous()
+        send_back = out_send.reshape(-1, D)
+        recv_back_flat = _ep_all_to_all(torch.empty_like(send_back), send_back, ep_group)
 
-                h = torch.bmm(padded, w1) + b1
-                h = F.gelu(h)
-                if self.dropout_p > 0 and self.training:
-                    h = F.dropout(h, p=self.dropout_p, training=True)
-                out_padded = torch.bmm(h, w2) + b2  # [epr, max_tok, D]
-
-                # Unpad
-                expert_out = recv_tokens.new_zeros(recv_total, D)
-                for e in range(epr):
-                    cnt = my_expert_counts[e].item()
-                    if cnt > 0:
-                        expert_out[offsets[e]:offsets[e+1]] = out_padded[e, :cnt]
-
-        # All-to-all combine: send results back
-        send_back = torch.empty(N * K, D, device=x_flat.device, dtype=comm_dtype)
-        dist.all_to_all_single(send_back, expert_out,
-                               output_split_sizes=input_splits,
-                               input_split_sizes=output_splits,
-                               group=ep_group)
+        # ---- Phase 5: Unpack valid results ----
+        recv_back = recv_back_flat.reshape(E, C, D)
+        results = recv_back[expert_ids, pos_clamped].to(x_flat.dtype)
+        results = results * keep.unsqueeze(-1).to(results.dtype)
 
         # Unsort and accumulate over top-K
-        output = torch.zeros(N, D, device=x_flat.device, dtype=x_flat.dtype)
         unsort_idx = sort_idx.argsort()
-        unsorting = send_back[unsort_idx].to(x_flat.dtype)
-        output = unsorting.reshape(N, K, D).sum(dim=1)
+        output = results[unsort_idx].reshape(N, K, D).sum(dim=1)
 
         return output
 
     def _forward_bmm(self, x_flat, top_k_weights, top_k_indices):
-        """Padded bmm forward (no EP)."""
+        """Padded bmm forward (no EP).
+
+        Uses fixed-capacity padding (rounded up to a bucket) so that
+        torch.compile sees a stable tensor shape and avoids recompilation.
+        """
         N, D = x_flat.shape
         E = self.num_experts
         K = self.top_k
@@ -329,19 +304,31 @@ class MoEFFN(nn.Module):
 
         expert_counts = torch.zeros(E, dtype=torch.long, device=x_flat.device)
         expert_counts.scatter_add_(0, sorted_experts, torch.ones(M, dtype=torch.long, device=x_flat.device))
-        max_tokens = expert_counts.max()
+
+        # Fixed capacity: ceil(average tokens per expert × 1.25), bucketed to
+        # a multiple of 64 for stable shapes under torch.compile.  Any tokens
+        # that exceed capacity are silently dropped (extremely rare with
+        # load-balancing loss active).
+        _BUCKET = 64
+        capacity = (M + E - 1) // E  # ceil(average)
+        capacity = capacity + capacity // 4  # +25 %
+        capacity = ((capacity + _BUCKET - 1) // _BUCKET) * _BUCKET
 
         offsets = torch.zeros(E, dtype=torch.long, device=x_flat.device)
         torch.cumsum(expert_counts[:-1], dim=0, out=offsets[1:])
         global_pos = torch.arange(M, device=x_flat.device)
         positions = global_pos - offsets[sorted_experts]
 
-        padded_tokens = x_flat.new_zeros(E, max_tokens, D)
-        padded_weights = x_flat.new_zeros(E, max_tokens)
-        padded_out_idx = torch.zeros(E, max_tokens, dtype=torch.long, device=x_flat.device)
+        # Clamp positions to capacity — overflow tokens (if any) are dropped
+        keep_mask = positions < capacity
+        positions = positions.clamp(max=capacity - 1)
 
-        padded_tokens[sorted_experts, positions] = x_flat[sorted_token_idx]
-        padded_weights[sorted_experts, positions] = sorted_weights
+        padded_tokens = x_flat.new_zeros(E, capacity, D)
+        padded_weights = x_flat.new_zeros(E, capacity)
+        padded_out_idx = torch.zeros(E, capacity, dtype=torch.long, device=x_flat.device)
+
+        padded_tokens[sorted_experts, positions] = x_flat[sorted_token_idx] * keep_mask.unsqueeze(-1).to(x_flat.dtype)
+        padded_weights[sorted_experts, positions] = sorted_weights * keep_mask.to(sorted_weights.dtype)
         padded_out_idx[sorted_experts, positions] = sorted_token_idx
 
         h = torch.bmm(padded_tokens, self.w1) + self.b1
