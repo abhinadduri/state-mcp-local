@@ -35,12 +35,18 @@ class TopKRouter(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.gate = nn.Linear(d_model, num_experts, bias=False)
+        # Small init prevents early routing imbalance (ST-MoE recommendation)
+        nn.init.trunc_normal_(self.gate.weight, std=0.001)
 
     def forward(self, x: torch.Tensor):
-        router_logits = self.gate(x)
+        # Force float32 for numerical stability (ST-MoE: bfloat16 softmax causes instability)
+        router_logits = self.gate(x).float()
+        router_logits = router_logits.clamp(-20.0, 20.0)  # safety net for softmax
         scores = F.softmax(router_logits, dim=-1)
         top_k_weights, top_k_indices = torch.topk(scores, self.top_k, dim=-1)
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        # Cast weights back to input dtype for downstream compute
+        top_k_weights = top_k_weights.to(x.dtype)
         return top_k_weights, top_k_indices, router_logits
 
 
@@ -93,6 +99,7 @@ class MoEFFN(nn.Module):
         top_k: int = 2,
         dropout: float = 0.0,
         num_shared_experts: int = 0,
+        n_layers: int = 1,
     ):
         super().__init__()
         self.d_model = d_model
@@ -107,9 +114,13 @@ class MoEFFN(nn.Module):
         self.b1 = nn.Parameter(torch.zeros(num_experts, 1, d_hid))
         self.w2 = nn.Parameter(torch.empty(num_experts, d_hid, d_model))
         self.b2 = nn.Parameter(torch.zeros(num_experts, 1, d_model))
+        import math
+        residual_scale = 1.0 / math.sqrt(2 * n_layers)
         for i in range(num_experts):
             nn.init.kaiming_uniform_(self.w1[i])
             nn.init.kaiming_uniform_(self.w2[i])
+            # Depth-scaled init on output projection (GPT-2/GPT-3 scheme)
+            self.w2.data[i] *= residual_scale
 
         # Shared experts: always active, not routed (DeepSeek-style)
         self.num_shared_experts = num_shared_experts
@@ -371,6 +382,7 @@ class MoETransformerEncoderLayer(nn.Module):
         top_k: int = 2,
         dropout: float = 0.1,
         num_shared_experts: int = 0,
+        n_layers: int = 1,
     ):
         super().__init__()
         torch.backends.cuda.enable_flash_sdp(True)
@@ -392,12 +404,19 @@ class MoETransformerEncoderLayer(nn.Module):
             top_k=top_k,
             dropout=dropout,
             num_shared_experts=num_shared_experts,
+            n_layers=n_layers,
         )
         self.norm2 = nn.LayerNorm(d_model)
 
+        # Depth-scaled init on attention output projection
+        import math
+        with torch.no_grad():
+            self.out_proj.weight *= 1.0 / math.sqrt(2 * n_layers)
+
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
-        residual = src
-        qkv = self.qkv_proj(src)
+        # Pre-norm: normalize before sublayer, add residual after
+        normed = self.norm1(src)
+        qkv = self.qkv_proj(normed)
         q, k, v = torch.chunk(qkv, 3, dim=-1)
 
         head_dim = self.d_model // self.nhead
@@ -411,11 +430,11 @@ class MoETransformerEncoderLayer(nn.Module):
         )
         attn_output = attn_output.transpose(1, 2).contiguous().view(B_size, T_size, self.d_model)
         attn_output = self.out_proj(attn_output)
-        src = self.norm1(residual + self.dropout_layer(attn_output))
+        src = src + self.dropout_layer(attn_output)
 
-        residual2 = src
-        ff_output = self.moe_ffn(src)
-        src = self.norm2(residual2 + self.dropout_layer(ff_output))
+        normed2 = self.norm2(src)
+        ff_output = self.moe_ffn(normed2)
+        src = src + self.dropout_layer(ff_output)
         return src
 
     @property

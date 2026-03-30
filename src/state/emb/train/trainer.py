@@ -57,15 +57,24 @@ def build_optimizer_and_scheduler(model, cfg, total_steps):
 
         muon_params, adamw_params = _split_muon_parameters(model)
 
-        # Move MoE router params from Muon to AdamW — the gate matrix is highly
-        # non-square (d_model × num_experts) and gets extreme Muon scaling.
-        from ..nn.moe import TopKRouter
-        router_param_ids = {id(p) for m in model.modules() if isinstance(m, TopKRouter) for p in m.parameters()}
-        if router_param_ids:
-            moved = [p for p in muon_params if id(p) in router_param_ids]
-            muon_params = [p for p in muon_params if id(p) not in router_param_ids]
+        # Move MoE router + expert params from Muon to AdamW.
+        # Router gate: highly non-square (d_model × num_experts), gets extreme Muon scaling.
+        # Expert w1/w2/b1/b2: 3D tensors [E, d, h] reshaped to [E, d*h] by Muon,
+        # producing 45x excessive scaling (sqrt(6M) vs sqrt(3k) for normal linear).
+        from ..nn.moe import TopKRouter, MoEFFN
+        moe_param_ids = set()
+        for m in model.modules():
+            if isinstance(m, TopKRouter):
+                moe_param_ids.update(id(p) for p in m.parameters())
+            elif isinstance(m, MoEFFN):
+                for name, p in m.named_parameters():
+                    if name in ("w1", "w2", "b1", "b2"):
+                        moe_param_ids.add(id(p))
+        if moe_param_ids:
+            moved = [p for p in muon_params if id(p) in moe_param_ids]
+            muon_params = [p for p in muon_params if id(p) not in moe_param_ids]
             adamw_params.extend(moved)
-        print(f"Muon: {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm params")
+        print(f"Muon: {len(muon_params)} matrix params, {len(adamw_params)} scalar/bias/norm/moe params")
         optimizer = MuonWithAuxAdamW(
             muon_params,
             adamw_params,
@@ -695,10 +704,8 @@ def main(cfg):
                     print(_key_avgs.table(sort_by="self_cpu_time_total", row_limit=20))
 
             if microstep % grad_accum == 0:
-                if not use_fsdp:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                else:
-                    grad_norm = None
+                # FSDP2 supports clip_grad_norm_ (does internal all-reduce on grad norms)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
