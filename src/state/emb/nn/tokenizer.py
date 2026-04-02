@@ -79,6 +79,10 @@ class TokenizerOutput(NamedTuple):
     task_counts: torch.Tensor  # [B, n_task] target counts
     dataset_emb: Optional[torch.Tensor]  # [B, output_dim] dataset token output
     dataset_nums: Optional[torch.Tensor]  # [B] dataset IDs for classification loss
+    latent_tokens: Optional[torch.Tensor] = None  # [B, 1+n_latent, d_model] full latent bank
+    gene_indices: Optional[torch.Tensor] = None  # [B, k_max] global gene IDs (encoder input)
+    gene_counts_original: Optional[torch.Tensor] = None  # [B, k_max] pre-mask log1p counts
+    encoder_mask: Optional[torch.Tensor] = None  # [B, k_max] bool, True=masked
 
 
 class Tokenizer(nn.Module):
@@ -462,6 +466,14 @@ class LatentTokenizer(Tokenizer):
         self.output_dim = output_dim
         self._gradient_checkpointing = cfg and getattr(cfg.model, "gradient_checkpointing", False)
 
+        # Column masking config (active only when decoder_type == "cross_attention_nb")
+        self._mask_rate_min = float(getattr(cfg.model, "mask_rate_min", 0.0)) if cfg else 0.0
+        self._mask_rate_max = float(getattr(cfg.model, "mask_rate_max", 0.0)) if cfg else 0.0
+
+        # Learned mask embedding — replaces count encoding for masked genes
+        # Distinct from zero-count: zero = "not expressed", mask = "expression unknown"
+        self.mask_token = nn.Parameter(torch.randn(1, d_model) * 0.02)
+
         # Learned gene embeddings vs frozen ESM2 + projection
         self.use_learned_embeddings = cfg and getattr(cfg.model, "use_learned_embeddings", False)
 
@@ -589,6 +601,9 @@ class LatentTokenizer(Tokenizer):
         # Gather ESM2 projected embeddings for measured genes only
         gene_embs = esm2_table[gene_indices]  # [B, k_max, d_model]
 
+        # Save original counts before masking (for NB decoder loss targets)
+        original_gene_counts = gene_counts
+
         # Count encoding for measured genes only
         if self.count_encoder is not None:
             counts_input = gene_counts.unsqueeze(-1)  # [B, k_max, 1]
@@ -597,6 +612,23 @@ class LatentTokenizer(Tokenizer):
             count_emb = torch.matmul(bin_weights, bin_embeddings)  # [B, k_max, d_model]
         else:
             count_emb = torch.zeros(B, k_max, self.d_model, device=device)
+
+        # --- Column masking: replace count encoding with learned mask token ---
+        encoder_mask = None
+        if self.training and self._mask_rate_max > 0:
+            mask_rate = torch.empty(1, device=device).uniform_(
+                self._mask_rate_min, self._mask_rate_max
+            ).item()
+            n_mask = int(k_max * mask_rate)
+            if n_mask > 0:
+                mask_cols = torch.randperm(k_max, device=device)[:n_mask]
+                encoder_mask = torch.zeros(B, k_max, dtype=torch.bool, device=device)
+                encoder_mask[:, mask_cols] = True
+                # Replace count_emb with learned mask embedding for masked genes
+                # Gene identity (gene_embs) preserved — model knows WHICH gene
+                # Expression info (count_emb) replaced — model doesn't know HOW MUCH
+                mask_expanded = encoder_mask.unsqueeze(-1)  # [B, k_max, 1]
+                count_emb = torch.where(mask_expanded, self.mask_token.expand_as(count_emb), count_emb)
 
         gene_tokens = gene_embs + count_emb  # [B, k_max, d_model]
 
@@ -626,12 +658,15 @@ class LatentTokenizer(Tokenizer):
         # --- Self-attention transformer + decoder ---
         output = self.transformer_encoder(src, src_key_padding_mask=None)
 
+        # Save full latent bank (CLS + latent tokens) for NB decoder
+        latent_bank = output[:, :1 + self.n_latent, :]  # [B, 257, d_model]
+
         # Only decode CLS (+ dataset) token — skip 256 latent tokens
         if self.dataset_token is not None:
-            output = output[:, [0, -1], :]  # [B, 2, d_model]
+            cls_ds_output = output[:, [0, -1], :]  # [B, 2, d_model]
         else:
-            output = output[:, :1, :]  # [B, 1, d_model]
-        gene_output = self.decoder(output)
+            cls_ds_output = output[:, :1, :]  # [B, 1, d_model]
+        gene_output = self.decoder(cls_ds_output)
 
         # CLS embedding
         embedding = gene_output[:, 0, :]
@@ -657,6 +692,10 @@ class LatentTokenizer(Tokenizer):
             task_counts=task_counts,
             dataset_emb=dataset_emb,
             dataset_nums=dataset_nums,
+            latent_tokens=latent_bank,
+            gene_indices=gene_indices,
+            gene_counts_original=original_gene_counts,
+            encoder_mask=encoder_mask,
         )
 
 
@@ -773,6 +812,9 @@ class TabularLatentTokenizer(LatentTokenizer):
         esm2_table = self._get_esm2_proj_table(device)
         gene_embs = esm2_table[gene_indices]
 
+        # Save original counts before masking (for NB decoder loss targets)
+        original_gene_counts = gene_counts
+
         if self.count_encoder is not None:
             counts_input = gene_counts.unsqueeze(-1)
             bin_weights = F.softmax(self.count_encoder(counts_input), dim=-1)
@@ -780,6 +822,20 @@ class TabularLatentTokenizer(LatentTokenizer):
             count_emb = torch.matmul(bin_weights, bin_embeddings)
         else:
             count_emb = torch.zeros(B, k_max, self.d_model, device=device)
+
+        # --- Column masking: replace count encoding with learned mask token ---
+        encoder_mask = None
+        if self.training and self._mask_rate_max > 0:
+            mask_rate = torch.empty(1, device=device).uniform_(
+                self._mask_rate_min, self._mask_rate_max
+            ).item()
+            n_mask = int(k_max * mask_rate)
+            if n_mask > 0:
+                mask_cols = torch.randperm(k_max, device=device)[:n_mask]
+                encoder_mask = torch.zeros(B, k_max, dtype=torch.bool, device=device)
+                encoder_mask[:, mask_cols] = True
+                mask_expanded = encoder_mask.unsqueeze(-1)
+                count_emb = torch.where(mask_expanded, self.mask_token.expand_as(count_emb), count_emb)
 
         gene_tokens = gene_embs + count_emb
 
@@ -809,12 +865,15 @@ class TabularLatentTokenizer(LatentTokenizer):
         # --- Tabular transformer (intra-cell + inter-cell attention) ---
         output = self.transformer_encoder(src, n_cells_per_set=n_cells_per_set)
 
-        # --- CLS extraction + decoder (same as LatentTokenizer) ---
+        # Save full latent bank (CLS + latent tokens) for NB decoder
+        latent_bank = output[:, :1 + self.n_latent, :]
+
+        # --- CLS extraction + decoder ---
         if self.dataset_token is not None:
-            output = output[:, [0, -1], :]
+            cls_ds_output = output[:, [0, -1], :]
         else:
-            output = output[:, :1, :]
-        gene_output = self.decoder(output)
+            cls_ds_output = output[:, :1, :]
+        gene_output = self.decoder(cls_ds_output)
 
         embedding = gene_output[:, 0, :]
         embedding = F.normalize(embedding, dim=1)
@@ -837,4 +896,8 @@ class TabularLatentTokenizer(LatentTokenizer):
             task_counts=task_counts,
             dataset_emb=dataset_emb,
             dataset_nums=dataset_nums,
+            latent_tokens=latent_bank,
+            gene_indices=gene_indices,
+            gene_counts_original=original_gene_counts,
+            encoder_mask=encoder_mask,
         )

@@ -214,6 +214,11 @@ def apply_fsdp2(model):
         for block in model.tokenizer.cross_attn_rounds:
             fully_shard(block)
 
+    # Shard NB decoder cross-attention layers if present
+    if hasattr(model, "nb_decoder") and model.nb_decoder is not None:
+        for layer in model.nb_decoder.cross_attn_layers:
+            fully_shard(layer)
+
     # Root handles remaining params (encoder, decoder, cls_token, etc.)
     # and coordinates gradient synchronization
     fully_shard(model)

@@ -20,8 +20,9 @@ from ..utils import (
     get_embedding_cfg,
     get_dataset_cfg,
 )
-from .loss import WassersteinLoss, KLDivergenceLoss, MMDLoss, TabularLoss
+from .loss import WassersteinLoss, KLDivergenceLoss, MMDLoss, TabularLoss, NegativeBinomialLoss
 from .tokenizer import Tokenizer, TokenizerOutput, SentenceTokenizer, SkipBlock
+from .decoder import CrossAttentionNBDecoder
 
 
 class StateEmbeddingModel(nn.Module):
@@ -125,6 +126,19 @@ class StateEmbeddingModel(nn.Module):
             self.criterion = TabularLoss(shared=self.cfg.dataset.S)
         else:
             raise ValueError(f"Loss {self.cfg.loss.name} not supported")
+
+        # --- NB decoder (optional, Stack-style cross-attention + NB loss) ---
+        self._decoder_type = self.cfg.model.get("decoder_type", "cls")
+        if self._decoder_type == "cross_attention_nb":
+            self.nb_decoder = CrossAttentionNBDecoder(
+                d_model=d_model,
+                nhead=cfg.model.nhead,
+                n_layers=int(cfg.model.get("nb_decoder_layers", 2)),
+                dropout=dropout,
+            )
+            self.nb_loss = NegativeBinomialLoss()
+        else:
+            self.nb_decoder = None
 
         # --- Backward compat shims ---
         self.pe_embedding = None  # Set externally; delegates to self.tokenizer.pe_embedding
@@ -265,6 +279,24 @@ class StateEmbeddingModel(nn.Module):
     def shared_step(self, batch, batch_idx=0):
         out = self.tokenizer(batch)
 
+        if self._decoder_type == "cross_attention_nb":
+            loss = self._shared_step_nb(out)
+        else:
+            loss = self._shared_step_cls(out)
+
+        # MoE auxiliary losses (load balancing + router z-loss) — shared by both paths
+        moe_cfg = self.cfg.model.get("moe", None) if self.cfg else None
+        if self.training and moe_cfg is not None and getattr(moe_cfg, "enable", False):
+            from .moe import collect_moe_aux_losses
+
+            moe_losses = collect_moe_aux_losses(self)
+            loss = loss + getattr(moe_cfg, "load_balance_weight", 0.01) * moe_losses["moe_load_balance"]
+            loss = loss + getattr(moe_cfg, "router_z_weight", 0.001) * moe_losses["moe_router_z"]
+
+        return loss
+
+    def _shared_step_cls(self, out):
+        """CLS decoder path — unchanged from original shared_step."""
         X = out.task_gene_embs  # [B, n_task, d_model]
         Y = out.task_counts  # [B, n_task]
         embs = out.cell_embedding  # [B, output_dim]
@@ -289,14 +321,33 @@ class StateEmbeddingModel(nn.Module):
             dataset_loss = self.dataset_loss(dataset_pred, dataset_labels)
             loss = loss + dataset_loss
 
-        # MoE auxiliary losses (load balancing + router z-loss)
-        moe_cfg = self.cfg.model.get("moe", None) if self.cfg else None
-        if self.training and moe_cfg is not None and getattr(moe_cfg, "enable", False):
-            from .moe import collect_moe_aux_losses
+        return loss
 
-            moe_losses = collect_moe_aux_losses(self)
-            loss = loss + getattr(moe_cfg, "load_balance_weight", 0.01) * moe_losses["moe_load_balance"]
-            loss = loss + getattr(moe_cfg, "router_z_weight", 0.001) * moe_losses["moe_router_z"]
+    def _shared_step_nb(self, out):
+        """NB decoder path — Stack-style cross-attention + NB reconstruction loss."""
+        latent_bank = out.latent_tokens  # [B, 257, d_model]
+        gene_indices = out.gene_indices  # [B, k_max]
+        original_counts = out.gene_counts_original  # [B, k_max] log1p
+        encoder_mask = out.encoder_mask  # [B, k_max] bool or None
+
+        # Gene queries from same embedding table, DETACHED (no decoder gradients to encoder)
+        gene_table = self.tokenizer._get_esm2_proj_table(latent_bank.device)
+        gene_queries = gene_table[gene_indices.long()].detach()  # [B, k_max, d_model]
+
+        # Decoder cross-attention
+        px_scale_logits, nb_dispersion = self.nb_decoder(gene_queries, latent_bank)
+
+        # NB mean = softmax(logits) * library_size (matches Stack base.py:118-121)
+        raw_counts = torch.expm1(original_counts)  # log1p → raw counts
+        lib_size = raw_counts.sum(dim=-1, keepdim=True).clamp_min(1.0)  # [B, 1]
+        px_scale = F.softmax(px_scale_logits, dim=-1)  # [B, k_max]
+        nb_mean = px_scale * lib_size  # [B, k_max]
+
+        # NB loss on masked genes only
+        if encoder_mask is None:
+            # Eval mode or no masking: predict all genes
+            encoder_mask = torch.ones_like(raw_counts, dtype=torch.bool)
+        loss = self.nb_loss(nb_mean, nb_dispersion, raw_counts, encoder_mask)
 
         return loss
 

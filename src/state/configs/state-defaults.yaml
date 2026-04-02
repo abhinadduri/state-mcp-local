@@ -248,6 +248,10 @@ model:
   n_cells_per_set: 1
   token_dim_inter: 8
   inter_n_heads: 8
+  decoder_type: cls
+  nb_decoder_layers: 2
+  mask_rate_min: 0.0
+  mask_rate_max: 0.0
   moe:
     enable: false
     num_experts: 8

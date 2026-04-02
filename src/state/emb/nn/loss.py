@@ -156,3 +156,48 @@ class TabularLoss(nn.Module):
             final_loss += cell_mmd
 
         return final_loss
+
+
+class NegativeBinomialLoss(nn.Module):
+    """Negative binomial reconstruction loss on masked genes.
+
+    Matches Stack's _compute_reconstruction_loss from losses.py:14-31.
+    Inlines the NB log-prob to avoid scvi dependency.
+    """
+
+    @staticmethod
+    def _nb_log_prob(x, mu, theta, eps=1e-8):
+        """Negative binomial log probability: NB(x | mu, theta).
+
+        Args:
+            x: observed counts
+            mu: mean parameter (> 0)
+            theta: dispersion / inverse overdispersion (> 0)
+        """
+        log_theta_mu_eps = torch.log(theta + mu + eps)
+        return (
+            theta * (torch.log(theta + eps) - log_theta_mu_eps)
+            + x * (torch.log(mu + eps) - log_theta_mu_eps)
+            + torch.lgamma(x + theta)
+            - torch.lgamma(theta)
+            - torch.lgamma(x + 1)
+        )
+
+    def forward(self, nb_mean, nb_dispersion, targets, mask):
+        """
+        Args:
+            nb_mean:       [B, k_max] predicted NB mean (raw count scale)
+            nb_dispersion: [B, k_max] predicted NB dispersion (> 0)
+            targets:       [B, k_max] true raw counts (NOT log1p)
+            mask:          [B, k_max] bool, True = masked (compute loss on these)
+        Returns:
+            scalar loss (mean NB NLL over masked positions)
+        """
+        recon_loss_all = -self._nb_log_prob(targets, nb_mean, nb_dispersion)
+
+        mask_f = mask.float()
+        masked_count = mask_f.sum()
+
+        if masked_count > 0:
+            return (recon_loss_all * mask_f).sum() / masked_count
+        return torch.tensor(0.0, device=targets.device, dtype=recon_loss_all.dtype)
