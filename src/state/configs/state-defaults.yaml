@@ -95,6 +95,12 @@ embeddings:
     valid_genes_masks: /data/SE-167M-Human/Preprint-Profile/valid_genes_masks_Preprint-SE-167M-Human.torch
     size: 5120
     num: 19790
+  SE-167M-BaseCount:
+    all_embeddings: /data/SE-167M-Human/Preprint-Profile/all_embeddings_Preprint-SE-167M-Human.pt
+    ds_emb_mapping: /data/SE-167M-Human/Preprint-Profile/ds_emb_mapping_Preprint-SE-167M-Human.torch
+    valid_genes_masks: /data/SE-167M-Human/Preprint-Profile/valid_genes_masks_Preprint-SE-167M-Human.torch
+    size: 5120
+    num: 19790
 validations:
   diff_exp:
     enable: true
@@ -204,6 +210,12 @@ dataset:
     val: /data/SE-167M-Human/Preprint-Profile/val_Preprint-SE-167M-Human.csv
     filter: true
     num_datasets: 14418
+  SE-167M-BaseCount:
+    ds_type: h5ad
+    train: /data/SE-167M-Human/Preprint-Profile/train_Preprint-SE-167M-Human-basecount-only.csv
+    val: /data/SE-167M-Human/Preprint-Profile/val_Preprint-SE-167M-Human-basecount-only.csv
+    filter: true
+    num_datasets: 14418
 tokenizer:
   token_dim: 5120
 model:
@@ -233,6 +245,9 @@ model:
   n_cross_attn_rounds: 1
   gradient_checkpointing: false
   use_learned_embeddings: true
+  n_cells_per_set: 1
+  token_dim_inter: 8
+  inter_n_heads: 8
   moe:
     enable: false
     num_experts: 8

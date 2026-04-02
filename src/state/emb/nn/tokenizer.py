@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from .flash_transformer import FlashTransformerEncoderLayer, FlashTransformerEncoder
 from .moe import MoETransformerEncoderLayer
+from .tabular_transformer import InterCellAttentionLayer, StackStyleInterCellLayer, TabularTransformerEncoder
 
 log = logging.getLogger(__name__)
 
@@ -649,6 +650,186 @@ class LatentTokenizer(Tokenizer):
             with torch.no_grad():
                 task_pe = self.pe_embedding(task_genes.long())  # [B, P+N, token_dim]
             task_gene_embs = self.gene_embedding_layer(task_pe)  # [B, P+N, d_model] — grad flows here
+
+        return TokenizerOutput(
+            cell_embedding=embedding,
+            task_gene_embs=task_gene_embs,
+            task_counts=task_counts,
+            dataset_emb=dataset_emb,
+            dataset_nums=dataset_nums,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TabularLatentTokenizer: LatentTokenizer + inter-cell attention (Stack-style)
+# ---------------------------------------------------------------------------
+
+
+class TabularLatentTokenizer(LatentTokenizer):
+    """LatentTokenizer with interleaved inter-cell attention.
+
+    Cross-attention from latent queries to gene tokens happens per-cell
+    (identical to LatentTokenizer). The self-attention phase alternates
+    between intra-cell attention (across latent positions) and inter-cell
+    attention (across cells within the same SRX/cell set).
+    """
+
+    def __init__(
+        self,
+        n_cells_per_set: int = 32,
+        n_genes: int = 19790,
+        n_latent: int = 256,
+        token_dim: int = 5120,
+        d_model: int = 1024,
+        nhead: int = 16,
+        d_hid: int = 2048,
+        nlayers: int = 8,
+        output_dim: int = 1024,
+        dropout: float = 0.0,
+        compiled: bool = False,
+        cfg=None,
+    ):
+        super().__init__(
+            n_genes=n_genes,
+            n_latent=n_latent,
+            token_dim=token_dim,
+            d_model=d_model,
+            nhead=nhead,
+            d_hid=d_hid,
+            nlayers=nlayers,
+            output_dim=output_dim,
+            dropout=dropout,
+            compiled=False,  # defer compilation — we replace the transformer
+            cfg=cfg,
+        )
+        self._n_cells_per_set = n_cells_per_set
+
+        # Inter-cell attention config
+        token_dim_inter = getattr(cfg.model, "token_dim_inter", 8) if cfg else 8
+        inter_n_heads = getattr(cfg.model, "inter_n_heads", 8) if cfg else 8
+
+        # Build Stack-style inter-cell attention layers (one per intra-cell layer)
+        inter_layers = [
+            StackStyleInterCellLayer(
+                d_model, n_latent,
+                token_dim_inter=token_dim_inter,
+                n_heads=inter_n_heads,
+                dropout=dropout,
+                n_layers=nlayers,
+            )
+            for _ in range(nlayers)
+        ]
+
+        # Replace the standard transformer with the tabular version
+        intra_layers = list(self.transformer_encoder.layers)
+        grad_ckpt = self._gradient_checkpointing
+        self.transformer_encoder = TabularTransformerEncoder(
+            intra_layers, inter_layers,
+            gradient_checkpointing=grad_ckpt,
+            n_cells_per_set=n_cells_per_set,
+        )
+
+        if compiled:
+            self.transformer_encoder = torch.compile(self.transformer_encoder)
+
+    def make_collator(self, cfg, is_train: bool, **kwargs):
+        from ..data.tabular_loader import TabularLatentCollator
+        from .. import utils
+
+        ds_emb_mapping = torch.load(
+            utils.get_embedding_cfg(cfg).ds_emb_mapping.format(
+                utils.get_embedding_cfg(cfg).size
+            ),
+            weights_only=False,
+        )
+        k_top = getattr(cfg.model, "k_top", None)
+        n_cells = getattr(cfg.model, "n_cells_per_set", self._n_cells_per_set)
+        return TabularLatentCollator(
+            cfg=cfg,
+            ds_emb_mapping=ds_emb_mapping,
+            n_genes=self.n_genes,
+            is_train=is_train,
+            k_top=k_top,
+            n_cells_per_set=n_cells,
+        )
+
+    def forward(self, batch) -> TokenizerOutput:
+        device = next(self.parameters()).device
+
+        n_cells_per_set = getattr(batch, "n_cells_per_set", 1)
+
+        gene_indices = batch.gene_indices.to(device)
+        gene_counts = batch.gene_counts.to(device)
+        gene_mask = batch.gene_mask.to(device)
+        task_genes = batch.task_genes.to(device)
+        task_counts = batch.task_counts.to(device)
+        dataset_nums = batch.dataset_nums
+        if dataset_nums is not None:
+            dataset_nums = dataset_nums.to(device)
+
+        B, k_max = gene_indices.shape
+
+        # --- Build sparse gene tokens (same as LatentTokenizer) ---
+        esm2_table = self._get_esm2_proj_table(device)
+        gene_embs = esm2_table[gene_indices]
+
+        if self.count_encoder is not None:
+            counts_input = gene_counts.unsqueeze(-1)
+            bin_weights = F.softmax(self.count_encoder(counts_input), dim=-1)
+            bin_embeddings = self.bin_encoder(torch.arange(10, device=device))
+            count_emb = torch.matmul(bin_weights, bin_embeddings)
+        else:
+            count_emb = torch.zeros(B, k_max, self.d_model, device=device)
+
+        gene_tokens = gene_embs + count_emb
+
+        # --- Cross-attention: latent queries attend to gene tokens (per-cell) ---
+        latent_tokens = self.latent_queries.unsqueeze(0).expand(B, -1, -1)
+
+        for cross_attn in self.cross_attn_rounds:
+            if self._gradient_checkpointing and self.training:
+                from torch.utils.checkpoint import checkpoint
+                latent_tokens = checkpoint(
+                    cross_attn, latent_tokens, gene_tokens, gene_mask,
+                    use_reentrant=False,
+                )
+            else:
+                latent_tokens = cross_attn(latent_tokens, gene_tokens, gene_mask)
+
+        # --- Prepend CLS token (+ optional dataset token) ---
+        cls = self.cls_token.unsqueeze(0).expand(B, 1, -1)
+        if self.dataset_token is not None:
+            ds_tok = self.dataset_token.unsqueeze(0).expand(B, 1, -1)
+            src = torch.cat([cls, latent_tokens, ds_tok], dim=1)
+        else:
+            src = torch.cat([cls, latent_tokens], dim=1)
+
+        src = src * math.sqrt(self.d_model)
+
+        # --- Tabular transformer (intra-cell + inter-cell attention) ---
+        output = self.transformer_encoder(src, n_cells_per_set=n_cells_per_set)
+
+        # --- CLS extraction + decoder (same as LatentTokenizer) ---
+        if self.dataset_token is not None:
+            output = output[:, [0, -1], :]
+        else:
+            output = output[:, :1, :]
+        gene_output = self.decoder(output)
+
+        embedding = gene_output[:, 0, :]
+        embedding = F.normalize(embedding, dim=1)
+
+        dataset_emb = None
+        if self.dataset_token is not None:
+            dataset_emb = gene_output[:, -1, :]
+
+        # --- Task gene embeddings for decoder ---
+        if self.use_learned_embeddings:
+            task_gene_embs = self.learned_gene_emb(task_genes.long())
+        else:
+            with torch.no_grad():
+                task_pe = self.pe_embedding(task_genes.long())
+            task_gene_embs = self.gene_embedding_layer(task_pe)
 
         return TokenizerOutput(
             cell_embedding=embedding,

@@ -22,8 +22,9 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 
 from ..nn.model import StateEmbeddingModel
-from ..nn.tokenizer import SentenceTokenizer, LatentTokenizer
+from ..nn.tokenizer import SentenceTokenizer, LatentTokenizer, TabularLatentTokenizer
 from ..data import H5adSentenceDataset
+from ..data.tabular_loader import CellSetH5adDataset
 from ..utils import get_latest_checkpoint, get_embedding_cfg, get_dataset_cfg
 from .callbacks import compute_forward_flops
 
@@ -203,6 +204,8 @@ def apply_fsdp2(model):
 
     # Shard each transformer layer as one unit — produces fewer all-gather
     # calls and allows the compiler to pipeline communication with compute.
+    # TabularTransformerEncoder exposes .layers property combining intra + inter layers;
+    # standard FlashTransformerEncoder uses .layers ModuleList directly.
     for layer in model.tokenizer.transformer_encoder.layers:
         fully_shard(layer)
 
@@ -264,7 +267,26 @@ def main(cfg):
 
     # --- Build tokenizer ---
     tokenizer_type = getattr(cfg.model, "tokenizer", "sentence")
-    if tokenizer_type == "latent":
+    if tokenizer_type == "tabular_latent":
+        n_latent = getattr(cfg.model, "n_latent", 128)
+        n_cells_per_set = getattr(cfg.model, "n_cells_per_set", 32)
+        tokenizer = TabularLatentTokenizer(
+            n_cells_per_set=n_cells_per_set,
+            n_genes=get_embedding_cfg(cfg).num,
+            n_latent=n_latent,
+            token_dim=get_embedding_cfg(cfg).size,
+            d_model=cfg.model.emsize,
+            nhead=cfg.model.nhead,
+            d_hid=cfg.model.d_hid,
+            nlayers=cfg.model.nlayers,
+            output_dim=cfg.model.output_dim,
+            dropout=cfg.model.dropout,
+            compiled=False,
+            cfg=cfg,
+        )
+        print(f"Using TabularLatentTokenizer: n_genes={get_embedding_cfg(cfg).num}, "
+              f"n_latent={n_latent}, n_cells_per_set={n_cells_per_set}")
+    elif tokenizer_type == "latent":
         n_latent = getattr(cfg.model, "n_latent", 128)
         tokenizer = LatentTokenizer(
             n_genes=get_embedding_cfg(cfg).num,
@@ -306,8 +328,13 @@ def main(cfg):
         raise ValueError(f"Unknown dataset type: {get_dataset_cfg(cfg).ds_type}")
 
     # --- Dataloaders ---
-    train_dataset = DatasetClass(cfg)
-    val_dataset = DatasetClass(cfg, test=True)
+    if tokenizer_type == "tabular_latent":
+        n_cells_per_set = getattr(cfg.model, "n_cells_per_set", 32)
+        train_dataset = CellSetH5adDataset(cfg, n_cells_per_set=n_cells_per_set)
+        val_dataset = CellSetH5adDataset(cfg, n_cells_per_set=n_cells_per_set, test=True)
+    else:
+        train_dataset = DatasetClass(cfg)
+        val_dataset = DatasetClass(cfg, test=True)
 
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_distributed else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_distributed else None
