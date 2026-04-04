@@ -134,9 +134,13 @@ class MoEFFN(nn.Module):
         self._aux_loss = None
         self._router_z_loss = None
 
-        # Global-batch load balancing: accumulate stats across micro-batches
-        self._accum_tokens_per_expert = None  # [E]
-        self._accum_score_sum = None  # [E]
+        # Global-batch load balancing: accumulate stats across micro-batches.
+        # Use register_buffer (persistent=False) so tensors move with .cuda()
+        # but don't appear in state_dict.  Crucially, starting as real tensors
+        # (not None) avoids a type-change that triggers torch.compile
+        # recompilation on the first forward call.
+        self.register_buffer("_accum_tokens_per_expert", torch.zeros(num_experts), persistent=False)
+        self.register_buffer("_accum_score_sum", torch.zeros(num_experts), persistent=False)
         self._accum_num_tokens = 0
 
         # EP state (set by enable_expert_parallel)
@@ -181,14 +185,9 @@ class MoEFFN(nn.Module):
         # Detach previous micro-batch stats so only the current micro-batch's
         # router gets gradients (previous graphs are already freed by backward).
         tpe, ss, nt = _compute_balance_stats(router_logits, top_k_indices, self.num_experts)
-        if self._accum_tokens_per_expert is None:
-            self._accum_tokens_per_expert = tpe
-            self._accum_score_sum = ss
-            self._accum_num_tokens = nt
-        else:
-            self._accum_tokens_per_expert = self._accum_tokens_per_expert.detach() + tpe
-            self._accum_score_sum = self._accum_score_sum.detach() + ss
-            self._accum_num_tokens = self._accum_num_tokens + nt
+        self._accum_tokens_per_expert = self._accum_tokens_per_expert.detach() + tpe
+        self._accum_score_sum = self._accum_score_sum.detach() + ss
+        self._accum_num_tokens = self._accum_num_tokens + nt
 
         # Compute loss from accumulated global-batch stats
         f = self._accum_tokens_per_expert / (self._accum_num_tokens * top_k_indices.shape[1])
@@ -365,8 +364,8 @@ class MoEFFN(nn.Module):
 
     def reset_balance_stats(self):
         """Reset accumulated balance stats after each optimizer step."""
-        self._accum_tokens_per_expert = None
-        self._accum_score_sum = None
+        self._accum_tokens_per_expert = torch.zeros_like(self._accum_tokens_per_expert)
+        self._accum_score_sum = torch.zeros_like(self._accum_score_sum)
         self._accum_num_tokens = 0
 
 

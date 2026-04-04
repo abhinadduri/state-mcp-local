@@ -72,28 +72,34 @@ class StateEmbeddingModel(nn.Module):
             )
 
         # --- Decoder head: predicts counts from cell_emb × gene_emb ---
+        # Skip CLS decoder when using cross_attention_nb (avoids unused params in DDP)
+        self._decoder_type = self.cfg.model.get("decoder_type", "cls")
         self.z_dim_rd = 1 if self.cfg.model.rda else 0
         self.z_dim_ds = 10 if self.cfg.model.get("dataset_correction", False) else 0
         self.z_dim = self.z_dim_rd + self.z_dim_ds
 
-        bottleneck_dim = getattr(self.cfg.model, "decoder_bottleneck_dim", None)
-        if bottleneck_dim is not None:
-            # Project gene_emb and cell_emb to small bottleneck dim before concat
-            self.gene_proj = nn.Linear(d_model, bottleneck_dim)
-            self.cell_proj = nn.Linear(output_dim, bottleneck_dim)
-            dec_input_dim = bottleneck_dim * 2 + self.z_dim
-            self.binary_decoder = nn.Sequential(
-                SkipBlock(dec_input_dim),
-                nn.Linear(dec_input_dim, 1, bias=True),
-            )
+        if self._decoder_type != "cross_attention_nb":
+            bottleneck_dim = getattr(self.cfg.model, "decoder_bottleneck_dim", None)
+            if bottleneck_dim is not None:
+                self.gene_proj = nn.Linear(d_model, bottleneck_dim)
+                self.cell_proj = nn.Linear(output_dim, bottleneck_dim)
+                dec_input_dim = bottleneck_dim * 2 + self.z_dim
+                self.binary_decoder = nn.Sequential(
+                    SkipBlock(dec_input_dim),
+                    nn.Linear(dec_input_dim, 1, bias=True),
+                )
+            else:
+                self.gene_proj = None
+                self.cell_proj = None
+                self.binary_decoder = nn.Sequential(
+                    SkipBlock(output_dim + d_model + self.z_dim),
+                    SkipBlock(output_dim + d_model + self.z_dim),
+                    nn.Linear(output_dim + d_model + self.z_dim, 1, bias=True),
+                )
         else:
             self.gene_proj = None
             self.cell_proj = None
-            self.binary_decoder = nn.Sequential(
-                SkipBlock(output_dim + d_model + self.z_dim),
-                SkipBlock(output_dim + d_model + self.z_dim),
-                nn.Linear(output_dim + d_model + self.z_dim, 1, bias=True),
-            )
+            self.binary_decoder = None
 
         # --- Dataset correction ---
         if getattr(self.cfg.model, "dataset_correction", False):
@@ -128,7 +134,6 @@ class StateEmbeddingModel(nn.Module):
             raise ValueError(f"Loss {self.cfg.loss.name} not supported")
 
         # --- NB decoder (optional, Stack-style cross-attention + NB loss) ---
-        self._decoder_type = self.cfg.model.get("decoder_type", "cls")
         if self._decoder_type == "cross_attention_nb":
             self.nb_decoder = CrossAttentionNBDecoder(
                 d_model=d_model,

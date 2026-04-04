@@ -510,14 +510,20 @@ def main(cfg):
         print(f"Applied FSDP2 sharding across {world_size} GPUs")
         if compiled:
             model.tokenizer = torch.compile(model.tokenizer)
-            model._decode = torch.compile(model._decode)
-            print("Compiled tokenizer and _decode with torch.compile (FSDP2)")
+            if model.binary_decoder is not None:
+                model._decode = torch.compile(model._decode)
+            if hasattr(model, "nb_decoder") and model.nb_decoder is not None:
+                model.nb_decoder = torch.compile(model.nb_decoder)
+            print("Compiled model modules with torch.compile (FSDP2)")
     else:
         # Compile then wrap with DDP
         if compiled:
             model.tokenizer = torch.compile(model.tokenizer)
-            model._decode = torch.compile(model._decode)
-            print("Compiled tokenizer and _decode with torch.compile")
+            if model.binary_decoder is not None:
+                model._decode = torch.compile(model._decode)
+            if hasattr(model, "nb_decoder") and model.nb_decoder is not None:
+                model.nb_decoder = torch.compile(model.nb_decoder)
+            print("Compiled model modules with torch.compile")
         if is_distributed:
             model = DDP(
                 model,
