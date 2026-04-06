@@ -35,10 +35,6 @@ dependencies = [
     "scipy>=1.15.0",
 ]
 
-[tool.uv.sources]
-cell-load = {path = "/home/aadduri/cell-load"}
-deseq2-pipeline = {path = "/home/aadduri/deseq2_pipeline", editable = true}
-
 [project.optional-dependencies]
 vectordb = [
     "lancedb>=0.24.0"

@@ -42,6 +42,17 @@ cd state
 uv tool install -e .
 ```
 
+### Dev Container (recommended for new contributors)
+
+Open the repo in VS Code and select **"Reopen in Container"**, or launch via GitHub Codespaces.
+This gives you a ready-made environment with all dependencies installed.
+
+Alternatively, run the setup script directly:
+
+```bash
+bash scripts/setup-dev.sh
+```
+
 ## CLI Usage
 
 If installed via `uv tool install`, run `state ...`. From source, run `uv run state ...`.
@@ -54,13 +65,13 @@ Use `state tx` to train and run perturbation prediction models.
 ### preprocess_train
 
 Prepares training h5ad files by normalizing counts, applying log1p, and selecting highly variable genes (HVGs).
-The HVG matrix is stored in `.obsm["X_hvg"]`, and the output .h5ad is written to `--output`.
+The HVG matrix is stored in `.obsm["X_hvg"]`, and the output .h5ad is written to `--output-dir`.
 
 ```bash
 state tx preprocess_train \
   --adata /path/to/raw_data.h5ad \
-  --output /path/to/preprocessed_training_data.h5ad \
-  --num_hvgs 2000
+  --output-dir /path/to/preprocessed/ \
+  --num-hvgs 2000
 ```
 
 ### train
@@ -108,13 +119,13 @@ Notes:
   - `val/expression_loss` when `output_space` is `gene` or `all`
   - `val/embedding_loss` when `output_space` is `embedding`
 
-### predict
+### evaluate
 
 Evaluates a trained run with `cell-eval` metrics (or just runs prediction with `--predict-only`).
 `--output-dir` should point to the run directory that contains `config.yaml` and `checkpoints/`.
 
 ```bash
-state tx predict --output-dir $HOME/state/test --checkpoint final.ckpt
+state tx evaluate --output-dir $HOME/state/test --checkpoint last.ckpt
 ```
 
 Use `--toml` to evaluate on a different dataset/split config than the one saved in the run.
@@ -242,6 +253,16 @@ state emb transform \
 
 If `--output` ends with `.npy`, only the embeddings matrix is written (no .h5ad is saved).
 Gene names are auto-detected from `var` (or `var.index`) based on overlap with the model's embeddings.
+
+### eval
+
+Evaluates an SE checkpoint on perturbation prediction (gene overlap metrics across perturbations).
+
+```bash
+state emb eval \
+  --checkpoint /path/to/SE-600M/se600m_epoch15.ckpt \
+  --adata /path/to/data.h5ad
+```
 
 ### Vector Database (optional)
 

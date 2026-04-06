@@ -20,6 +20,34 @@ from .utils import get_embedding_cfg, get_precision_config
 log = logging.getLogger(__name__)
 
 
+def _adjust_moe_config_for_ep(cfg, state_dict):
+    """Detect EP-sharded MoE weights in checkpoint and adjust config + state_dict.
+
+    When a checkpoint was saved without EP consolidation, the FFN weights
+    only contain one rank's expert slice while the router still has the full
+    num_experts.  Adjust both the config and the router weights so the model
+    can be built and loaded on a single device.
+    """
+    moe_cfg = getattr(getattr(cfg, 'model', None), 'moe', None)
+    if moe_cfg is None or not getattr(moe_cfg, 'enable', False):
+        return
+    for key, tensor in state_dict.items():
+        if ".moe_ffn.w1" in key:
+            ckpt_experts = tensor.shape[0]
+            cfg_experts = getattr(moe_cfg, 'num_experts', None)
+            if cfg_experts is not None and ckpt_experts != cfg_experts:
+                log.warning(
+                    f"Checkpoint has {ckpt_experts} experts per layer "
+                    f"(EP-sharded from {cfg_experts}); adjusting config for inference"
+                )
+                moe_cfg.num_experts = ckpt_experts
+                # Slice router gate weights to match available experts
+                for k in list(state_dict.keys()):
+                    if ".moe_ffn.router.gate.weight" in k:
+                        state_dict[k] = state_dict[k][:ckpt_experts]
+            break
+
+
 class Inference:
     def __init__(self, cfg=None, protein_embeds=None):
         self.model = None
@@ -139,7 +167,6 @@ class Inference:
         if checkpoint_suffix == ".safetensors":
             self.model = self._load_model_from_safetensors(checkpoint_path, device=device)
         else:
-            self.model = self._init_model_from_cfg(cfg_to_use)
             ckpt_data = torch.load(checkpoint, map_location="cpu", weights_only=False)
             if isinstance(ckpt_data, dict) and "model" in ckpt_data:
                 state_dict = ckpt_data["model"]
@@ -150,6 +177,9 @@ class Inference:
             # Strip DDP "module." prefix if present
             if state_dict and any(k.startswith("module.") for k in state_dict):
                 state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
+            # Detect EP-sharded MoE experts and adjust config to match checkpoint
+            _adjust_moe_config_for_ep(cfg_to_use, state_dict)
+            self.model = self._init_model_from_cfg(cfg_to_use)
             self.model.load_state_dict(state_dict, strict=False)
 
         # Convert model to appropriate precision for faster inference
