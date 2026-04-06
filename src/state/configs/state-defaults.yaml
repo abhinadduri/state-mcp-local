@@ -18,6 +18,9 @@ experiment:
   limit_val_batches: 500
   strategy: ddp
   ddp_timeout: 3600
+  fsdp_no_reshard: false
+  fsdp_root_only: false
+  fsdp_shard_group_size: 0
   checkpoint:
     path: /checkpoints/se_pretrain
     save_top_k: 2

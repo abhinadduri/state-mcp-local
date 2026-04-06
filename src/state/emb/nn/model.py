@@ -248,6 +248,10 @@ class StateEmbeddingModel(nn.Module):
         out = self.tokenizer(batch)
         return out.task_gene_embs, out.task_counts, None, out.cell_embedding, out.dataset_emb
 
+    def decode_to_continuous(self, logits):
+        """Convert binary decoder logits [B, n_genes, 1] to continuous scores [B, n_genes]."""
+        return logits.squeeze(-1)
+
     def _decode(self, X, Y, embs, ds_emb=None):
         """Core decoder path: project + concat + binary_decoder.
 

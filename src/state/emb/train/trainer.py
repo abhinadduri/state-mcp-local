@@ -114,6 +114,29 @@ def build_optimizer_and_scheduler(model, cfg, total_steps):
     return optimizer, scheduler
 
 
+def _gather_ep_experts(raw_model, model_sd):
+    """All-gather EP-sharded MoE expert weights so the checkpoint has all experts."""
+    if not dist.is_initialized():
+        return model_sd
+    from ..nn.moe import MoEFFN
+    ep_group = None
+    for module in raw_model.modules():
+        if isinstance(module, MoEFFN) and module._ep_group is not None:
+            ep_group = module._ep_group
+            break
+    if ep_group is None:
+        return model_sd
+    ep_size = dist.get_world_size(ep_group)
+    ep_suffixes = (".w1", ".b1", ".w2", ".b2")
+    for key in list(model_sd.keys()):
+        if ".moe_ffn." in key and any(key.endswith(s) for s in ep_suffixes):
+            local = model_sd[key].to("cuda")
+            gathered = [torch.empty_like(local) for _ in range(ep_size)]
+            dist.all_gather(gathered, local, group=ep_group)
+            model_sd[key] = torch.cat(gathered, dim=0).cpu()
+    return model_sd
+
+
 class CheckpointManager:
     """Manages checkpoint saving with last + top-k by metric."""
 
@@ -136,6 +159,8 @@ class CheckpointManager:
             # Fallback for non-FSDP (DDP / single-GPU)
             model_sd = raw_model.state_dict()
             optim_sd = optimizer.state_dict()
+        # Consolidate EP-sharded MoE expert weights so all experts are saved
+        model_sd = _gather_ep_experts(raw_model, model_sd)
         checkpoint = {
             "model": model_sd,
             "optimizer": optim_sd,
@@ -193,35 +218,64 @@ class CheckpointManager:
         return last_path
 
 
-def apply_fsdp2(model):
-    """Apply FSDP2 partial sharding to the model.
+def apply_fsdp2(model, reshard_after_forward=True, root_only=False, shard_group_size=0):
+    """Apply FSDP2 sharding to the model.
 
-    Shards each transformer encoder layer individually (95% of params for 7B).
-    Also shards cross-attention blocks if present (LatentTokenizer).
-    The root fully_shard handles remaining params + gradient synchronization.
+    Args:
+        reshard_after_forward: If False, keep params unsharded after forward pass.
+        root_only: If True, only shard at root level.
+        shard_group_size: If >0, use HSDP — shard within groups of this size,
+            replicate across groups. E.g., shard_group_size=2 on 8 GPUs creates
+            4 replica groups of 2 GPUs each. Reduces all-gather volume by
+            (world_size / shard_group_size)x.
     """
     from torch.distributed._composable.fsdp import fully_shard
 
-    # Shard each transformer layer as one unit — produces fewer all-gather
-    # calls and allows the compiler to pipeline communication with compute.
-    # TabularTransformerEncoder exposes .layers property combining intra + inter layers;
-    # standard FlashTransformerEncoder uses .layers ModuleList directly.
-    for layer in model.tokenizer.transformer_encoder.layers:
-        fully_shard(layer)
+    shard_kwargs = {}
+    if not reshard_after_forward:
+        shard_kwargs["reshard_after_forward"] = False
 
-    # Shard cross-attention blocks if present (LatentTokenizer)
-    if hasattr(model.tokenizer, "cross_attn_rounds"):
-        for block in model.tokenizer.cross_attn_rounds:
-            fully_shard(block)
+    # HSDP: create a 2D mesh (replicate, shard) for hybrid sharding
+    if shard_group_size > 0:
+        import torch.distributed as dist
+        from torch.distributed.device_mesh import init_device_mesh
+        world_size = dist.get_world_size()
+        assert world_size % shard_group_size == 0, \
+            f"world_size ({world_size}) must be divisible by shard_group_size ({shard_group_size})"
+        n_replicas = world_size // shard_group_size
+        mesh = init_device_mesh("cuda", (n_replicas, shard_group_size),
+                                mesh_dim_names=("replicate", "shard"))
+        shard_kwargs["mesh"] = mesh
+        print(f"HSDP: {n_replicas} replica groups × {shard_group_size}-way shard")
 
-    # Shard NB decoder cross-attention layers if present
-    if hasattr(model, "nb_decoder") and model.nb_decoder is not None:
-        for layer in model.nb_decoder.cross_attn_layers:
-            fully_shard(layer)
+    from ..nn.moe import MoETransformerEncoderLayer
 
-    # Root handles remaining params (encoder, decoder, cls_token, etc.)
-    # and coordinates gradient synchronization
-    fully_shard(model)
+    if root_only:
+        # Root-only: single all-gather for entire model (needs more memory)
+        pass
+    elif shard_group_size == -1:
+        # Expert-only sharding: only shard MoE FFN sub-modules, keep attention
+        # replicated. Eliminates all-gather for attention layers entirely.
+        # Root fully_shard handles gradient sync for un-sharded params.
+        for layer in model.tokenizer.transformer_encoder.layers:
+            if isinstance(layer, MoETransformerEncoderLayer):
+                fully_shard(layer.moe_ffn, **shard_kwargs)
+    else:
+        # Standard per-layer sharding
+        for layer in model.tokenizer.transformer_encoder.layers:
+            fully_shard(layer, **shard_kwargs)
+
+        if hasattr(model.tokenizer, "cross_attn_rounds"):
+            for block in model.tokenizer.cross_attn_rounds:
+                fully_shard(block, **shard_kwargs)
+
+        if hasattr(model, "nb_decoder") and model.nb_decoder is not None:
+            for layer in model.nb_decoder.cross_attn_layers:
+                fully_shard(layer, **shard_kwargs)
+
+    # Root handles remaining params + gradient synchronization
+    root_kwargs = {k: v for k, v in shard_kwargs.items() if k == "mesh"}
+    fully_shard(model, **root_kwargs)
 
     return model
 
@@ -484,7 +538,12 @@ def main(cfg):
               and is_distributed)
     if use_ep:
         from ..nn.moe import enable_expert_parallel
-        ep_group = dist.group.WORLD
+        # EP-only mode (strategy=ddp) uses a separate PG to avoid NCCL conflicts.
+        # FSDP2 mode uses WORLD group (FSDP2 handles communication internally).
+        if use_fsdp:
+            ep_group = dist.group.WORLD
+        else:
+            ep_group = dist.new_group(ranks=list(range(world_size)))
         enable_expert_parallel(model, ep_group)
         n_experts = getattr(moe_cfg, "num_experts", 8)
         print(f"Expert parallelism enabled: {n_experts} experts across {world_size} GPUs")
@@ -505,9 +564,19 @@ def main(cfg):
             print(f"EP-corrected FLOPs per batch (scale={ep_scale:.3f}): {flops_per_batch:,}")
 
     # --- Apply distributed strategy ---
+    no_reshard = cfg.experiment.get("fsdp_no_reshard", False)
+    fsdp_root_only = cfg.experiment.get("fsdp_root_only", False)
+    fsdp_shard_group = cfg.experiment.get("fsdp_shard_group_size", 0)
     if use_fsdp:
-        model = apply_fsdp2(model)
-        print(f"Applied FSDP2 sharding across {world_size} GPUs")
+        model = apply_fsdp2(model, reshard_after_forward=not no_reshard,
+                           root_only=fsdp_root_only, shard_group_size=fsdp_shard_group)
+        opts = []
+        if no_reshard:
+            opts.append("no reshard")
+        if fsdp_root_only:
+            opts.append("root-only shard")
+        opts_str = f" ({', '.join(opts)})" if opts else ""
+        print(f"Applied FSDP2 sharding across {world_size} GPUs{opts_str}")
         if compiled:
             model.tokenizer = torch.compile(model.tokenizer)
             if model.binary_decoder is not None:
@@ -516,21 +585,52 @@ def main(cfg):
                 model.nb_decoder = torch.compile(model.nb_decoder)
             print("Compiled model modules with torch.compile (FSDP2)")
     else:
-        # Compile then wrap with DDP
-        if compiled:
+        # Compile then wrap with DDP (or use EP-only manual gradient sync)
+        compile_attn_only = use_ep and compiled  # EP mode: compile attention only (MoE pack/unpack hurts perf)
+        if compile_attn_only:
+            from ..nn.moe import MoETransformerEncoderLayer
+            n_compiled = 0
+            for module in model.modules():
+                if isinstance(module, MoETransformerEncoderLayer):
+                    module._attention_block = torch.compile(module._attention_block)
+                    n_compiled += 1
+            if hasattr(model, "nb_decoder") and model.nb_decoder is not None:
+                model.nb_decoder = torch.compile(model.nb_decoder)
+            print(f"Compiled {n_compiled} attention blocks + NB decoder (EP-only mode)")
+        elif compiled:
             model.tokenizer = torch.compile(model.tokenizer)
             if model.binary_decoder is not None:
                 model._decode = torch.compile(model._decode)
             if hasattr(model, "nb_decoder") and model.nb_decoder is not None:
                 model.nb_decoder = torch.compile(model.nb_decoder)
             print("Compiled model modules with torch.compile")
-        if is_distributed:
+        if is_distributed and not use_ep:
             model = DDP(
                 model,
                 device_ids=[local_rank],
-                find_unused_parameters=False,
+                find_unused_parameters=hasattr(raw_model, "nb_decoder") and raw_model.nb_decoder is not None,
                 gradient_as_bucket_view=True,
             )
+        elif is_distributed and use_ep:
+            # EP-only mode: skip DDP/FSDP2 entirely. Each GPU has unique experts
+            # (~1B params, no allreduce needed) + shared params (~636M, need allreduce).
+            # Manual gradient allreduce after backward is 10× less communication
+            # than FSDP2's per-layer all-gather + reduce-scatter.
+            from ..nn.moe import MoEFFN
+            _shared_params = []
+            _ep_param_ids = set()
+            for module in model.modules():
+                if isinstance(module, MoEFFN):
+                    for p in module.parameters():
+                        _ep_param_ids.add(id(p))
+            for p in model.parameters():
+                if p.requires_grad and id(p) not in _ep_param_ids:
+                    _shared_params.append(p)
+            n_shared = sum(p.numel() for p in _shared_params)
+            n_expert = sum(p.numel() for p in model.parameters() if id(p) in _ep_param_ids)
+            print(f"EP-only mode: {n_shared/1e6:.0f}M shared params (allreduce), "
+                  f"{n_expert/1e6:.0f}M expert params (local)")
+            model._ep_shared_params = _shared_params
 
     model.train()
 
@@ -677,10 +777,14 @@ def main(cfg):
 
             # Skip gradient sync on non-final accumulation microsteps
             is_accum_step = (microstep + 1) % grad_accum != 0
+            is_ep_only = use_ep and not use_fsdp and is_distributed and not isinstance(model, DDP)
 
             if use_fsdp and is_distributed:
                 # FSDP2: toggle gradient sync via FSDPModule method
                 model.set_requires_gradient_sync(not is_accum_step)
+                sync_context = nullcontext()
+            elif is_ep_only:
+                # EP-only: no DDP/FSDP wrapper, manual gradient sync after backward
                 sync_context = nullcontext()
             elif is_distributed and is_accum_step:
                 # DDP: use no_sync context manager
@@ -709,6 +813,16 @@ def main(cfg):
 
                 if profiling and is_main and profile_steps[0] <= microstep < profile_steps[1]:
                     _t1_bwd.record()
+
+            # EP-only: bucketed gradient allreduce for shared params on final microstep
+            if is_ep_only and not is_accum_step:
+                # Flatten all shared gradients into one buffer for a single allreduce
+                grads = [p.grad for p in model._ep_shared_params if p.grad is not None]
+                if grads:
+                    flat = torch._utils._flatten_dense_tensors(grads)
+                    dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+                    for g, synced in zip(grads, torch._utils._unflatten_dense_tensors(flat, grads)):
+                        g.copy_(synced)
 
             microstep += 1
 

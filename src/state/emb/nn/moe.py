@@ -207,30 +207,15 @@ class MoEFFN(nn.Module):
 
         return output.reshape(B, T, D)
 
-    def _forward_ep(self, x_flat, top_k_weights, top_k_indices):
-        """Expert parallel forward using fixed-capacity padded all-to-all.
+    def _ep_pack(self, x_flat, top_k_weights, top_k_indices, N, E, K, C):
+        """Phase 1: Route tokens and pack into padded [E, C, D] buffer.
 
-        All tensor shapes are static (determined by batch_size and model config),
-        so torch.compile can trace through everything except the all-to-all calls
-        themselves (which use minimal graph breaks via _ep_all_to_all).
+        Compilable — no NCCL ops. Fuses ~20 small ops into 1-2 kernels.
         """
-        N, D = x_flat.shape
-        E = self.num_experts
-        K = self.top_k
-        ep_group = self._ep_group
-        ep_size = self._ep_size
-        epr = self._experts_per_rank
+        D = x_flat.shape[1]
+        M = N * K
 
-        M = N * K  # total token-expert assignments
-
-        # Fixed capacity per expert, bucketed for stable shapes
-        _BUCKET = 64
-        avg = (M + E - 1) // E
-        C = avg + avg // 8  # 12.5% headroom (load balance loss keeps routing uniform)
-        C = ((C + _BUCKET - 1) // _BUCKET) * _BUCKET
-
-        # ---- Phase 1: Pack tokens into padded [E, C, D] ----
-        flat_experts = top_k_indices.reshape(-1)  # [M]
+        flat_experts = top_k_indices.reshape(-1)
         flat_weights = top_k_weights.reshape(-1)
         flat_token_idx = torch.arange(N, device=x_flat.device).unsqueeze(1).expand(-1, K).reshape(-1)
 
@@ -250,47 +235,79 @@ class MoEFFN(nn.Module):
         keep = positions < C
         pos_clamped = positions.clamp(max=C - 1)
 
-        # Pre-weight and pack into padded buffer
         weighted = (x_flat[sorted_token_idx] * sorted_weights.unsqueeze(-1)).to(torch.bfloat16)
         padded_send = weighted.new_zeros(E, C, D)
         padded_send[expert_ids, pos_clamped] = weighted * keep.unsqueeze(-1).to(weighted.dtype)
 
-        # ---- Phase 2: Fixed-size all-to-all dispatch ----
-        # [E, C, D] → [ep_size * epr * C, D]; experts are in rank order naturally
-        send_flat = padded_send.reshape(-1, D).contiguous()
-        recv_flat = _ep_all_to_all(torch.empty_like(send_flat), send_flat, ep_group)
+        return padded_send, sort_idx, expert_ids, pos_clamped, keep
 
-        # ---- Phase 3: Local expert BMM ----
-        # recv: [ep_size, epr, C, D] → merge sources → [epr, ep_size*C, D]
-        recv = recv_flat.reshape(ep_size, epr, C, D)
-        recv_merged = recv.permute(1, 0, 2, 3).reshape(epr, ep_size * C, D)
+    def _ep_unpack(self, recv_back_flat, sort_idx, expert_ids, pos_clamped, keep, E, C, N, K, dtype):
+        """Phase 5: Unpack results from padded buffer.
 
-        w1 = self.w1.to(torch.bfloat16)
-        b1 = self.b1.to(torch.bfloat16)
-        w2 = self.w2.to(torch.bfloat16)
-        b2 = self.b2.to(torch.bfloat16)
+        Compilable — no NCCL ops. Fuses ~8 small ops into 1-2 kernels.
+        """
+        D = recv_back_flat.shape[1]
+        recv_back = recv_back_flat.reshape(E, C, D)
+        results = recv_back[expert_ids, pos_clamped].to(dtype)
+        results = results * keep.unsqueeze(-1).to(results.dtype)
 
-        h = torch.bmm(recv_merged, w1) + b1
+        unsort_idx = sort_idx.argsort()
+        output = results[unsort_idx].reshape(N, K, D).sum(dim=1)
+        return output
+
+    def _forward_ep(self, x_flat, top_k_weights, top_k_indices):
+        """Expert parallel forward with optional Triton-fused pack/unpack."""
+        N, D = x_flat.shape
+        E = self.num_experts
+        K = self.top_k
+        ep_group = self._ep_group
+        ep_size = self._ep_size
+        epr = self._experts_per_rank
+        M = N * K
+
+        _BUCKET = 64
+        avg = (M + E - 1) // E
+        C = avg + avg // 8
+        C = ((C + _BUCKET - 1) // _BUCKET) * _BUCKET
+
+        # Phase 1: Pack — use Triton if available (1 kernel vs ~20 PyTorch ops)
+        try:
+            from .moe_triton import HAS_TRITON, triton_ep_pack, triton_ep_unpack
+        except ImportError:
+            HAS_TRITON = False
+
+        if HAS_TRITON:
+            padded_send, token_ids, expert_ids, pos_clamped, keep = triton_ep_pack(
+                x_flat, top_k_weights, top_k_indices, E, C)
+        else:
+            padded_send, sort_idx, expert_ids, pos_clamped, keep = self._ep_pack(
+                x_flat, top_k_weights, top_k_indices, N, E, K, C)
+
+        # Phase 2: All-to-all dispatch (NCCL)
+        send_flat = padded_send.reshape(-1, D)
+        if not send_flat.is_contiguous():
+            send_flat = send_flat.contiguous()
+        recv_flat = torch.empty_like(send_flat)
+        _ep_all_to_all(recv_flat, send_flat, ep_group)
+
+        # Phase 3: Local expert BMM
+        recv_merged = recv_flat.reshape(ep_size, epr, C, D).permute(1, 0, 2, 3).reshape(epr, ep_size * C, D)
+        h = torch.bmm(recv_merged, self.w1) + self.b1
         h = F.gelu(h)
         if self.dropout_p > 0 and self.training:
             h = F.dropout(h, p=self.dropout_p, training=True)
-        out = torch.bmm(h, w2) + b2  # [epr, ep_size*C, D]
+        out = torch.bmm(h, self.w2) + self.b2
 
-        # ---- Phase 4: Fixed-size all-to-all combine ----
-        out_send = out.reshape(epr, ep_size, C, D).permute(1, 0, 2, 3).contiguous()
-        send_back = out_send.reshape(-1, D)
-        recv_back_flat = _ep_all_to_all(torch.empty_like(send_back), send_back, ep_group)
+        # Phase 4: All-to-all combine (NCCL)
+        send_back = out.reshape(epr, ep_size, C, D).permute(1, 0, 2, 3).contiguous().reshape(-1, D)
+        recv_back_flat = torch.empty_like(send_back)
+        _ep_all_to_all(recv_back_flat, send_back, ep_group)
 
-        # ---- Phase 5: Unpack valid results ----
-        recv_back = recv_back_flat.reshape(E, C, D)
-        results = recv_back[expert_ids, pos_clamped].to(x_flat.dtype)
-        results = results * keep.unsqueeze(-1).to(results.dtype)
-
-        # Unsort and accumulate over top-K
-        unsort_idx = sort_idx.argsort()
-        output = results[unsort_idx].reshape(N, K, D).sum(dim=1)
-
-        return output
+        # Phase 5: Unpack
+        if HAS_TRITON:
+            return triton_ep_unpack(recv_back_flat, token_ids, expert_ids, pos_clamped, keep, N, E, C, K)
+        else:
+            return self._ep_unpack(recv_back_flat, sort_idx, expert_ids, pos_clamped, keep, E, C, N, K, x_flat.dtype)
 
     def _forward_bmm(self, x_flat, top_k_weights, top_k_indices):
         """Padded bmm forward (no EP).
@@ -412,8 +429,8 @@ class MoETransformerEncoderLayer(nn.Module):
         with torch.no_grad():
             self.out_proj.weight *= 1.0 / math.sqrt(2 * n_layers)
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None):
-        # Pre-norm: normalize before sublayer, add residual after
+    def _attention_block(self, src):
+        """Attention sub-block — compilable (no NCCL ops)."""
         normed = self.norm1(src)
         qkv = self.qkv_proj(normed)
         q, k, v = torch.chunk(qkv, 3, dim=-1)
@@ -429,8 +446,10 @@ class MoETransformerEncoderLayer(nn.Module):
         )
         attn_output = attn_output.transpose(1, 2).contiguous().view(B_size, T_size, self.d_model)
         attn_output = self.out_proj(attn_output)
-        src = src + self.dropout_layer(attn_output)
+        return src + self.dropout_layer(attn_output)
 
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        src = self._attention_block(src)
         normed2 = self.norm2(src)
         ff_output = self.moe_ffn(normed2)
         src = src + self.dropout_layer(ff_output)
