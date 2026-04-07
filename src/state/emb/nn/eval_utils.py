@@ -3,13 +3,46 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
-from vci.data import create_dataloader
-from vci.eval.emb import cluster_embedding
-from vci.utils import compute_gene_overlap_cross_pert
+from ..data import create_dataloader
+from ..eval.emb import cluster_embedding
+from ..utils import compute_gene_overlap_cross_pert
 from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import roc_auc_score, accuracy_score
 import warnings
+
+
+class LinearProbe(nn.Module):
+    """True linear probe: single linear layer for embedding quality evaluation."""
+
+    def __init__(self, in_dim, n_classes):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, n_classes)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+def subsample_adata(adata, target_cells, pert_col="gene", seed=42):
+    """Stratified subsample preserving all perturbation classes.
+
+    Caps each perturbation at target_cells // n_perturbations cells.
+    """
+    rng = np.random.RandomState(seed)
+    pert_labels = adata.obs[pert_col].values
+    unique_perts = np.unique(pert_labels)
+    max_per_pert = target_cells // len(unique_perts)
+
+    selected_indices = []
+    for pert in unique_perts:
+        pert_indices = np.where(pert_labels == pert)[0]
+        n_select = min(len(pert_indices), max(1, max_per_pert))
+        chosen = rng.choice(pert_indices, size=n_select, replace=False)
+        selected_indices.extend(chosen)
+
+    selected_indices = np.array(selected_indices)
+    rng.shuffle(selected_indices)
+    return adata[selected_indices].copy()
 
 
 def evaluate_intrinsic(model, cfg, device=None, logger=print, adata=None):
@@ -367,6 +400,7 @@ def benchmark_single_celltype(
     lr=1e-4,
     n_layers=1,
     seed=42,
+    probe_type="linear",
 ):
     """Run benchmarking for a single cell type."""
     print(f"\nBenchmarking cell type: {cell_type}")
@@ -385,11 +419,14 @@ def benchmark_single_celltype(
         return None
 
     # Create and train model
-    model = MLPClassifier(in_dim=features.shape[1], hidden_dim=1024, n_classes=len(label_names), n_layers=n_layers).to(
-        device
-    )
+    if probe_type == "linear":
+        model = LinearProbe(in_dim=features.shape[1], n_classes=len(label_names)).to(device)
+    else:
+        model = MLPClassifier(
+            in_dim=features.shape[1], hidden_dim=1024, n_classes=len(label_names), n_layers=n_layers
+        ).to(device)
 
-    print(f"  Training model with {sum(p.numel() for p in model.parameters())} parameters...")
+    print(f"  Training {probe_type} probe with {sum(p.numel() for p in model.parameters())} parameters...")
     model = train_and_select(model, loaders, epochs, lr, device)
 
     # Evaluate
@@ -410,25 +447,21 @@ def benchmark_single_celltype(
     return results
 
 
-def run_intrinsic_benchmark(adata, device, logger=print):
+def run_intrinsic_benchmark(
+    adata, device, logger=print,
+    probe_type="linear", epochs=3, perturb_key="gene",
+    cell_type_key="cell_type", embed_key="X_emb",
+    batch_size=128, lr=1e-4, seed=42,
+):
     """
     Run the intrinsic benchmark evaluation on embeddings.
     Returns averaged AUROC and Accuracy across all cell types.
     """
-    logger("Running intrinsic perturbation benchmark...")
+    logger(f"Running intrinsic perturbation benchmark (probe={probe_type}, epochs={epochs})...")
 
-    # Fixed parameters
-    embed_key = "X_emb"
-    perturb_key = "gene"
-    cell_type_key = "cell_type"
     val_split = 0.20
-    epochs = 5
-    batch_size = 128
-    lr = 1e-4
-    n_layers = 1
     min_cells_per_perturb = 10
     min_cells_per_celltype = 50
-    seed = 42
 
     # Set random seeds
     torch.manual_seed(seed)
@@ -449,7 +482,8 @@ def run_intrinsic_benchmark(adata, device, logger=print):
     all_results = []
     for cell_type, (features, labels, label_names) in celltype_data.items():
         result = benchmark_single_celltype(
-            cell_type, features, labels, label_names, device, val_split, epochs, batch_size, lr, n_layers, seed
+            cell_type, features, labels, label_names, device, val_split, epochs,
+            batch_size, lr, seed=seed, probe_type=probe_type,
         )
         if result is not None:
             all_results.append(result)

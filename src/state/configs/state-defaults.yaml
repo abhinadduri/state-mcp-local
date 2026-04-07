@@ -31,7 +31,7 @@ wandb:
   project: vci
   entity: arcinstitute
 embeddings:
-  current: SE-167M
+  current: SE-167M-BaseCount
   esm2-cellxgene:
     all_embeddings: /large_storage/ctc/ML/data/cell/misc/Homo_sapiens.GRCh38.gene_symbol_to_embedding_ESM2.pt
     ds_emb_mapping: /large_storage/ctc/datasets/vci/training/gene_embidx_mapping.torch
@@ -110,23 +110,23 @@ validations:
     eval_interval_multiple: 10
     obs_pert_col: gene
     obs_filter_label: non-targeting
-    top_k_rank: 200
+    top_k_rank: 500
     method: null
-    dataset: /large_storage/ctc/datasets/cellxgene/processed/rpe1_top5000_variable.h5ad
-    dataset_name: rpe1_top5000_variable
+    dataset: /home/aadduri/state-mcp-local/rpe1_top_5000.h5ad
+    dataset_name: rpe1_top_5000
   perturbation:
     enable: true
     eval_interval_multiple: 10
     pert_col: gene
     ctrl_label: non-targeting
-    dataset: /large_storage/ctc/datasets/cellxgene/processed/rpe1_top5000_variable.h5ad
-    dataset_name: rpe1_top5000_variable
+    dataset: /home/aadduri/state-mcp-local/rpe1_top_5000.h5ad
+    dataset_name: rpe1_top_5000
 dataset:
   name: vci
   seed: 42
   num_train_workers: 16
   num_val_workers: 4
-  current: SE-167M
+  current: SE-167M-BaseCount
   cellxgene:
     data_dir: /large_experiments/goodarzilab/mohsen/cellxgene/processed
     ds_type: h5ad

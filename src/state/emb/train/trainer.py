@@ -114,27 +114,47 @@ def build_optimizer_and_scheduler(model, cfg, total_steps):
     return optimizer, scheduler
 
 
+def _get_ep_info(raw_model):
+    """Return (ep_group, ep_rank, experts_per_rank) or Nones if EP is not active."""
+    from ..nn.moe import MoEFFN
+    for module in raw_model.modules():
+        if isinstance(module, MoEFFN) and module._ep_group is not None:
+            return module._ep_group, module._ep_rank, module._experts_per_rank
+    return None, None, None
+
+
+_EP_FFN_SUFFIXES = (".w1", ".b1", ".w2", ".b2")
+
+
 def _gather_ep_experts(raw_model, model_sd):
     """All-gather EP-sharded MoE expert weights so the checkpoint has all experts."""
     if not dist.is_initialized():
         return model_sd
-    from ..nn.moe import MoEFFN
-    ep_group = None
-    for module in raw_model.modules():
-        if isinstance(module, MoEFFN) and module._ep_group is not None:
-            ep_group = module._ep_group
-            break
+    ep_group, _, _ = _get_ep_info(raw_model)
     if ep_group is None:
         return model_sd
     ep_size = dist.get_world_size(ep_group)
-    ep_suffixes = (".w1", ".b1", ".w2", ".b2")
     for key in list(model_sd.keys()):
-        if ".moe_ffn." in key and any(key.endswith(s) for s in ep_suffixes):
+        if ".moe_ffn." in key and any(key.endswith(s) for s in _EP_FFN_SUFFIXES):
             local = model_sd[key].to("cuda")
             gathered = [torch.empty_like(local) for _ in range(ep_size)]
             dist.all_gather(gathered, local, group=ep_group)
             model_sd[key] = torch.cat(gathered, dim=0).cpu()
     return model_sd
+
+
+def _scatter_ep_experts(raw_model, state_dict):
+    """Slice consolidated expert weights to this rank's EP shard for resume."""
+    ep_group, ep_rank, experts_per_rank = _get_ep_info(raw_model)
+    if ep_group is None:
+        return state_dict
+    start = ep_rank * experts_per_rank
+    end = start + experts_per_rank
+    for key in list(state_dict.keys()):
+        if ".moe_ffn." in key and any(key.endswith(s) for s in _EP_FFN_SUFFIXES):
+            if state_dict[key].shape[0] > experts_per_rank:
+                state_dict[key] = state_dict[key][start:end].clone()
+    return state_dict
 
 
 class CheckpointManager:
@@ -293,6 +313,35 @@ def run_validation(model, val_dataloader, limit_val_batches):
             val_losses.append(loss.item())
     model.train()
     return sum(val_losses) / len(val_losses) if val_losses else float("inf")
+
+
+def _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step):
+    """Submit an async Slurm eval job after checkpoint save (rank 0 only)."""
+    if eval_slurm is None or wandb_run is None:
+        return
+    diff_exp = cfg.validations.diff_exp
+    if not getattr(diff_exp, "enable", False):
+        return
+    ckpt_path = os.path.join(ckpt_dir, "last.pt")
+    eval_cmd = (
+        f"python -m src.state emb eval "
+        f"--checkpoint {ckpt_path} "
+        f"--adata {diff_exp.dataset} "
+        f"--pert-col {diff_exp.obs_pert_col} "
+        f"--control-pert {diff_exp.obs_filter_label} "
+        f"--run-probe "
+        f"--wandb-run-id {wandb_run.id} "
+        f"--wandb-project {cfg.wandb.project} "
+        f"--wandb-entity {cfg.wandb.entity} "
+        f"--step {global_step}"
+    )
+    job_id = eval_slurm.submit(
+        eval_cmd, tag="emb_eval", cancel_pending=True,
+        job_name=f"eval_{cfg.experiment.name}_{global_step}",
+        mem="128G",
+    )
+    if job_id:
+        print(f"Submitted async eval job {job_id} for step {global_step}")
 
 
 def main(cfg):
@@ -667,6 +716,8 @@ def main(cfg):
     if chk:
         print(f"******** Loading checkpoint {run_name} {chk}...")
         ckpt = torch.load(chk, map_location=f"cuda:{local_rank}", weights_only=False)
+        # Slice consolidated EP expert weights to this rank's shard
+        ckpt["model"] = _scatter_ep_experts(raw_model, ckpt["model"])
         if use_fsdp:
             try:
                 from torch.distributed.checkpoint.state_dict import (
@@ -709,6 +760,16 @@ def main(cfg):
     # --- Checkpoint manager ---
     ckpt_dir = os.path.join(cfg.experiment.checkpoint.path, cfg.experiment.name)
     ckpt_mgr = CheckpointManager(dirpath=ckpt_dir, save_top_k=cfg.experiment.checkpoint.save_top_k)
+
+    # --- Async eval via Slurm ---
+    eval_slurm = None
+    if is_main and cfg.wandb.enable:
+        try:
+            from ..slurm_utils import SlurmJobManager
+            eval_slurm = SlurmJobManager()
+            os.makedirs(os.path.join(os.getcwd(), "slurm_logs"), exist_ok=True)
+        except Exception as e:
+            print(f"Warning: Could not init SlurmJobManager: {e}")
 
     # --- FLOPS tracking ---
     cumulative_flops = 0
@@ -949,12 +1010,14 @@ def main(cfg):
                         best_val_loss, metric_value=val_loss, run_name=run_name,
                         rank=local_rank,
                     )
+                    _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step)
 
                     model.train()
 
                 # Periodic checkpoint — all ranks participate for FSDP2, rank 0 writes
                 if ckpt_interval > 0 and global_step % ckpt_interval == 0:
                     ckpt_mgr.save_periodic(model, optimizer, scheduler, global_step, epoch, best_val_loss, rank=local_rank)
+                    _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step)
 
                 # Max steps check
                 if 0 < max_steps <= global_step:

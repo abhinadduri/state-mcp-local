@@ -24,6 +24,21 @@ def add_arguments_eval(parser: ap.ArgumentParser):
             "Path to protein embeddings override (.pt). If omitted, uses embeddings packaged in the checkpoint, or the path from config as fallback."
         ),
     )
+    parser.add_argument("--run-probe", action="store_true", help="Run perturbation classification probe on embeddings")
+    parser.add_argument(
+        "--probe-type", choices=["linear", "mlp"], default="linear",
+        help="Probe architecture: linear (single layer) or mlp (default: linear)",
+    )
+    parser.add_argument("--probe-epochs", type=int, default=3, help="Training epochs for probe (default: 3)")
+    parser.add_argument(
+        "--subsample", type=int, default=None,
+        help="Stratified subsample to N cells before evaluation, preserving all perturbation classes",
+    )
+    # Wandb logging — used by async Slurm eval to log to the training run
+    parser.add_argument("--wandb-run-id", default=None, help="Wandb run ID to log metrics to")
+    parser.add_argument("--wandb-project", default=None, help="Wandb project")
+    parser.add_argument("--wandb-entity", default=None, help="Wandb entity")
+    parser.add_argument("--step", type=int, default=None, help="Training step to associate metrics with")
 
 
 def run_emb_eval(args):
@@ -63,6 +78,14 @@ def run_emb_eval(args):
     # Load AnnData
     adata = sc.read_h5ad(args.adata)
     print(f"Loaded AnnData with shape: {adata.shape}")
+
+    # Stratified subsampling if requested
+    if args.subsample:
+        from ...emb.nn.eval_utils import subsample_adata
+        n_perts = adata.obs[args.pert_col].nunique()
+        print(f"Subsampling to ~{args.subsample} cells ({n_perts} perturbations, ~{args.subsample // n_perts} cells each)...")
+        adata = subsample_adata(adata, args.subsample, pert_col=args.pert_col)
+        print(f"Subsampled AnnData shape: {adata.shape}")
 
     # Create inference object and load model
     print("Creating inference object and loading model...")
@@ -295,7 +318,57 @@ def run_emb_eval(args):
     print(f"Mean gene overlap: {mean_overlap:.4f}")
     print(f"Number of perturbations evaluated: {len(de_metrics)}")
 
-    return de_metrics, mean_overlap
+    # Run perturbation classification probe if requested
+    probe_results = None
+    if getattr(args, "run_probe", False):
+        from ...emb.nn.eval_utils import run_intrinsic_benchmark
+        print("\n" + "=" * 60)
+        print("Running perturbation classification probe...")
+        print("=" * 60)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        probe_results = run_intrinsic_benchmark(
+            adata, device, logger=print,
+            probe_type=getattr(args, "probe_type", "linear"),
+            epochs=getattr(args, "probe_epochs", 3),
+            perturb_key=args.pert_col,
+        )
+        print(f"\nProbe Accuracy: {probe_results['intrinsic_accuracy_mean']:.4f}")
+        print(f"Probe AUROC: {probe_results['intrinsic_auroc_mean']:.4f}")
+
+    # Log to wandb if run ID provided (async Slurm eval mode)
+    wandb_run_id = getattr(args, "wandb_run_id", None)
+    if wandb_run_id:
+        try:
+            import wandb
+            wandb.init(
+                id=wandb_run_id,
+                project=getattr(args, "wandb_project", None),
+                entity=getattr(args, "wandb_entity", None),
+                resume="allow",
+            )
+            # Use a custom x-axis so eval metrics don't conflict with
+            # the training step counter (which only increases).
+            wandb.define_metric("eval/step")
+            wandb.define_metric("eval/*", step_metric="eval/step")
+
+            step = getattr(args, "step", None)
+            metrics = {
+                "eval/step": step,
+                "eval/de_gene_overlap": mean_overlap,
+            }
+            if roc_aucs:
+                metrics["eval/roc_auc"] = float(np.mean(roc_aucs))
+                metrics["eval/pr_auc"] = float(np.mean(pr_aucs))
+            if probe_results:
+                metrics["eval/probe_accuracy"] = probe_results["intrinsic_accuracy_mean"]
+                metrics["eval/probe_auroc"] = probe_results["intrinsic_auroc_mean"]
+            wandb.log(metrics)
+            wandb.finish()
+            print(f"\nLogged metrics to wandb run {wandb_run_id} at step {step}")
+        except Exception as e:
+            print(f"Warning: Failed to log to wandb: {e}")
+
+    return de_metrics, mean_overlap, probe_results
 
 
 if __name__ == "__main__":
