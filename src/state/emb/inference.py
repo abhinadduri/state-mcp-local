@@ -209,7 +209,8 @@ class Inference:
             self.model.tokenizer.pe_embedding = pe_emb
         else:
             self.model.pe_embedding = pe_emb
-        self.model.binary_decoder.requires_grad = False
+        if self.model.binary_decoder is not None:
+            self.model.binary_decoder.requires_grad = False
         self.model.eval()
 
         if self.protein_embeds is None:
@@ -276,11 +277,11 @@ class Inference:
 
         # Create the correct tokenizer based on config
         tokenizer = None
-        if self._cfg_get(model_cfg, "tokenizer", "sentence") == "latent":
-            from .nn.tokenizer import LatentTokenizer
+        tokenizer_type = self._cfg_get(model_cfg, "tokenizer", "sentence")
+        if tokenizer_type in ("latent", "tabular_latent"):
             n_genes = int(self._cfg_get(emb_cfg, "num", 19790) or 19790)
             n_latent = int(self._cfg_get(model_cfg, "n_latent", 256))
-            tokenizer = LatentTokenizer(
+            tok_kwargs = dict(
                 n_genes=n_genes,
                 n_latent=n_latent,
                 token_dim=token_dim,
@@ -293,6 +294,14 @@ class Inference:
                 compiled=False,
                 cfg=cfg,
             )
+            if tokenizer_type == "tabular_latent":
+                from .nn.tokenizer import TabularLatentTokenizer
+                # Use n_cells_per_set=1 for inference (inter-cell attention is a no-op,
+                # avoids needing the TabularLatentCollator batch format)
+                tokenizer = TabularLatentTokenizer(n_cells_per_set=1, **tok_kwargs)
+            else:
+                from .nn.tokenizer import LatentTokenizer
+                tokenizer = LatentTokenizer(**tok_kwargs)
 
         return StateEmbeddingModel(
             token_dim=token_dim,

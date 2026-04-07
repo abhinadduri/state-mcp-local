@@ -138,20 +138,34 @@ def run_emb_eval(args):
     ds_emb_batches = []
     logprob_batches = []
 
+    has_nb_decoder = model.nb_decoder is not None
+    has_cls_decoder = model.binary_decoder is not None
+
+    # Pre-compute gene queries for NB decoder (all genes in adata)
+    if has_nb_decoder:
+        try:
+            all_gene_embeds = model.get_gene_embedding(adata.var.index)
+        except Exception:
+            all_gene_embeds = model.get_gene_embedding(adata.var["gene_symbols"])
+
     with torch.no_grad():
         with torch.autocast(device_type=device_type, dtype=precision):
             for batch in tqdm(dataloader, desc="Processing batches"):
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
-                # Compute embeddings — capture task_counts for RDA
-                _, task_counts_batch, _, emb, ds_emb = model._compute_embedding_for_batch(batch)
+                # Run tokenizer to get full output (needed for NB decoder's latent_bank)
+                out = model.tokenizer(batch)
+                emb = out.cell_embedding
+                ds_emb = out.dataset_emb
+                task_counts_batch = out.task_counts
 
-                # Get gene embeddings
-                try:
-                    gene_embeds = model.get_gene_embedding(adata.var.index)
-                except Exception:
-                    gene_embeds = model.get_gene_embedding(adata.var["gene_symbols"])
+                # Get gene embeddings for CLS decoder
+                if has_cls_decoder:
+                    try:
+                        gene_embeds = model.get_gene_embedding(adata.var.index)
+                    except Exception:
+                        gene_embeds = model.get_gene_embedding(adata.var["gene_symbols"])
 
                 # Handle dataset embeddings
                 if hasattr(model, "dataset_token") and model.dataset_token is not None:
@@ -163,22 +177,24 @@ def run_emb_eval(args):
                 if ds_emb is not None:
                     ds_emb_batches.append(ds_emb.detach().cpu().float().numpy())
 
-                # Decode: use model._decode which handles bottleneck projections correctly
-                B_cur = emb.shape[0]
-
-                # Expand gene embeddings to batch: [n_genes, d_model] → [B, n_genes, d_model]
-                gene_embeds_batch = gene_embeds.unsqueeze(0).expand(B_cur, -1, -1)
-
-                # _decode handles gene_proj, cell_proj, rda, ds_emb concatenation
-                # Use task_counts_batch for RDA computation (mean non-zero expression)
-                logprobs_batch = model._decode(gene_embeds_batch, task_counts_batch, emb, ds_emb=ds_emb)
-                # For discrete models, convert bin logits to continuous values
-                logprobs_batch = model.decode_to_continuous(logprobs_batch)
-                logprobs_batch = logprobs_batch.detach().cpu().float().numpy()
-                logprob_batches.append(logprobs_batch)
+                # Decode: compute gene prediction scores
+                if has_cls_decoder:
+                    B_cur = emb.shape[0]
+                    gene_embeds_batch = gene_embeds.unsqueeze(0).expand(B_cur, -1, -1)
+                    logprobs_batch = model._decode(gene_embeds_batch, task_counts_batch, emb, ds_emb=ds_emb)
+                    logprobs_batch = model.decode_to_continuous(logprobs_batch)
+                    logprobs_batch = logprobs_batch.detach().cpu().float().numpy()
+                    logprob_batches.append(logprobs_batch)
+                elif has_nb_decoder:
+                    B_cur = emb.shape[0]
+                    gene_queries = all_gene_embeds.unsqueeze(0).expand(B_cur, -1, -1).detach()
+                    latent_bank = out.latent_tokens  # [B, 1+n_latent, d_model]
+                    px_scale_logits, _ = model.nb_decoder(gene_queries, latent_bank)
+                    # Use softmax(logits) as predicted relative expression
+                    pred_expr = torch.softmax(px_scale_logits, dim=-1)
+                    logprob_batches.append(pred_expr.detach().cpu().float().numpy())
 
     # Combine batches
-    logprob_batches = np.vstack(logprob_batches)
     emb_combined = np.vstack(emb_batches)
     if ds_emb_batches:
         ds_emb_combined = np.vstack(ds_emb_batches)
@@ -186,137 +202,137 @@ def run_emb_eval(args):
     else:
         adata.obsm["X_emb"] = emb_combined
 
-    # Create predictions DataFrame
-    probs_df = pd.DataFrame(logprob_batches)
-    probs_df[args.pert_col] = adata.obs[args.pert_col].values
-
-    # Get top-k genes for each perturbation
-    k = cfg.validations.diff_exp.top_k_rank
-    probs_df = probs_df.groupby(args.pert_col).mean()
-    ctrl = probs_df.loc[args.control_pert].values
-    pert_effects = np.abs(probs_df - ctrl)
-    top_k_indices = np.argsort(pert_effects.values, axis=1)[:, -k:][:, ::-1]
-    top_k_genes = np.array(adata.var.index)[top_k_indices]
-    pred_de_genes = pd.DataFrame(top_k_genes)
-    pred_de_genes.index = pert_effects.index.values
-
-    print(f"Predicted DEGs shape: {pred_de_genes.shape}")
-
-    # Compute ground truth DEGs for ALL genes (for ROC/PR curves)
-    print("Computing ground truth DEGs for all genes...")
-    adata_copy = adata.copy()  # Don't modify original adata
-    sc.pp.log1p(adata_copy)
-
-    # First compute for top k genes (for overlap metric)
-    sc.tl.rank_genes_groups(
-        adata_copy,
-        groupby=args.pert_col,
-        reference=args.control_pert,
-        rankby_abs=True,
-        n_genes=k,
-        method=cfg.validations.diff_exp.method,
-        use_raw=False,
-    )
-    true_de_genes = pd.DataFrame(adata_copy.uns["rank_genes_groups"]["names"])
-    true_de_genes = true_de_genes.T
-
-    print(f"Ground truth DEGs shape: {true_de_genes.shape}")
-
-    # Compute overlap metrics
-    print("Computing gene overlap metrics...")
-    de_metrics = compute_gene_overlap_cross_pert(pred_de_genes, true_de_genes, control_pert=args.control_pert, k=k)
-
-    # Now compute for ALL genes (for ROC/PR curves)
-    print("Computing statistical tests for all genes...")
-    sc.tl.rank_genes_groups(
-        adata_copy,
-        groupby=args.pert_col,
-        reference=args.control_pert,
-        rankby_abs=True,
-        n_genes=adata_copy.n_vars,  # All genes
-        method=cfg.validations.diff_exp.method,
-        use_raw=False,
-    )
-
-    # Compute ROC and PR curves per perturbation with correct gene alignment
-    print("Computing ROC and PR curves per perturbation...")
-    from sklearn.metrics import roc_curve, precision_recall_curve, auc
-    from scipy.stats import sem
-
-    roc_curves = []
-    pr_curves = []
+    de_metrics = {}
+    mean_overlap = float("nan")
     roc_aucs = []
     pr_aucs = []
 
-    # Get ground truth results from scanpy
-    names_df = pd.DataFrame(adata_copy.uns["rank_genes_groups"]["names"])
-    pvals_df = pd.DataFrame(adata_copy.uns["rank_genes_groups"]["pvals_adj"])
+    has_predictions = len(logprob_batches) > 0
+    if has_predictions:
+        logprob_batches = np.vstack(logprob_batches)
 
-    # Get gene order from original adata
-    gene_order = adata.var.index.tolist()
+        # Create predictions DataFrame
+        probs_df = pd.DataFrame(logprob_batches)
+        probs_df[args.pert_col] = adata.obs[args.pert_col].values
 
-    for pert in pert_effects.index:
-        if pert == args.control_pert or pert not in names_df.columns:
-            continue
+        # Get top-k genes for each perturbation
+        k = cfg.validations.diff_exp.top_k_rank
+        probs_df = probs_df.groupby(args.pert_col).mean()
+        ctrl = probs_df.loc[args.control_pert].values
+        pert_effects = np.abs(probs_df - ctrl)
+        top_k_indices = np.argsort(pert_effects.values, axis=1)[:, -k:][:, ::-1]
+        top_k_genes = np.array(adata.var.index)[top_k_indices]
+        pred_de_genes = pd.DataFrame(top_k_genes)
+        pred_de_genes.index = pert_effects.index.values
 
-        # Get predicted scores (in original gene order)
-        pred_scores = pert_effects.loc[pert].values
+        print(f"Predicted DEGs shape: {pred_de_genes.shape}")
 
-        # Get ground truth results for this perturbation (proper alignment)
-        pert_col_idx = names_df.columns.get_loc(pert)
-        pert_names = names_df.iloc[:, pert_col_idx].values  # Gene names ordered by significance
-        pert_pvals = pvals_df.iloc[:, pert_col_idx].values  # P-values in same order
+        # Compute ground truth DEGs for ALL genes (for ROC/PR curves)
+        print("Computing ground truth DEGs for all genes...")
+        adata_copy = adata.copy()  # Don't modify original adata
+        sc.pp.log1p(adata_copy)
 
-        # Create a mapping from gene name to p-value
-        gene_to_pval = dict(zip(pert_names, pert_pvals))
+        # First compute for top k genes (for overlap metric)
+        sc.tl.rank_genes_groups(
+            adata_copy,
+            groupby=args.pert_col,
+            reference=args.control_pert,
+            rankby_abs=True,
+            n_genes=k,
+            method=cfg.validations.diff_exp.method,
+            use_raw=False,
+        )
+        true_de_genes = pd.DataFrame(adata_copy.uns["rank_genes_groups"]["names"])
+        true_de_genes = true_de_genes.T
 
-        # Create p-values in the same order as predicted scores (original gene order)
-        aligned_pvals = []
-        aligned_pred_scores = []
+        print(f"Ground truth DEGs shape: {true_de_genes.shape}")
 
-        for i, gene in enumerate(gene_order):
-            if gene in gene_to_pval:
-                aligned_pvals.append(gene_to_pval[gene])
-                aligned_pred_scores.append(pred_scores[i])
-            else:
-                # If gene not in statistical test results, assign p-value of 1.0 (not significant)
-                aligned_pvals.append(1.0)
-                aligned_pred_scores.append(pred_scores[i])
+        # Compute overlap metrics
+        print("Computing gene overlap metrics...")
+        de_metrics = compute_gene_overlap_cross_pert(pred_de_genes, true_de_genes, control_pert=args.control_pert, k=k)
 
-        aligned_pvals = np.array(aligned_pvals)
-        aligned_pred_scores = np.array(aligned_pred_scores)
+        # Now compute for ALL genes (for ROC/PR curves)
+        print("Computing statistical tests for all genes...")
+        sc.tl.rank_genes_groups(
+            adata_copy,
+            groupby=args.pert_col,
+            reference=args.control_pert,
+            rankby_abs=True,
+            n_genes=adata_copy.n_vars,  # All genes
+            method=cfg.validations.diff_exp.method,
+            use_raw=False,
+        )
 
-        # Create binary labels
-        true_labels = (aligned_pvals < 0.05).astype(int)
+        # Compute ROC and PR curves per perturbation with correct gene alignment
+        print("Computing ROC and PR curves per perturbation...")
+        from sklearn.metrics import roc_curve, precision_recall_curve, auc
+        from scipy.stats import sem
 
-        # Skip if all labels are the same
-        if len(np.unique(true_labels)) < 2:
-            continue
+        roc_curves = []
+        pr_curves = []
 
-        # Compute ROC curve
-        fpr, tpr, _ = roc_curve(true_labels, aligned_pred_scores)
-        roc_auc = auc(fpr, tpr)
-        roc_curves.append((fpr, tpr))
-        roc_aucs.append(roc_auc)
+        # Get ground truth results from scanpy
+        names_df = pd.DataFrame(adata_copy.uns["rank_genes_groups"]["names"])
+        pvals_df = pd.DataFrame(adata_copy.uns["rank_genes_groups"]["pvals_adj"])
 
-        # Compute PR curve
-        precision, recall, _ = precision_recall_curve(true_labels, aligned_pred_scores)
-        pr_auc = auc(recall, precision)
-        pr_curves.append((precision, recall))
-        pr_aucs.append(pr_auc)
+        # Get gene order from original adata
+        gene_order = adata.var.index.tolist()
 
-    # Compute and report AUC metrics
-    if roc_curves:
-        print(f"\nROC AUC: {np.mean(roc_aucs):.4f} ± {sem(roc_aucs):.4f}")
-        print(f"PR AUC: {np.mean(pr_aucs):.4f} ± {sem(pr_aucs):.4f}")
-    else:
-        print("No valid ROC/PR curves could be computed (insufficient variation in labels)")
+        for pert in pert_effects.index:
+            if pert == args.control_pert or pert not in names_df.columns:
+                continue
 
-    # Print overlap results
-    mean_overlap = np.array(list(de_metrics.values())).mean()
-    print("\nOverlap Results:")
-    print(f"Mean gene overlap: {mean_overlap:.4f}")
-    print(f"Number of perturbations evaluated: {len(de_metrics)}")
+            # Get predicted scores (in original gene order)
+            pred_scores = pert_effects.loc[pert].values
+
+            # Get ground truth results for this perturbation (proper alignment)
+            pert_col_idx = names_df.columns.get_loc(pert)
+            pert_names = names_df.iloc[:, pert_col_idx].values
+            pert_pvals = pvals_df.iloc[:, pert_col_idx].values
+
+            gene_to_pval = dict(zip(pert_names, pert_pvals))
+
+            aligned_pvals = []
+            aligned_pred_scores = []
+
+            for i, gene in enumerate(gene_order):
+                if gene in gene_to_pval:
+                    aligned_pvals.append(gene_to_pval[gene])
+                    aligned_pred_scores.append(pred_scores[i])
+                else:
+                    aligned_pvals.append(1.0)
+                    aligned_pred_scores.append(pred_scores[i])
+
+            aligned_pvals = np.array(aligned_pvals)
+            aligned_pred_scores = np.array(aligned_pred_scores)
+
+            true_labels = (aligned_pvals < 0.05).astype(int)
+
+            if len(np.unique(true_labels)) < 2:
+                continue
+
+            fpr, tpr, _ = roc_curve(true_labels, aligned_pred_scores)
+            roc_auc = auc(fpr, tpr)
+            roc_curves.append((fpr, tpr))
+            roc_aucs.append(roc_auc)
+
+            precision, recall, _ = precision_recall_curve(true_labels, aligned_pred_scores)
+            pr_auc = auc(recall, precision)
+            pr_curves.append((precision, recall))
+            pr_aucs.append(pr_auc)
+
+        # Compute and report AUC metrics
+        if roc_curves:
+            from scipy.stats import sem
+            print(f"\nROC AUC: {np.mean(roc_aucs):.4f} ± {sem(roc_aucs):.4f}")
+            print(f"PR AUC: {np.mean(pr_aucs):.4f} ± {sem(pr_aucs):.4f}")
+        else:
+            print("No valid ROC/PR curves could be computed (insufficient variation in labels)")
+
+        mean_overlap = np.array(list(de_metrics.values())).mean()
+        print("\nOverlap Results:")
+        print(f"Mean gene overlap: {mean_overlap:.4f}")
+        print(f"Number of perturbations evaluated: {len(de_metrics)}")
 
     # Run perturbation classification probe if requested
     probe_results = None

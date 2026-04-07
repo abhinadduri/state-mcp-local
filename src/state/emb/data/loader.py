@@ -79,7 +79,7 @@ def create_dataloader(
     )
     if sentence_collator is None:
         tokenizer_type = getattr(cfg.model, "tokenizer", "sentence") if hasattr(cfg, "model") else "sentence"
-        if tokenizer_type == "latent":
+        if tokenizer_type in ("latent", "tabular_latent"):
             from ..nn.tokenizer import LatentCollator
             emb_cfg = utils.get_embedding_cfg(cfg)
             n_genes = int(getattr(emb_cfg, "num", 19790) or 19790)
@@ -115,7 +115,7 @@ def create_dataloader(
 
 
 class H5adSentenceDataset(data.Dataset):
-    def __init__(self, cfg, test=False, datasets=None, shape_dict=None, adata=None, adata_name=None) -> None:
+    def __init__(self, cfg, test=False, datasets=None, shape_dict=None, adata=None, adata_name=None, dataset_path_map=None) -> None:
         super(H5adSentenceDataset, self).__init__()
 
         self.adata = None
@@ -137,7 +137,8 @@ class H5adSentenceDataset(data.Dataset):
             assert len(datasets) == len(shape_dict)
             self.datasets = datasets
             self.shapes_dict = shape_dict
-            self.dataset_path_map = {dataset: dataset for dataset in datasets}
+            self.dataset_path_map = dataset_path_map or {dataset: dataset for dataset in datasets}
+            self.dataset_group_map = {dataset: "leiden" for dataset in datasets}
 
         self.datasets = sorted(self.datasets)
         self.cfg = cfg

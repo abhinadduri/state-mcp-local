@@ -14,7 +14,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+import pandas as pd
+from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim.lr_scheduler import ChainedScheduler, LinearLR, CosineAnnealingLR
 from datetime import timedelta
@@ -300,19 +301,96 @@ def apply_fsdp2(model, reshard_after_forward=True, root_only=False, shard_group_
     return model
 
 
-def run_validation(model, val_dataloader, limit_val_batches):
-    """Run validation loop, return mean val loss."""
+class PerSpeciesBatchSampler:
+    """Yield species-pure batches from a ConcatDataset of per-species datasets.
+
+    Each species gets up to ``limit_val_batches`` batches.  Distributed
+    sharding is handled per-species so every rank sees every species.
+    """
+
+    def __init__(self, cumulative_sizes, batch_size, limit_val_batches,
+                 num_replicas=1, rank=0):
+        self.cumulative_sizes = cumulative_sizes
+        self.batch_size = batch_size
+        self.limit_val_batches = limit_val_batches
+        self.num_replicas = num_replicas
+        self.rank = rank
+
+    def __iter__(self):
+        prev = 0
+        for cum_size in self.cumulative_sizes:
+            indices = list(range(prev, cum_size))
+            indices = indices[self.rank::self.num_replicas]
+            n_yielded = 0
+            for i in range(0, len(indices), self.batch_size):
+                if 0 < self.limit_val_batches <= n_yielded:
+                    break
+                yield indices[i:i + self.batch_size]
+                n_yielded += 1
+            prev = cum_size
+
+    def __len__(self):
+        return sum(self.species_batch_counts())
+
+    def species_batch_counts(self):
+        """Return the number of batches that will be yielded per species."""
+        counts = []
+        prev = 0
+        for cum_size in self.cumulative_sizes:
+            n = len(list(range(prev, cum_size))[self.rank::self.num_replicas])
+            n_batches = (n + self.batch_size - 1) // self.batch_size
+            if self.limit_val_batches > 0:
+                n_batches = min(self.limit_val_batches, n_batches)
+            counts.append(n_batches)
+            prev = cum_size
+        return counts
+
+
+def run_validation(model, val_dataloader, limit_val_batches,
+                   species_names=None, species_batch_counts=None):
+    """Run validation loop.
+
+    Returns ``(overall_loss, species_losses)`` where *species_losses* is a
+    dict mapping species name to mean loss, or ``None`` for single-species.
+    """
     model.eval()
-    val_losses = []
     with torch.no_grad():
-        for i, batch in enumerate(val_dataloader):
-            if 0 < limit_val_batches <= i:
-                break
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                loss = model(batch)
-            val_losses.append(loss.item())
+        if species_names is None:
+            # Single-species / legacy path — unchanged behaviour.
+            val_losses = []
+            for i, batch in enumerate(val_dataloader):
+                if 0 < limit_val_batches <= i:
+                    break
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    loss = model(batch)
+                val_losses.append(loss.item())
+            model.train()
+            return (sum(val_losses) / len(val_losses) if val_losses else float("inf")), None
+
+        # Multi-species: consume batches species-by-species (the batch
+        # sampler guarantees ordering).
+        val_iter = iter(val_dataloader)
+        all_batch_losses = []
+        species_losses = {}
+        for sp_name, sp_count in zip(species_names, species_batch_counts):
+            sp_losses = []
+            for _ in range(sp_count):
+                batch = next(val_iter)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    loss = model(batch)
+                sp_losses.append(loss.item())
+                all_batch_losses.append(loss.item())
+            species_losses[sp_name] = (
+                sum(sp_losses) / len(sp_losses) if sp_losses else float("inf")
+            )
+
+        overall = (
+            sum(all_batch_losses) / len(all_batch_losses)
+            if all_batch_losses else float("inf")
+        )
+
     model.train()
-    return sum(val_losses) / len(val_losses) if val_losses else float("inf")
+    return overall, species_losses
 
 
 def _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step):
@@ -329,6 +407,7 @@ def _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step):
         f"--adata {diff_exp.dataset} "
         f"--pert-col {diff_exp.obs_pert_col} "
         f"--control-pert {diff_exp.obs_filter_label} "
+        f"--batch-size 128 "
         f"--run-probe "
         f"--wandb-run-id {wandb_run.id} "
         f"--wandb-project {cfg.wandb.project} "
@@ -683,12 +762,64 @@ def main(cfg):
 
     model.train()
 
+    # --- Per-species validation setup ---
+    val_species_names = None
+    val_species_batch_counts = None
+    limit_val_batches = cfg.experiment.limit_val_batches
+
+    val_csv_path = get_dataset_cfg(cfg).val
+    _val_df = pd.read_csv(val_csv_path)
+    _species_list = (
+        sorted(_val_df["species"].unique().tolist())
+        if "species" in _val_df.columns else []
+    )
+    if len(_species_list) > 1:
+        species_datasets = []
+        val_species_names = []
+        for sp in _species_list:
+            sp_df = _val_df[_val_df["species"] == sp]
+            sp_ns = sorted(sp_df["names"].astype(str).tolist())
+            sp_shapes = {
+                str(r.names): (int(r.num_cells), int(r.num_genes))
+                for _, r in sp_df.iterrows()
+            }
+            sp_paths = {str(r.names): r.path for _, r in sp_df.iterrows()}
+            sp_dataset = H5adSentenceDataset(
+                cfg, datasets=sp_ns, shape_dict=sp_shapes,
+                dataset_path_map=sp_paths,
+            )
+            species_datasets.append(sp_dataset)
+            val_species_names.append(sp)
+
+        concat_val = ConcatDataset(species_datasets)
+        batch_sampler = PerSpeciesBatchSampler(
+            concat_val.cumulative_sizes,
+            cfg.model.batch_size,
+            limit_val_batches,
+            num_replicas=world_size if is_distributed else 1,
+            rank=local_rank if is_distributed else 0,
+        )
+        val_species_batch_counts = batch_sampler.species_batch_counts()
+        val_dataloader = DataLoader(
+            concat_val,
+            batch_sampler=batch_sampler,
+            collate_fn=val_collator,
+            num_workers=n_val_workers,
+            persistent_workers=n_val_workers > 0,
+            pin_memory=True,
+            prefetch_factor=4 if n_val_workers > 0 else None,
+        )
+        print(
+            f"Per-species validation: {len(val_species_names)} species, "
+            f"{sum(val_species_batch_counts)} total batches"
+        )
+    del _val_df, _species_list
+
     # --- Config values ---
     grad_accum = cfg.optimizer.gradient_accumulation_steps
     max_grad_norm = cfg.optimizer.max_grad_norm
     ckpt_interval = cfg.experiment.checkpoint.every_n_train_steps
     val_interval = int(cfg.experiment.val_check_interval)
-    limit_val_batches = cfg.experiment.limit_val_batches
 
     max_steps = -1
     if cfg.experiment.profile.enable_profiler:
@@ -981,25 +1112,35 @@ def main(cfg):
 
                 # Validation
                 if val_interval > 0 and limit_val_batches > 0 and global_step % val_interval == 0:
-                    val_loss = run_validation(model, val_dataloader, limit_val_batches)
+                    val_loss, species_losses = run_validation(
+                        model, val_dataloader, limit_val_batches,
+                        species_names=val_species_names,
+                        species_batch_counts=val_species_batch_counts,
+                    )
 
                     if is_distributed:
                         val_loss_tensor = torch.tensor(val_loss, device=f"cuda:{local_rank}")
                         dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
                         val_loss = val_loss_tensor.item()
+                        if species_losses:
+                            for sp in species_losses:
+                                sp_t = torch.tensor(species_losses[sp], device=f"cuda:{local_rank}")
+                                dist.all_reduce(sp_t, op=dist.ReduceOp.AVG)
+                                species_losses[sp] = sp_t.item()
 
                     if is_main:
                         print(f"\n[Step {global_step}] val_loss={val_loss:.4f} (best={best_val_loss:.4f})")
                         if wandb_run:
                             import wandb
 
-                            wandb.log(
-                                {
-                                    "validation/val_loss": val_loss,
-                                    "cumulative_flops": float(cumulative_flops),
-                                },
-                                step=global_step,
-                            )
+                            log_dict = {
+                                "validation/val_loss": val_loss,
+                                "cumulative_flops": float(cumulative_flops),
+                            }
+                            if species_losses:
+                                for sp, sp_loss in species_losses.items():
+                                    log_dict[f"validation/val_loss_{sp}"] = sp_loss
+                            wandb.log(log_dict, step=global_step)
 
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
