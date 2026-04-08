@@ -964,9 +964,10 @@ def main(cfg):
                 log.info(f"Starting NSys profiling at microstep {microstep}")
                 torch.cuda.nvtx.range_push("VCIProfiledSection")
 
-            # Track time for the accumulation window
+            # Track time and loss for the accumulation window
             if microstep % grad_accum == 0:
                 accum_start = time.time()
+                accum_loss = 0.0
 
             # Skip gradient sync on non-final accumulation microsteps
             is_accum_step = (microstep + 1) % grad_accum != 0
@@ -1001,6 +1002,7 @@ def main(cfg):
                     _t1_fwd.record()
                     _t0_bwd.record()
 
+                accum_loss += loss.item()
                 loss_scaled = loss / grad_accum
                 loss_scaled.backward()
 
@@ -1083,8 +1085,9 @@ def main(cfg):
                 # Update progress bar (one tick per optimizer step)
                 if is_main:
                     pbar.update(1)
+                    avg_loss = accum_loss / grad_accum
                     pbar.set_postfix({
-                        "loss": f"{loss.item():.4f}",
+                        "loss": f"{avg_loss:.4f}",
                         "lr": f"{lr:.2e}",
                         "c/s": f"{cells_per_sec:.0f}",
                         "mfu": f"{mfu:.1f}%",
@@ -1095,7 +1098,7 @@ def main(cfg):
                     import wandb
 
                     log_dict = {
-                        "trainer/train_loss": loss.item(),
+                        "trainer/train_loss": accum_loss / grad_accum,
                         "trainer/learning_rate": lr,
                         "perf/cells_per_sec": cells_per_sec,
                         "perf/mfu": mfu,
