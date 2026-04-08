@@ -418,7 +418,7 @@ def _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step, cumula
     job_id = eval_slurm.submit(
         eval_cmd, tag="emb_eval", cancel_pending=True,
         job_name=f"eval_{cfg.experiment.name}_{global_step}",
-        mem="128G",
+        mem="256G",
     )
     if job_id:
         print(f"Submitted async eval job {job_id} for step {global_step}")
