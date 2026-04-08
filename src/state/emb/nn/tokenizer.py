@@ -614,6 +614,8 @@ class LatentTokenizer(Tokenizer):
             count_emb = torch.zeros(B, k_max, self.d_model, device=device)
 
         # --- Column masking: replace count encoding with learned mask token ---
+        # Per-instance masking: each cell gets its own random set of masked genes,
+        # restricted to real (non-padding) positions.
         encoder_mask = None
         if self.training and self._mask_rate_max > 0:
             mask_rate = torch.empty(1, device=device).uniform_(
@@ -621,9 +623,12 @@ class LatentTokenizer(Tokenizer):
             ).item()
             n_mask = int(k_max * mask_rate)
             if n_mask > 0:
-                mask_cols = torch.randperm(k_max, device=device)[:n_mask]
+                rand = torch.rand(B, k_max, device=device)
+                rand.masked_fill_(~gene_mask, -1.0)  # exclude padding from selection
+                _, topk_idx = rand.topk(n_mask, dim=-1)  # [B, n_mask]
                 encoder_mask = torch.zeros(B, k_max, dtype=torch.bool, device=device)
-                encoder_mask[:, mask_cols] = True
+                encoder_mask.scatter_(1, topk_idx, True)
+                encoder_mask &= gene_mask  # safety: never mask padding
                 # Replace count_emb with learned mask embedding for masked genes
                 # Gene identity (gene_embs) preserved — model knows WHICH gene
                 # Expression info (count_emb) replaced — model doesn't know HOW MUCH
@@ -824,6 +829,7 @@ class TabularLatentTokenizer(LatentTokenizer):
             count_emb = torch.zeros(B, k_max, self.d_model, device=device)
 
         # --- Column masking: replace count encoding with learned mask token ---
+        # Per-instance masking: each cell gets its own random set of masked genes.
         encoder_mask = None
         if self.training and self._mask_rate_max > 0:
             mask_rate = torch.empty(1, device=device).uniform_(
@@ -831,9 +837,12 @@ class TabularLatentTokenizer(LatentTokenizer):
             ).item()
             n_mask = int(k_max * mask_rate)
             if n_mask > 0:
-                mask_cols = torch.randperm(k_max, device=device)[:n_mask]
+                rand = torch.rand(B, k_max, device=device)
+                rand.masked_fill_(~gene_mask, -1.0)
+                _, topk_idx = rand.topk(n_mask, dim=-1)
                 encoder_mask = torch.zeros(B, k_max, dtype=torch.bool, device=device)
-                encoder_mask[:, mask_cols] = True
+                encoder_mask.scatter_(1, topk_idx, True)
+                encoder_mask &= gene_mask
                 mask_expanded = encoder_mask.unsqueeze(-1)
                 count_emb = torch.where(mask_expanded, self.mask_token.expand_as(count_emb), count_emb)
 
