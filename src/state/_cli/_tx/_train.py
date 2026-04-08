@@ -202,6 +202,12 @@ def run_tx_train(cfg: DictConfig):
         "Model created. Estimated params size: %.2f GB",
         sum(p.numel() * p.element_size() for p in model.parameters()) / 1024**3,
     )
+
+    # Build ICL demo cache if model supports it
+    if hasattr(model, "build_demo_cache"):
+        logger.info("Building ICL demonstration cache...")
+        model.build_demo_cache(data_module)
+        logger.info("ICL demonstration cache built successfully.")
     loggers = get_loggers(
         output_dir=cfg["output_dir"],
         name=cfg["name"],
@@ -235,11 +241,11 @@ def run_tx_train(cfg: DictConfig):
     callbacks = ckpt_callbacks + [batch_speed_monitor]
 
     # Track gradient norm only for state transition model
-    if cfg["model"]["name"] == "state":
+    if cfg["model"]["name"] in ("state", "state_icl"):
         callbacks.append(GradNormCallback(log_interval=int(cfg["training"].get("gradnorm_log_interval", 50))))
 
     # Add ModelFLOPSUtilizationCallback to track and log MFU. currently only works for state transition model
-    if cfg["training"]["use_mfu"] and cfg["model"]["name"] == "state":
+    if cfg["training"]["use_mfu"] and cfg["model"]["name"] in ("state", "state_icl"):
         mfu_available_flops = cfg["training"]["mfu_kwargs"]["available_flops"]
         mfu_use_backward = cfg["training"]["mfu_kwargs"]["use_backward"]
         mfu_logging_interval = cfg["training"]["mfu_kwargs"]["logging_interval"]
@@ -254,7 +260,7 @@ def run_tx_train(cfg: DictConfig):
 
         callbacks.append(mfu_cb)
 
-    if "cumulative_flops_use_backward" in cfg["training"] and cfg["model"]["name"] == "state":
+    if "cumulative_flops_use_backward" in cfg["training"] and cfg["model"]["name"] in ("state", "state_icl"):
         cumulative_flops_use_backward = cfg["training"]["cumulative_flops_use_backward"]
         cumulative_flops_cb = CumulativeFLOPSCallback(use_backward=cumulative_flops_use_backward)
         callbacks.append(cumulative_flops_cb)

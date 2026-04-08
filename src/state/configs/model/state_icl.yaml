@@ -1,0 +1,64 @@
+name: state_icl
+checkpoint: null
+device: cuda
+
+kwargs:
+  cell_set_len: 64
+  blur: 0.05
+  hidden_dim: 384
+  loss: energy
+  nb_loss: false
+  nb_embed_loss_weight: 0.0
+  n_encoder_layers: 1
+  n_decoder_layers: 1
+  predict_residual: True
+  softplus: True
+  freeze_pert_backbone: False
+  transformer_decoder: False
+  finetune_vci_decoder: False
+  batch_encoder: False
+  mask_attn: False
+
+  # ICL-specific parameters
+  n_demo_perts: 4
+  n_demo_cells_per_pert: 8
+  demo_dropout: 0.3
+  use_segment_embeddings: True
+  cross_context_prob: 0.5  # 50% of training batches use demos from a different cell type
+
+  use_effect_gating_token: False
+  distributional_loss: energy
+  init_from: null
+  llm_name: null
+
+  transformer_backbone_key: llama
+  transformer_backbone_kwargs:
+      bidirectional_attention: true
+      max_position_embeddings: 96  # 64 query + 32 demo tokens
+      hidden_size: ${model.kwargs.hidden_dim}
+      intermediate_size: 3072
+      num_hidden_layers: 8
+      num_attention_heads: 12
+      num_key_value_heads: 12
+      head_dim: 64
+      use_cache: false
+      attention_dropout: 0.0
+      hidden_dropout: 0.0
+      layer_norm_eps: 1e-6
+      pad_token_id: 0
+      bos_token_id: 1
+      eos_token_id: 2
+      tie_word_embeddings: false
+      rotary_dim: 0
+      use_rotary_embeddings: false
+
+  lora:
+      enable: false
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      bias: none
+      target: auto
+      adapt_mlp: false
+      task_type: FEATURE_EXTRACTION
+      merge_on_eval: false

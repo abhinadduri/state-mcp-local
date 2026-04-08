@@ -781,6 +781,10 @@ def run_tx_evaluate(args: ap.ArgumentParser):
         from ...tx.models.state_transition import StateTransitionPerturbationModel
 
         ModelClass = StateTransitionPerturbationModel
+    elif model_class_name.lower() == "state_icl":
+        from ...tx.models.state_transition_icl import ICLStateTransitionPerturbationModel
+
+        ModelClass = ICLStateTransitionPerturbationModel
 
     elif model_class_name.lower() in ["globalsimplesum", "perturb_mean"]:
         from ...tx.models.perturb_mean import PerturbMeanPerturbationModel
@@ -815,6 +819,19 @@ def run_tx_evaluate(args: ap.ArgumentParser):
     model = ModelClass.load_from_checkpoint(checkpoint_path, weights_only=False, **model_init_kwargs)
     model.eval()
     logger.info("Model loaded successfully.")
+
+    # Load ICL inference demos if available
+    if hasattr(model, "set_inference_demos"):
+        demo_file = os.path.join(args.output_dir, "inference_demos.pt")
+        if os.path.exists(demo_file):
+            demo_data = torch.load(demo_file, weights_only=False)
+            demo_batch = demo_data.get("demo_batch", demo_data)
+            device = next(model.parameters()).device
+            demo_batch = {k: v.to(device) for k, v in demo_batch.items()}
+            model.set_inference_demos(demo_batch)
+            logger.info("Loaded ICL inference demos from %s", demo_file)
+        else:
+            logger.info("No inference_demos.pt found; evaluating ICL model WITHOUT demos.")
 
     # -----------------------------------------------------------------------
     # 4. Run inference on test set
