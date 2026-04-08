@@ -409,7 +409,9 @@ class CrossAttentionBlock(nn.Module):
         n_q = queries.shape[1]
         k_max = kv_tokens.shape[1]
 
-        q = self.q_proj(queries)
+        # Pre-norm: normalize queries before projection (consistent with encoder)
+        normed_q = self.norm(queries)
+        q = self.q_proj(normed_q)
         kv = self.kv_proj(kv_tokens)
         k, v = kv.chunk(2, dim=-1)
 
@@ -427,7 +429,7 @@ class CrossAttentionBlock(nn.Module):
         attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, n_q, self.d_model)
         attn_out = self.out_proj(attn_out)
-        return self.norm(queries + attn_out)
+        return queries + attn_out
 
 
 class LatentTokenizer(Tokenizer):
