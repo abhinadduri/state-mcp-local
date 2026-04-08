@@ -956,7 +956,8 @@ def main(cfg):
         pbar = tqdm(total=pbar_total,
                     desc=f"Epoch {epoch}", disable=not is_main, dynamic_ncols=True,
                     initial=global_step if max_steps > 0 else 0)
-        accum_start = None
+        accum_start = time.time()
+        accum_loss = 0.0
 
         for batch in train_dataloader:
             # NSys profiling start
