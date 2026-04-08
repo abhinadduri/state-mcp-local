@@ -277,22 +277,27 @@ class MoEFFN(nn.Module):
         safety_cap = avg * 2
         local_max = _counts.max()
         dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=ep_group)
-        C = max(local_max.item(), 1)
-        if C > safety_cap:
-            log.warning("MoE routing imbalanced: max=%d, avg=%d, capping at %d", C, avg, safety_cap)
+        C_raw = max(local_max.item(), 1)
+        capped = C_raw > safety_cap
+        if capped:
+            log.warning("MoE routing imbalanced: max=%d, avg=%d, capping at %d", C_raw, avg, safety_cap)
             C = safety_cap
+        else:
+            C = C_raw
         C = ((C + _BUCKET - 1) // _BUCKET) * _BUCKET
 
         # Phase 1: Pack — use Triton if available (1 kernel vs ~20 PyTorch ops)
+        # Triton kernel has no capacity bounds check, so fall back to PyTorch
+        # when the safety cap is active (PyTorch path has keep guard).
         try:
             from .moe_triton import HAS_TRITON, triton_ep_pack, triton_ep_unpack
         except ImportError:
             HAS_TRITON = False
 
-        if HAS_TRITON:
+        if HAS_TRITON and not capped:
             padded_send, token_ids, expert_ids, positions = triton_ep_pack(
                 x_flat, top_k_weights, top_k_indices, E, C)
-            keep = None  # Triton path: cap not applied inside kernel
+            keep = None
         else:
             padded_send, sort_idx, expert_ids, positions, keep = self._ep_pack(
                 x_flat, top_k_weights, top_k_indices, N, E, K, C)
@@ -317,8 +322,8 @@ class MoEFFN(nn.Module):
         recv_back_flat = torch.empty_like(send_back)
         _ep_all_to_all(recv_back_flat, send_back, ep_group)
 
-        # Phase 5: Unpack
-        if HAS_TRITON:
+        # Phase 5: Unpack (must match pack path)
+        if HAS_TRITON and not capped:
             return triton_ep_unpack(recv_back_flat, token_ids, expert_ids, positions, N, E, C, K)
         else:
             return self._ep_unpack(recv_back_flat, sort_idx, expert_ids, positions, keep, E, C, N, K, x_flat.dtype)
