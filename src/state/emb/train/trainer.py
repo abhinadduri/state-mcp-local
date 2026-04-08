@@ -393,7 +393,7 @@ def run_validation(model, val_dataloader, limit_val_batches,
     return overall, species_losses
 
 
-def _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step):
+def _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step, cumulative_flops=0):
     """Submit an async Slurm eval job after checkpoint save (rank 0 only)."""
     if eval_slurm is None or wandb_run is None:
         return
@@ -412,7 +412,8 @@ def _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step):
         f"--wandb-run-id {wandb_run.id} "
         f"--wandb-project {cfg.wandb.project} "
         f"--wandb-entity {cfg.wandb.entity} "
-        f"--step {global_step}"
+        f"--step {global_step} "
+        f"--cumulative-flops {int(cumulative_flops)}"
     )
     job_id = eval_slurm.submit(
         eval_cmd, tag="emb_eval", cancel_pending=True,
@@ -1151,14 +1152,14 @@ def main(cfg):
                         best_val_loss, metric_value=val_loss, run_name=run_name,
                         rank=local_rank,
                     )
-                    _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step)
+                    _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step, cumulative_flops)
 
                     model.train()
 
                 # Periodic checkpoint — all ranks participate for FSDP2, rank 0 writes
                 if ckpt_interval > 0 and global_step % ckpt_interval == 0:
                     ckpt_mgr.save_periodic(model, optimizer, scheduler, global_step, epoch, best_val_loss, rank=local_rank)
-                    _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step)
+                    _maybe_submit_eval(eval_slurm, wandb_run, cfg, ckpt_dir, global_step, cumulative_flops)
 
                 # Max steps check
                 if 0 < max_steps <= global_step:

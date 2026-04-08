@@ -39,6 +39,7 @@ def add_arguments_eval(parser: ap.ArgumentParser):
     parser.add_argument("--wandb-project", default=None, help="Wandb project")
     parser.add_argument("--wandb-entity", default=None, help="Wandb entity")
     parser.add_argument("--step", type=int, default=None, help="Training step to associate metrics with")
+    parser.add_argument("--cumulative-flops", type=int, default=None, help="Cumulative FLOPs at this training step")
 
 
 def run_emb_eval(args):
@@ -354,35 +355,55 @@ def run_emb_eval(args):
     # Log to wandb if run ID provided (async Slurm eval mode)
     wandb_run_id = getattr(args, "wandb_run_id", None)
     if wandb_run_id:
+        step = getattr(args, "step", None)
+        cum_flops = getattr(args, "cumulative_flops", None)
+        metrics = {"eval/step": step, "eval/de_gene_overlap": mean_overlap}
+        if cum_flops is not None:
+            metrics["eval/cumulative_flops"] = cum_flops
+        if roc_aucs:
+            metrics["eval/roc_auc"] = float(np.mean(roc_aucs))
+            metrics["eval/pr_auc"] = float(np.mean(pr_aucs))
+        if probe_results:
+            metrics["eval/probe_accuracy"] = probe_results["intrinsic_accuracy_mean"]
+            metrics["eval/probe_auroc"] = probe_results["intrinsic_auroc_mean"]
+
+        wandb_project = getattr(args, "wandb_project", None)
+        wandb_entity = getattr(args, "wandb_entity", None)
+        logged = False
+
+        # Try wandb.init approach first (works when wandb service is available)
         try:
             import wandb
             wandb.init(
-                id=wandb_run_id,
-                project=getattr(args, "wandb_project", None),
-                entity=getattr(args, "wandb_entity", None),
-                resume="allow",
+                id=wandb_run_id, project=wandb_project,
+                entity=wandb_entity, resume="allow",
             )
-            # Use a custom x-axis so eval metrics don't conflict with
-            # the training step counter (which only increases).
             wandb.define_metric("eval/step")
+            wandb.define_metric("eval/cumulative_flops")
             wandb.define_metric("eval/*", step_metric="eval/step")
-
-            step = getattr(args, "step", None)
-            metrics = {
-                "eval/step": step,
-                "eval/de_gene_overlap": mean_overlap,
-            }
-            if roc_aucs:
-                metrics["eval/roc_auc"] = float(np.mean(roc_aucs))
-                metrics["eval/pr_auc"] = float(np.mean(pr_aucs))
-            if probe_results:
-                metrics["eval/probe_accuracy"] = probe_results["intrinsic_accuracy_mean"]
-                metrics["eval/probe_auroc"] = probe_results["intrinsic_auroc_mean"]
             wandb.log(metrics)
             wandb.finish()
+            logged = True
+        except Exception:
+            pass
+
+        # Fallback: use wandb API to update run summary directly
+        if not logged:
+            try:
+                import wandb
+                api = wandb.Api()
+                run = api.run(f"{wandb_entity}/{wandb_project}/{wandb_run_id}")
+                for k, v in metrics.items():
+                    run.summary[k] = v
+                run.summary.update()
+                logged = True
+            except Exception:
+                pass
+
+        if logged:
             print(f"\nLogged metrics to wandb run {wandb_run_id} at step {step}")
-        except Exception as e:
-            print(f"Warning: Failed to log to wandb: {e}")
+        else:
+            print(f"Warning: Failed to log to wandb (both init and API fallback failed)")
 
     return de_metrics, mean_overlap, probe_results
 

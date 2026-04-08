@@ -104,6 +104,18 @@ embeddings:
     valid_genes_masks: /data/SE-167M-Human/Preprint-Profile/valid_genes_masks_Preprint-SE-167M-Human.torch
     size: 5120
     num: 19790
+  All-Species-ESM:
+    all_embeddings: /data/basecount_filtered/profiles/all_embeddings_All-Species-ESM.pt
+    ds_emb_mapping: /data/basecount_filtered/profiles/ds_emb_mapping_All-Species-ESM.torch
+    valid_genes_masks: /data/basecount_filtered/profiles/valid_genes_masks_All-Species-ESM.torch
+    size: 2560
+    num: 502243
+  All-Species:
+    all_embeddings: /data/basecount_filtered/profiles/all_embeddings_All-Species.pt
+    ds_emb_mapping: /data/basecount_filtered/profiles/ds_emb_mapping_All-Species.torch
+    valid_genes_masks: /data/basecount_filtered/profiles/valid_genes_masks_All-Species.torch
+    size: 2560
+    num: 502243
 validations:
   diff_exp:
     enable: true
@@ -219,6 +231,18 @@ dataset:
     val: /data/SE-167M-Human/Preprint-Profile/val_Preprint-SE-167M-Human-basecount-only.csv
     filter: true
     num_datasets: 14418
+  All-Species-ESM:
+    ds_type: h5ad
+    train: /data/basecount_filtered/profiles/train_All-Species-ESM.csv
+    val: /data/basecount_filtered/profiles/val_All-Species-ESM.csv
+    filter: true
+    num_datasets: 60827
+  All-Species:
+    ds_type: h5ad
+    train: /data/basecount_filtered/profiles/train_All-Species.csv
+    val: /data/basecount_filtered/profiles/val_All-Species.csv
+    filter: true
+    num_datasets: 60827
 tokenizer:
   token_dim: 5120
 model:
@@ -268,10 +292,10 @@ task:
   mask: 0.2
 optimizer:
   name: muon
-  max_lr: 4e-4
+  max_lr: 0.0004
   min_lr: 0.0
   warmup_steps: 2000
-  schedule_steps: -1  # -1 = use total training steps
+  schedule_steps: -1
   weight_decay: 0.1
   start: 0.33
   max_grad_norm: 1.0
