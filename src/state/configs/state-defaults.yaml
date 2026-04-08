@@ -296,7 +296,7 @@ optimizer:
   min_lr: 0.0
   warmup_steps: 2000
   schedule_steps: -1
-  weight_decay: 0.1
+  weight_decay: 0.05
   start: 0.33
   max_grad_norm: 1.0
   gradient_accumulation_steps: 8

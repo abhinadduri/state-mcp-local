@@ -1,5 +1,5 @@
 wandb_track: true
-weight_decay: 0.0005
+weight_decay: 0.05
 batch_size: 16
 lr: 1e-4
 optimizer: muon

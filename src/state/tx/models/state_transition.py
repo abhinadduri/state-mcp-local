@@ -1178,7 +1178,7 @@ class StateTransitionPerturbationModel(PerturbationModel):
         """
         optimizer_name = str(self.hparams.get("optimizer", "adam")).lower()
         base_lr = float(self.hparams.get("lr", self.lr))
-        weight_decay = float(self.hparams.get("weight_decay", 0.0))
+        weight_decay = float(self.hparams.get("weight_decay", 0.05))
 
         if optimizer_name == "adamw":
             optimizer = torch.optim.AdamW(self.parameters(), lr=base_lr, weight_decay=weight_decay)
