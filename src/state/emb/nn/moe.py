@@ -280,7 +280,6 @@ class MoEFFN(nn.Module):
         C_raw = max(local_max.item(), 1)
         capped = C_raw > safety_cap
         if capped:
-            log.warning("MoE routing imbalanced: max=%d, avg=%d, capping at %d", C_raw, avg, safety_cap)
             C = safety_cap
         else:
             C = C_raw
@@ -359,7 +358,6 @@ class MoEFFN(nn.Module):
         safety_cap = avg * 2
         capacity = max(expert_counts.max().item(), 1)
         if capacity > safety_cap:
-            log.warning("MoE routing imbalanced: max=%d, avg=%d, capping at %d", capacity, avg, safety_cap)
             capacity = safety_cap
         capacity = ((capacity + _BUCKET - 1) // _BUCKET) * _BUCKET
 
