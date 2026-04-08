@@ -39,9 +39,9 @@ class TopKRouter(nn.Module):
         nn.init.trunc_normal_(self.gate.weight, std=0.001)
 
     def forward(self, x: torch.Tensor):
-        # Force float32 for numerical stability (ST-MoE: bfloat16 softmax causes instability)
+        # Force float32 for numerical stability (ST-MoE: bfloat16 softmax causes instability).
+        # No clamping — the router z-loss provides a smooth penalty on large logits.
         router_logits = self.gate(x).float()
-        router_logits = router_logits.clamp(-20.0, 20.0)  # safety net for softmax
         scores = F.softmax(router_logits, dim=-1)
         top_k_weights, top_k_indices = torch.topk(scores, self.top_k, dim=-1)
         top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
