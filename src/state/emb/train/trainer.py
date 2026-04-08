@@ -1057,6 +1057,13 @@ def main(cfg):
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
+                # Collect MoE expert utilization stats before reset
+                moe_expert_stats = {}
+                moe_cfg_check = cfg.model.get("moe", None)
+                if is_main and moe_cfg_check is not None and getattr(moe_cfg_check, "enable", False):
+                    from ..nn.moe import collect_moe_expert_stats
+                    moe_expert_stats = collect_moe_expert_stats(raw_model)
+
                 # Reset MoE global-batch balance stats after each optimizer step
                 from ..nn.moe import reset_moe_balance_stats
                 reset_moe_balance_stats(model)
@@ -1112,6 +1119,8 @@ def main(cfg):
                         moe_losses = collect_moe_aux_losses(raw_model)
                         log_dict["moe/load_balance_loss"] = moe_losses["moe_load_balance"].item()
                         log_dict["moe/router_z_loss"] = moe_losses["moe_router_z"].item()
+                        if moe_expert_stats:
+                            log_dict.update(moe_expert_stats)
                     wandb.log(log_dict, step=global_step)
 
                 # Validation

@@ -485,6 +485,47 @@ def collect_moe_aux_losses(model: nn.Module):
     return {"moe_load_balance": total_lb, "moe_router_z": total_rz, "moe_num_layers": n}
 
 
+def collect_moe_expert_stats(model: nn.Module):
+    """Collect expert utilization statistics from all MoE layers.
+
+    Must be called BEFORE reset_moe_balance_stats() since it reads the
+    accumulated token counts and routing probabilities.
+    """
+    all_f = []
+    all_P = []
+
+    for module in model.modules():
+        if isinstance(module, MoEFFN) and module._accum_num_tokens > 0:
+            K = module.top_k
+            f = module._accum_tokens_per_expert / (module._accum_num_tokens * K)
+            P = module._accum_score_sum / module._accum_num_tokens
+            all_f.append(f.detach().float())
+            all_P.append(P.detach().float())
+
+    if not all_f:
+        return {}
+
+    # Average across MoE layers
+    f_avg = torch.stack(all_f).mean(dim=0)  # [E]
+    P_avg = torch.stack(all_P).mean(dim=0)  # [E]
+
+    E = f_avg.shape[0]
+    f_min = f_avg.min().item()
+
+    return {
+        "moe/token_frac_max": f_avg.max().item(),
+        "moe/token_frac_min": f_min,
+        "moe/token_frac_std": f_avg.std().item(),
+        "moe/routing_prob_max": P_avg.max().item(),
+        "moe/routing_prob_min": P_avg.min().item(),
+        "moe/routing_prob_std": P_avg.std().item(),
+        # max/min ratio: 1.0 = perfect balance, higher = worse
+        "moe/imbalance_ratio": (f_avg.max().item() / f_min) if f_min > 0 else float("inf"),
+        # fraction of experts getting < 50% of ideal share
+        "moe/underutilized_experts": int((f_avg < 0.5 / E).sum().item()),
+    }
+
+
 def reset_moe_balance_stats(model: nn.Module):
     """Reset accumulated balance stats on all MoE layers (call after optimizer step)."""
     for module in model.modules():
