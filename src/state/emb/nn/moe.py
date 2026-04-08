@@ -232,13 +232,17 @@ class MoEFFN(nn.Module):
         expert_ids = torch.repeat_interleave(torch.arange(E, device=x_flat.device), counts)
         positions = torch.arange(M, device=x_flat.device) - offsets[expert_ids]
 
+        # Guard against overflow when safety cap is active
+        keep = positions < C
+        positions = positions.clamp(max=C - 1)
+
         weighted = (x_flat[sorted_token_idx] * sorted_weights.unsqueeze(-1)).to(torch.bfloat16)
         padded_send = weighted.new_zeros(E, C, D)
-        padded_send[expert_ids, positions] = weighted
+        padded_send[expert_ids, positions] = weighted * keep.unsqueeze(-1).to(weighted.dtype)
 
-        return padded_send, sort_idx, expert_ids, positions
+        return padded_send, sort_idx, expert_ids, positions, keep
 
-    def _ep_unpack(self, recv_back_flat, sort_idx, expert_ids, positions, E, C, N, K, dtype):
+    def _ep_unpack(self, recv_back_flat, sort_idx, expert_ids, positions, keep, E, C, N, K, dtype):
         """Phase 5: Unpack results from padded buffer.
 
         Compilable — no NCCL ops. Fuses ~8 small ops into 1-2 kernels.
@@ -246,6 +250,7 @@ class MoEFFN(nn.Module):
         D = recv_back_flat.shape[1]
         recv_back = recv_back_flat.reshape(E, C, D)
         results = recv_back[expert_ids, positions].to(dtype)
+        results = results * keep.unsqueeze(-1).to(results.dtype)
 
         unsort_idx = sort_idx.argsort()
         output = results[unsort_idx].reshape(N, K, D).sum(dim=1)
@@ -261,15 +266,21 @@ class MoEFFN(nn.Module):
         epr = self._experts_per_rank
         M = N * K
 
-        # Dropless: capacity = max tokens assigned to any expert.
+        # Dropless: capacity = max tokens assigned to any expert, capped at
+        # 2× average to prevent OOM from pathological routing imbalance.
         # Synced across EP ranks so all-to-all buffers match.
         _flat_experts = top_k_indices.reshape(-1)
         _counts = torch.zeros(E, dtype=torch.long, device=x_flat.device)
         _counts.scatter_add_(0, _flat_experts, torch.ones(M, dtype=torch.long, device=x_flat.device))
         _BUCKET = 64
+        avg = (M + E - 1) // E
+        safety_cap = avg * 2
         local_max = _counts.max()
         dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=ep_group)
         C = max(local_max.item(), 1)
+        if C > safety_cap:
+            log.warning("MoE routing imbalanced: max=%d, avg=%d, capping at %d", C, avg, safety_cap)
+            C = safety_cap
         C = ((C + _BUCKET - 1) // _BUCKET) * _BUCKET
 
         # Phase 1: Pack — use Triton if available (1 kernel vs ~20 PyTorch ops)
@@ -281,8 +292,9 @@ class MoEFFN(nn.Module):
         if HAS_TRITON:
             padded_send, token_ids, expert_ids, positions = triton_ep_pack(
                 x_flat, top_k_weights, top_k_indices, E, C)
+            keep = None  # Triton path: cap not applied inside kernel
         else:
-            padded_send, sort_idx, expert_ids, positions = self._ep_pack(
+            padded_send, sort_idx, expert_ids, positions, keep = self._ep_pack(
                 x_flat, top_k_weights, top_k_indices, N, E, K, C)
 
         # Phase 2: All-to-all dispatch (NCCL)
@@ -309,7 +321,7 @@ class MoEFFN(nn.Module):
         if HAS_TRITON:
             return triton_ep_unpack(recv_back_flat, token_ids, expert_ids, positions, N, E, C, K)
         else:
-            return self._ep_unpack(recv_back_flat, sort_idx, expert_ids, positions, E, C, N, K, x_flat.dtype)
+            return self._ep_unpack(recv_back_flat, sort_idx, expert_ids, positions, keep, E, C, N, K, x_flat.dtype)
 
     def _forward_bmm(self, x_flat, top_k_weights, top_k_indices):
         """Padded bmm forward (no EP), dropless.
@@ -335,10 +347,15 @@ class MoEFFN(nn.Module):
         expert_counts.scatter_add_(0, sorted_experts, torch.ones(M, dtype=torch.long, device=x_flat.device))
 
         # Dropless: capacity = max tokens assigned to any single expert,
-        # bucketed to a multiple of 64 for stable shapes under torch.compile.
-        # No tokens are dropped — every token reaches its assigned expert.
+        # capped at 2× average to prevent OOM from pathological routing.
+        # Bucketed to a multiple of 64 for stable shapes under torch.compile.
         _BUCKET = 64
+        avg = (M + E - 1) // E
+        safety_cap = avg * 2
         capacity = max(expert_counts.max().item(), 1)
+        if capacity > safety_cap:
+            log.warning("MoE routing imbalanced: max=%d, avg=%d, capping at %d", capacity, avg, safety_cap)
+            capacity = safety_cap
         capacity = ((capacity + _BUCKET - 1) // _BUCKET) * _BUCKET
 
         offsets = torch.zeros(E, dtype=torch.long, device=x_flat.device)
@@ -346,12 +363,16 @@ class MoEFFN(nn.Module):
         global_pos = torch.arange(M, device=x_flat.device)
         positions = global_pos - offsets[sorted_experts]
 
+        # Guard against overflow when safety cap is active
+        keep = positions < capacity
+        positions = positions.clamp(max=capacity - 1)
+
         padded_tokens = x_flat.new_zeros(E, capacity, D)
         padded_weights = x_flat.new_zeros(E, capacity)
         padded_out_idx = torch.zeros(E, capacity, dtype=torch.long, device=x_flat.device)
 
-        padded_tokens[sorted_experts, positions] = x_flat[sorted_token_idx]
-        padded_weights[sorted_experts, positions] = sorted_weights
+        padded_tokens[sorted_experts, positions] = x_flat[sorted_token_idx] * keep.unsqueeze(-1).to(x_flat.dtype)
+        padded_weights[sorted_experts, positions] = sorted_weights * keep.to(sorted_weights.dtype)
         padded_out_idx[sorted_experts, positions] = sorted_token_idx
 
         h = torch.bmm(padded_tokens, self.w1) + self.b1
