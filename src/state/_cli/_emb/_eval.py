@@ -182,8 +182,13 @@ def run_emb_eval(args):
                     gene_queries = all_gene_embeds.unsqueeze(0).expand(B_cur, -1, -1).detach()
                     latent_bank = out.latent_tokens  # [B, 1+n_latent, d_model]
                     px_scale_logits, _ = model.nb_decoder(gene_queries, latent_bank)
-                    # Use softmax(logits) as predicted relative expression
-                    pred_expr = torch.softmax(px_scale_logits, dim=-1)
+                    # Predicted counts: softmax(logits) * library_size
+                    # Library size from encoder's sparse gene counts (pre-mask)
+                    orig_counts = out.gene_counts_original  # [B, k_max] log1p
+                    raw_counts = torch.expm1(orig_counts)
+                    lib_size = raw_counts.sum(dim=-1, keepdim=True).clamp_min(1.0)  # [B, 1]
+                    px_scale = torch.softmax(px_scale_logits, dim=-1)
+                    pred_expr = px_scale * lib_size
                     logprob_batches.append(pred_expr.detach().cpu().float().numpy())
 
     # Combine batches
