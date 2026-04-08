@@ -83,6 +83,7 @@ class TokenizerOutput(NamedTuple):
     gene_indices: Optional[torch.Tensor] = None  # [B, k_max] global gene IDs (encoder input)
     gene_counts_original: Optional[torch.Tensor] = None  # [B, k_max] pre-mask log1p counts
     encoder_mask: Optional[torch.Tensor] = None  # [B, k_max] bool, True=masked
+    gene_mask: Optional[torch.Tensor] = None  # [B, k_max] bool, True=real gene (not padding)
 
 
 class Tokenizer(nn.Module):
@@ -419,14 +420,15 @@ class CrossAttentionBlock(nn.Module):
         k = k.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
         v = v.view(B, k_max, self.nhead, self.head_dim).transpose(1, 2)
 
-        # Always apply mask — avoids cudaStreamSynchronize from kv_mask.all().item()
-        # which also acts as a torch.compile graph break.
-        padding_mask = kv_mask.unsqueeze(-1)
-        k = k * padding_mask.unsqueeze(1)
-        v = v * padding_mask.unsqueeze(1)
+        # Proper attention mask: padding positions get -inf so softmax assigns
+        # them zero weight.  Always applied (no data-dependent branch) to stay
+        # torch.compile-friendly.  Shape [B, 1, 1, k_max] broadcasts over heads
+        # and query positions.
+        attn_mask = torch.zeros(B, 1, 1, k_max, device=q.device, dtype=q.dtype)
+        attn_mask.masked_fill_(~kv_mask.view(B, 1, 1, k_max), float("-inf"))
 
         dropout_p = self.dropout if self.training else 0.0
-        attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
         attn_out = attn_out.transpose(1, 2).contiguous().view(B, n_q, self.d_model)
         attn_out = self.out_proj(attn_out)
         return queries + attn_out
@@ -703,6 +705,7 @@ class LatentTokenizer(Tokenizer):
             gene_indices=gene_indices,
             gene_counts_original=original_gene_counts,
             encoder_mask=encoder_mask,
+            gene_mask=gene_mask,
         )
 
 
@@ -911,4 +914,5 @@ class TabularLatentTokenizer(LatentTokenizer):
             gene_indices=gene_indices,
             gene_counts_original=original_gene_counts,
             encoder_mask=encoder_mask,
+            gene_mask=gene_mask,
         )

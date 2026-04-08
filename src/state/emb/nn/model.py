@@ -352,10 +352,14 @@ class StateEmbeddingModel(nn.Module):
         px_scale = F.softmax(px_scale_logits, dim=-1)  # [B, k_max]
         nb_mean = px_scale * lib_size  # [B, k_max]
 
-        # NB loss on masked genes only
+        # NB loss on masked genes only (exclude padding via gene_mask)
         if encoder_mask is None:
-            # Eval mode or no masking: predict all genes
-            encoder_mask = torch.ones_like(raw_counts, dtype=torch.bool)
+            # No masking: predict all real (non-padding) genes
+            encoder_mask = out.gene_mask if out.gene_mask is not None else torch.ones_like(raw_counts, dtype=torch.bool)
+        else:
+            # Masking active: intersect with gene_mask to exclude padding
+            if out.gene_mask is not None:
+                encoder_mask = encoder_mask & out.gene_mask
         loss = self.nb_loss(nb_mean, nb_dispersion, raw_counts, encoder_mask)
 
         return loss

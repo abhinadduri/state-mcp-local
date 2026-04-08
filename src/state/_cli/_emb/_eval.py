@@ -142,8 +142,9 @@ def run_emb_eval(args):
     has_nb_decoder = model.nb_decoder is not None
     has_cls_decoder = model.binary_decoder is not None
 
-    # Pre-compute gene queries for NB decoder (all genes in adata)
-    if has_nb_decoder:
+    # Pre-compute gene embeddings outside the loop (same every batch)
+    all_gene_embeds = None
+    if has_nb_decoder or has_cls_decoder:
         try:
             all_gene_embeds = model.get_gene_embedding(adata.var.index)
         except Exception:
@@ -152,21 +153,11 @@ def run_emb_eval(args):
     with torch.no_grad():
         with torch.autocast(device_type=device_type, dtype=precision):
             for batch in tqdm(dataloader, desc="Processing batches"):
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-
                 # Run tokenizer to get full output (needed for NB decoder's latent_bank)
                 out = model.tokenizer(batch)
                 emb = out.cell_embedding
                 ds_emb = out.dataset_emb
                 task_counts_batch = out.task_counts
-
-                # Get gene embeddings for CLS decoder
-                if has_cls_decoder:
-                    try:
-                        gene_embeds = model.get_gene_embedding(adata.var.index)
-                    except Exception:
-                        gene_embeds = model.get_gene_embedding(adata.var["gene_symbols"])
 
                 # Handle dataset embeddings
                 if hasattr(model, "dataset_token") and model.dataset_token is not None:
@@ -181,7 +172,7 @@ def run_emb_eval(args):
                 # Decode: compute gene prediction scores
                 if has_cls_decoder:
                     B_cur = emb.shape[0]
-                    gene_embeds_batch = gene_embeds.unsqueeze(0).expand(B_cur, -1, -1)
+                    gene_embeds_batch = all_gene_embeds.unsqueeze(0).expand(B_cur, -1, -1)
                     logprobs_batch = model._decode(gene_embeds_batch, task_counts_batch, emb, ds_emb=ds_emb)
                     logprobs_batch = model.decode_to_continuous(logprobs_batch)
                     logprobs_batch = logprobs_batch.detach().cpu().float().numpy()
