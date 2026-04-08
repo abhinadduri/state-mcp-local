@@ -35,7 +35,6 @@ if HAS_TRITON:
         # Mapping output (for unpack)
         pack_expert_ptr,    # [M] expert id for each assignment (int64)
         pack_position_ptr,  # [M] position within expert (int64)
-        pack_keep_ptr,      # [M] whether token fits in capacity (bool as int8)
         pack_sort_ptr,      # [M] sort index for unsort in unpack (int64)
         # Dimensions
         N: tl.constexpr, D: tl.constexpr, M: tl.constexpr,
@@ -46,6 +45,7 @@ if HAS_TRITON:
 
         Each program instance handles one token-expert assignment.
         Uses atomic_add on per-expert counters to determine pack position.
+        Dropless: C is guaranteed >= max tokens per expert, so all tokens fit.
         """
         pid = tl.program_id(0)
         if pid >= M:
@@ -57,24 +57,20 @@ if HAS_TRITON:
 
         # Atomically claim a position for this token in the expert's buffer
         position = tl.atomic_add(expert_counts_ptr + expert, 1)
-        keep = position < C
-        pos_clamped = tl.minimum(position, C - 1)
 
         # Save mapping for unpack phase
         tl.store(pack_expert_ptr + pid, expert)
-        tl.store(pack_position_ptr + pid, pos_clamped)
-        tl.store(pack_keep_ptr + pid, keep.to(tl.int8))
+        tl.store(pack_position_ptr + pid, position)
         tl.store(pack_sort_ptr + pid, pid)  # identity (no sort needed with atomics)
 
-        if keep:
-            # Copy weighted token into packed buffer
-            d_offsets = tl.arange(0, BLOCK_D)
-            for d_start in range(0, D, BLOCK_D):
-                d_idx = d_start + d_offsets
-                mask = d_idx < D
-                token_val = tl.load(x_ptr + token_idx * D + d_idx, mask=mask)
-                packed_val = token_val * weight
-                tl.store(packed_ptr + expert * C * D + pos_clamped * D + d_idx, packed_val, mask=mask)
+        # Copy weighted token into packed buffer
+        d_offsets = tl.arange(0, BLOCK_D)
+        for d_start in range(0, D, BLOCK_D):
+            d_idx = d_start + d_offsets
+            mask = d_idx < D
+            token_val = tl.load(x_ptr + token_idx * D + d_idx, mask=mask)
+            packed_val = token_val * weight
+            tl.store(packed_ptr + expert * C * D + position * D + d_idx, packed_val, mask=mask)
 
     @triton.jit
     def _moe_unpack_kernel(
@@ -83,7 +79,6 @@ if HAS_TRITON:
         # Mapping from pack phase
         expert_ids_ptr,     # [M] expert id per assignment
         positions_ptr,      # [M] position within expert
-        keep_ptr,           # [M] whether token was packed (int8)
         # Token mapping
         token_ids_ptr,      # [M] original token indices
         # Output
@@ -97,6 +92,7 @@ if HAS_TRITON:
 
         Each program handles one token-expert assignment, atomically accumulating
         into the output (handles top-K > 1 by accumulation).
+        Dropless: all tokens were packed, so all are unpacked unconditionally.
         """
         pid = tl.program_id(0)
         if pid >= M:
@@ -104,24 +100,23 @@ if HAS_TRITON:
 
         expert = tl.load(expert_ids_ptr + pid)
         position = tl.load(positions_ptr + pid)
-        keep = tl.load(keep_ptr + pid).to(tl.int1)
         token_idx = tl.load(token_ids_ptr + pid)
 
-        if keep:
-            d_offsets = tl.arange(0, BLOCK_D)
-            for d_start in range(0, D, BLOCK_D):
-                d_idx = d_start + d_offsets
-                mask = d_idx < D
-                result = tl.load(recv_ptr + expert * C * D + position * D + d_idx, mask=mask)
-                # Atomic add for top-K accumulation
-                tl.atomic_add(output_ptr + token_idx * D + d_idx, result, mask=mask)
+        d_offsets = tl.arange(0, BLOCK_D)
+        for d_start in range(0, D, BLOCK_D):
+            d_idx = d_start + d_offsets
+            mask = d_idx < D
+            result = tl.load(recv_ptr + expert * C * D + position * D + d_idx, mask=mask)
+            # Atomic add for top-K accumulation
+            tl.atomic_add(output_ptr + token_idx * D + d_idx, result, mask=mask)
 
 
 def triton_ep_pack(x_flat, top_k_weights, top_k_indices, E, C):
     """Fused pack: route tokens + weight + pack into padded [E, C, D] buffer.
 
     Replaces ~20 PyTorch ops with 1 Triton kernel.
-    Returns: (packed_buffer, token_ids, expert_ids, positions, keep_mask)
+    Dropless: C is guaranteed >= max tokens per expert.
+    Returns: (packed_buffer, token_ids, expert_ids, positions)
     """
     N, D = x_flat.shape
     K = top_k_indices.shape[1]
@@ -139,7 +134,6 @@ def triton_ep_pack(x_flat, top_k_weights, top_k_indices, E, C):
     # Mapping buffers (for unpack)
     pack_expert = torch.empty(M, device=x_flat.device, dtype=torch.int64)
     pack_position = torch.empty(M, device=x_flat.device, dtype=torch.int64)
-    pack_keep = torch.empty(M, device=x_flat.device, dtype=torch.int8)
     pack_sort = torch.empty(M, device=x_flat.device, dtype=torch.int64)
 
     BLOCK_D = min(triton.next_power_of_2(D), 1024)
@@ -147,17 +141,18 @@ def triton_ep_pack(x_flat, top_k_weights, top_k_indices, E, C):
     _moe_pack_kernel[(M,)](
         x_flat, flat_weights, flat_experts, flat_token_idx,
         packed, expert_counts,
-        pack_expert, pack_position, pack_keep, pack_sort,
+        pack_expert, pack_position, pack_sort,
         N, D, M, E, C, BLOCK_D,
     )
 
-    return packed, flat_token_idx, pack_expert, pack_position, pack_keep
+    return packed, flat_token_idx, pack_expert, pack_position
 
 
-def triton_ep_unpack(recv_flat, token_ids, expert_ids, positions, keep_mask, N, E, C, K):
+def triton_ep_unpack(recv_flat, token_ids, expert_ids, positions, N, E, C, K):
     """Fused unpack: extract results from padded buffer back to token order.
 
     Replaces ~8 PyTorch ops with 1 Triton kernel.
+    Dropless: all tokens were packed, so all are unconditionally unpacked.
     """
     D = recv_flat.shape[1]
     M = expert_ids.shape[0]
@@ -168,7 +163,7 @@ def triton_ep_unpack(recv_flat, token_ids, expert_ids, positions, keep_mask, N, 
 
     _moe_unpack_kernel[(M,)](
         recv_flat.reshape(E, C, D),
-        expert_ids, positions, keep_mask, token_ids,
+        expert_ids, positions, token_ids,
         output,
         N, D, M, E, C, K, BLOCK_D,
     )
