@@ -339,9 +339,11 @@ class StateEmbeddingModel(nn.Module):
         original_counts = out.gene_counts_original  # [B, k_max] log1p
         encoder_mask = out.encoder_mask  # [B, k_max] bool or None
 
-        # Gene queries from same embedding table, DETACHED (no decoder gradients to encoder)
+        # Gene queries from same embedding table.
+        # No detach: NB decoder gradients flow through gene queries back to the
+        # encoder's gene projection / learned embeddings (matches Stack's design).
         gene_table = self.tokenizer._get_esm2_proj_table(latent_bank.device)
-        gene_queries = gene_table[gene_indices.long()].detach()  # [B, k_max, d_model]
+        gene_queries = gene_table[gene_indices.long()]  # [B, k_max, d_model]
 
         # Decoder cross-attention
         px_scale_logits, nb_dispersion = self.nb_decoder(gene_queries, latent_bank)
