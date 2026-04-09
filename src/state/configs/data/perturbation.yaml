@@ -10,7 +10,7 @@ kwargs:
   n_basal_samples: 1
   downsample: null
   downsample_cells: null
-  balance_outliers: false
+  balance_outliers: true
   additional_obs: []
   basal_mapping_strategy: random
   should_yield_control_cells: true
