@@ -150,6 +150,22 @@ def run_emb_eval(args):
         except Exception:
             all_gene_embeds = model.get_gene_embedding(adata.var["gene_symbols"])
 
+    # Build reverse mapping: global gene index → adata column index (for NB sparse scatter)
+    n_adata_genes = adata.shape[1]
+    global_to_adata = {}
+    if has_nb_decoder:
+        ds = dataloader.dataset
+        # Get the ds_emb_map: adata_col_idx → global_gene_idx
+        emb_map = None
+        if hasattr(ds, "ds_emb_map"):
+            emb_map = list(ds.ds_emb_map.values())[0]  # single dataset for eval
+        elif hasattr(ds, "dataset") and hasattr(ds.dataset, "ds_emb_map"):
+            emb_map = list(ds.dataset.ds_emb_map.values())[0]
+        if emb_map is not None:
+            for adata_idx, global_idx in enumerate(emb_map):
+                if global_idx >= 0:
+                    global_to_adata[int(global_idx)] = adata_idx
+
     with torch.no_grad():
         with torch.autocast(device_type=device_type, dtype=precision):
             for batch in tqdm(dataloader, desc="Processing batches"):
@@ -179,17 +195,29 @@ def run_emb_eval(args):
                     logprob_batches.append(logprobs_batch)
                 elif has_nb_decoder:
                     B_cur = emb.shape[0]
-                    gene_queries = all_gene_embeds.unsqueeze(0).expand(B_cur, -1, -1).detach()
+                    # Use the SAME sparse gene set the encoder sees (matches training softmax scope)
+                    gene_indices = out.gene_indices  # [B, k_max] global gene IDs
+                    gene_mask = out.gene_mask  # [B, k_max] bool — True = real gene
+                    gene_table = model.tokenizer._get_esm2_proj_table(emb.device)
+                    gene_queries = gene_table[gene_indices.long()]  # [B, k_max, d_model]
                     latent_bank = out.latent_tokens  # [B, 1+n_latent, d_model]
                     px_scale_logits, _ = model.nb_decoder(gene_queries, latent_bank)
-                    # Predicted counts: softmax(logits) * library_size
-                    # Library size from encoder's sparse gene counts (pre-mask)
+                    # Predicted counts: softmax over sparse genes × library_size
                     orig_counts = out.gene_counts_original  # [B, k_max] log1p
                     raw_counts = torch.expm1(orig_counts)
                     lib_size = raw_counts.sum(dim=-1, keepdim=True).clamp_min(1.0)  # [B, 1]
                     px_scale = torch.softmax(px_scale_logits, dim=-1)
-                    pred_expr = px_scale * lib_size
-                    logprob_batches.append(pred_expr.detach().cpu().float().numpy())
+                    pred_expr = (px_scale * lib_size).detach().cpu().float().numpy()
+                    # Scatter sparse predictions into full [B, n_adata_genes] array
+                    gi_np = gene_indices.cpu().numpy()  # [B, k_max]
+                    gm_np = gene_mask.cpu().numpy() if gene_mask is not None else np.ones_like(gi_np, dtype=bool)
+                    full_pred = np.zeros((B_cur, n_adata_genes), dtype=np.float32)
+                    # Vectorized scatter via precomputed reverse map
+                    adata_cols = np.vectorize(global_to_adata.get)(gi_np, -1)  # [B, k_max], -1 = unmapped
+                    valid = gm_np & (adata_cols >= 0)
+                    rows, cols_sparse = np.where(valid)
+                    full_pred[rows, adata_cols[rows, cols_sparse]] = pred_expr[rows, cols_sparse]
+                    logprob_batches.append(full_pred)
 
     # Combine batches
     emb_combined = np.vstack(emb_batches)

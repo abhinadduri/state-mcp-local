@@ -205,9 +205,11 @@ class CheckpointManager:
         if rank != 0:
             return None
 
-        # Always save last
+        # Always save last — fsync to ensure file is on disk before eval jobs read it
         last_path = os.path.join(self.dirpath, "last.pt")
         torch.save(checkpoint, last_path)
+        with open(last_path, "rb") as f:
+            os.fsync(f.fileno())
 
         # Save named checkpoint if metric provided
         if metric_value is not None:
@@ -236,6 +238,8 @@ class CheckpointManager:
             return None
         last_path = os.path.join(self.dirpath, "last.pt")
         torch.save(checkpoint, last_path)
+        with open(last_path, "rb") as f:
+            os.fsync(f.fileno())
         return last_path
 
 
